@@ -894,7 +894,13 @@ fn detect_physical_memory() -> Option<u64> {
     kb.checked_mul(1024)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "freebsd")]
+fn detect_physical_memory() -> Option<u64> {
+    let out = std::process::Command::new("/sbin/sysctl").args(["-n", "hw.physmem"]).output().ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 fn detect_physical_memory() -> Option<u64> {
     None
 }

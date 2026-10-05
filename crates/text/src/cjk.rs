@@ -259,6 +259,10 @@ pub fn font_files(script: CjkScript) -> Vec<FontFile> {
         };
         let mut v: Vec<FontFile> = [
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            // FreeBSD ports (x11-fonts/noto-sans-cjk and friends) install under /usr/local.
+            "/usr/local/share/fonts/noto/NotoSansCJK-Regular.ttc",
+            "/usr/local/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/local/share/fonts/noto/NotoSansCJK-VF.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",

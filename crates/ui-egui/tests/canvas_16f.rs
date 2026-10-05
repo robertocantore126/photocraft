@@ -17,6 +17,14 @@ use photocraft_ui_egui::PhotocraftApp;
 use photocraft_ui_egui::gpu_canvas::{self, GpuCanvas};
 use serde_json::json;
 
+/// Concurrent wgpu devices in one process crash on some drivers (Mesa llvmpipe over GL, RADV;
+/// see #194), so every test here holds this lock for its whole run, devices included.
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A headless GPU canvas on a device created like the app's, if the adapter has a float canvas.
 fn canvas() -> Option<(GpuCanvas, RenderState)> {
     let rs =
@@ -58,6 +66,7 @@ fn max_error(doc: &Document, texels: &[[f32; 4]]) -> f32 {
 
 #[test]
 fn sixteen_bit_gradient_keeps_more_than_256_levels() {
+    let _gpu = gpu_lock();
     let Some((g, _rs)) = canvas() else { return };
     let doc = gradient(SampleType::U16, 4096, 4, 0.0, 1.0);
     let key = doc.id.0;
@@ -85,6 +94,7 @@ fn sixteen_bit_gradient_keeps_more_than_256_levels() {
 
 #[test]
 fn damage_rect_uploads_into_the_float_texture() {
+    let _gpu = gpu_lock();
     let Some((g, _rs)) = canvas() else { return };
     let mut doc = gradient(SampleType::U16, 512, 64, 0.0, 1.0);
     let key = doc.id.0;
@@ -103,6 +113,7 @@ fn damage_rect_uploads_into_the_float_texture() {
 
 #[test]
 fn eight_bit_documents_keep_their_rgba8_texture() {
+    let _gpu = gpu_lock();
     let Some((g, _rs)) = canvas() else { return };
     let doc = gradient(SampleType::U8, 1024, 4, 0.0, 1.0);
     // CPU path: exactly the premultiplied RGBA8 of the composite, as before.
@@ -129,6 +140,7 @@ fn eight_bit_documents_keep_their_rgba8_texture() {
 
 #[test]
 fn format_follows_depth_and_budget() {
+    let _gpu = gpu_lock();
     let Some((g, _rs)) = canvas() else { return };
     assert_eq!(g.format_for(SampleType::U8, [4000, 4000]), TextureFormat::Rgba8Unorm);
     assert_eq!(g.format_for(SampleType::U16, [7360, 4912]), TextureFormat::Rgba16Float);
@@ -141,6 +153,7 @@ fn format_follows_depth_and_budget() {
 
 #[test]
 fn thirty_two_bit_values_above_one_are_kept() {
+    let _gpu = gpu_lock();
     let Some((g, _rs)) = canvas() else { return };
     let doc = gradient(SampleType::F32, 256, 2, 0.0, 4.0);
     g.refresh(doc.id.0, &doc, None, None);
@@ -214,6 +227,7 @@ fn screen_levels(img: &Screen, y: u32, x0: u32, x1: u32) -> (usize, i32) {
 
 #[test]
 fn sixteen_bit_gradient_on_screen() {
+    let _gpu = gpu_lock();
     // A 16-bit ramp drawn by the app's canvas: smooth, monotonic, no visible steps.
     let doc = gradient(SampleType::U16, 2048, 1024, 0.0, 1.0);
     let Some(img) = screen(doc, &[], "photocraft-canvas-16f-gradient.png") else { return };
@@ -223,6 +237,7 @@ fn sixteen_bit_gradient_on_screen() {
 
 #[test]
 fn thirty_two_bit_preview_exposes_values_above_one() {
+    let _gpu = gpu_lock();
     // A dark 32-bit ramp brightened +4 stops by View › 32-bit Preview Options: with an 8-bit
     // canvas texture its 0..1/16 range has 16 codes (banding); the float texture keeps it smooth.
     let doc = gradient(SampleType::F32, 2048, 1024, 0.0, 1.0 / 16.0);
