@@ -124,6 +124,20 @@ pub fn import(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
     flat::import_flat(name, bytes)
 }
 
+/// [`import`] taking ownership of the file's bytes, so a PSD/PSB can drop them once parsed: the
+/// parsed file holds its own copy of the layer data, and a 2.5 GB PSB would otherwise keep both
+/// in memory while every layer decodes.
+pub fn import_owned(name: &str, bytes: Vec<u8>) -> Result<ImportResult, IoError> {
+    if has_extension(name, photocraft_format::EXTENSION) || photocraft_format::is_pcraft(&bytes) || !is_psd(&bytes) {
+        return import(name, &bytes);
+    }
+    let file = PsdFile::from_bytes(&bytes)?;
+    drop(bytes);
+    let (mut document, warnings) = psd_to_document(&file);
+    document.name = name.to_string();
+    Ok(ImportResult { document, warnings })
+}
+
 fn extension(name_or_ext: &str) -> String {
     name_or_ext.rsplit(['.', '/', '\\']).next().unwrap_or(name_or_ext).to_ascii_lowercase()
 }

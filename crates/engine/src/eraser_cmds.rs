@@ -76,7 +76,7 @@ fn damage(s: &mut Session, dmg: Rect, erased: bool) -> Value {
     if let Some(st) = s.active_mut()
         && !dmg.is_empty()
     {
-        st.last_damage = Some(dmg);
+        st.set_pixel_damage(dmg);
     }
     json!({ "erased": erased, "damage": [dmg.x0, dmg.y0, dmg.width(), dmg.height()] })
 }

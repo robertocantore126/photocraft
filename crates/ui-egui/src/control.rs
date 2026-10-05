@@ -381,7 +381,7 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     None => Err("automation read authority is not configured".into()),
                 };
                 wrap(opened.and_then(|(name, bytes)| {
-                    let warnings = app.open_automation_bytes(&name, &bytes)?;
+                    let warnings = app.open_automation_cow(&name, std::borrow::Cow::Owned(bytes))?;
                     // Brushes/gradients go to the preset libraries: no document, no Open Recent entry.
                     if !crate::preset_files_ui::is_preset_file(&name) {
                         if let Some(state) = app.session.active_mut() {
@@ -424,7 +424,12 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "frame": app.frame,
         "session": photocraft_engine::inspect::session(&app.session),
         "document": app.session.active().map(photocraft_engine::inspect::document),
-        "perf": {"fps": app.fps, "timings": app.perf},
+        "perf": {
+            "fps": app.fps,
+            "timings": app.perf,
+            "tiles": photocraft_raster::spill::stats(),
+            "compositor": app.gpu.as_ref().and_then(|g| g.compositor_bytes()).map(|(r, fx)| json!({"residentBytes": r, "fxBytes": fx})),
+        },
         "brush": {"size": app.session.tools.brush.size, "hardness": app.session.tools.brush.hardness, "opacity": app.session.tools.brush.opacity},
         "distort": app.distort.describe(),
     })

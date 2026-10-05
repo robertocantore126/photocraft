@@ -373,7 +373,10 @@ fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&m
         Ok((r, damage))
     })?;
     if let Some(st) = s.active_mut() {
-        st.last_damage = damage;
+        match damage {
+            Some(d) => st.set_pixel_damage(d),
+            None => st.last_damage = None,
+        }
     }
     Ok(r)
 }

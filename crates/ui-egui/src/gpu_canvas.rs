@@ -323,6 +323,11 @@ impl GpuCanvas {
         if let Some(b) = res.compositor_budget {
             comp.set_memory_budget(b);
         }
+        // 8-bit documents composite with half-float accumulators (about twice as fast; each
+        // pass rounds to an 11-bit mantissa). `PHOTOCRAFT_ACC_F32=1` keeps full float.
+        let fast = doc.depth == photocraft_color::SampleType::U8 && std::env::var_os("PHOTOCRAFT_ACC_F32").is_none();
+        let wanted = if fast { photocraft_gpu::FAST_ACC_FORMAT } else { photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter) };
+        comp.set_acc_format(wanted);
         comp.set_focus(res.compositor_focus);
         let key = doc.id.0;
         let format = self.format_for(doc.depth, size);
@@ -332,10 +337,12 @@ impl GpuCanvas {
             res.compositor = Some(comp);
             return Err(e);
         }
-        // A full refresh whose layer pages don't fit the memory budget would re-upload the
-        // evicted ones every time (no faster than the CPU, and more memory): the banded CPU
-        // compositor does it, and edits in the view (damage rects) stay on the GPU.
-        if region == doc.bounds() && !comp.fits_budget(doc, region) {
+        // A full refresh whose layer pages don't fit the memory budget stays on the GPU: the
+        // compositor evicts and re-uploads pages cell by cell within the budget. Re-uploading
+        // is far cheaper than compositing on the CPU once layers carry effects, adjustments or
+        // smart objects (a 20 MP, 479-layer PSB: 7.5 s on the GPU, 211 s on the CPU, with the
+        // UI frozen). `PHOTOCRAFT_CPU_FULL_OVER_BUDGET=1` restores the CPU fallback.
+        if region == doc.bounds() && std::env::var_os("PHOTOCRAFT_CPU_FULL_OVER_BUDGET").is_some() && !comp.fits_budget(doc, region) {
             res.compositor = Some(comp);
             return Err(photocraft_gpu::Unsupported("layers exceed the GPU memory budget; full refresh on the CPU".into()));
         }
@@ -392,8 +399,13 @@ impl GpuCanvas {
         });
         if result.is_ok() {
             d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
-            if std::env::var_os("PHOTOCRAFT_GPU_SYNC").is_some() {
-                // Benchmarking: wait for the GPU so callers can time the whole refresh.
+            // Wait for the GPU before returning. Without this, edits that arrive faster than the
+            // GPU finishes them keep their upload staging in flight, and the driver's memory pool
+            // keeps that high-water mark for the rest of the session (4 GB of RAM after 100
+            // layers of a 4K document, still held after closing it). It's also faster: the
+            // next edit doesn't queue behind unfinished work. `PHOTOCRAFT_GPU_ASYNC=1` restores
+            // the old behaviour for comparisons.
+            if std::env::var_os("PHOTOCRAFT_GPU_ASYNC").is_none() {
                 let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             }
         } else if fresh {
@@ -693,6 +705,9 @@ pub struct Perf {
     /// The Memory Usage allowance (bytes) `gpu_budget_mb` was computed from.
     #[serde(skip)]
     pub gpu_budget_allowance: u64,
+    /// The pixel bytes `gpu_budget_mb` was computed from.
+    #[serde(skip)]
+    pub gpu_budget_pixels: u64,
     /// Last command run through the app and its duration (ms).
     pub last_command: String,
     pub command_ms: f64,

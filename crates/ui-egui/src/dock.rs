@@ -374,6 +374,7 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
         let before = *g.tab_mut(&mut app.ui.dock_tabs);
         let mut sel = before;
         let tabs = g.tabs(t.pro);
+        let t0 = crate::gpu_canvas::now_ms();
         let resp = widgets::card_ex(&mut child, g.key(), tabs, &mut sel, collapsed, |ui, tab| {
             let inner = ui.available_height().max(0.0);
             if g.scrolls_itself(tab) {
@@ -387,6 +388,8 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, shown: &[Group], mut bod
                     .show(ui, |ui| body(app, ui, g, tab));
             }
         });
+        // Per-panel UI time (`ui.inspect` → perf.timings.spans), to find what a big document slows.
+        app.perf.span(g.key(), crate::gpu_canvas::now_ms() - t0);
         strips.push(StripRects { group: g, tabs: resp.tabs.clone(), menu: resp.menu.rect, chevron: resp.chevron });
         // The body may switch tabs itself (Adjustments jumps back to Properties).
         if sel != before {

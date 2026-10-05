@@ -377,10 +377,40 @@ pub struct Performance {
 
 impl Performance {
     /// Pixel memory a document and its History may hold (Memory Usage), in bytes: beyond it
-    /// the oldest history states are dropped.
+    /// the oldest history states are dropped. 0 (no byte limit, only History States) while the
+    /// scratch disk is on: tiles only History holds go to disk instead.
     pub fn history_budget_bytes(&self) -> usize {
+        if photocraft_raster::spill::enabled() {
+            return 0;
+        }
         (self.memory_usage_mb as usize).saturating_mul(1 << 20)
     }
+
+    /// Pixel bytes kept in memory before tiles move to the scratch disk: half of Memory Usage
+    /// (the rest is for the GPU canvas, caches and the app). `PHOTOCRAFT_TILE_BUDGET_MB`
+    /// overrides it (tests, stress runs).
+    pub fn tile_budget_bytes(&self) -> usize {
+        let mb = std::env::var("PHOTOCRAFT_TILE_BUDGET_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(self.memory_usage_mb as usize / 2);
+        mb.saturating_mul(1 << 20)
+    }
+}
+
+/// Point the tile scratch disk at the first enabled Scratch Disk with [`Performance::tile_budget_bytes`]
+/// (native builds; the web build keeps every tile in memory).
+fn sync_scratch(p: &Preferences) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = p
+            .scratch_disks
+            .disks
+            .iter()
+            .find(|d| d.enabled && !d.path.trim().is_empty())
+            .map(|d| if d.path.trim() == "(system temp)" { std::env::temp_dir() } else { std::path::PathBuf::from(d.path.trim()) });
+        // A directory that can't be used turns spilling off; the reason is in `spill::stats()`.
+        let _ = photocraft_raster::spill::configure(dir.as_deref(), p.performance.tile_budget_bytes());
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = p;
 }
 
 impl Default for Performance {
@@ -1091,6 +1121,7 @@ impl Session {
     /// Push engine-relevant preferences into live state: every document's history limit and
     /// the layer-effect cache budget.
     pub fn apply_prefs(&mut self) {
+        sync_scratch(self.prefs());
         let n = self.prefs().performance.history_states.max(1) as usize;
         let bytes = self.prefs().performance.history_budget_bytes();
         let budget = self.prefs().performance.effect_cache_mb as usize;

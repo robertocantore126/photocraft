@@ -695,7 +695,10 @@ fn menu_tint(name: &str) -> Option<egui::Color32> {
 }
 
 pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    let items = menu_items(app);
+    // Built only when a menu is open: the full tree is ~1,000 items, each asking whether its
+    // command is enabled (some walk every layer), so building it every frame cost ~50 ms on a
+    // 479-layer document with every menu closed.
+    let mut items: Option<Vec<MenuItem>> = None;
     let mut clicked: Option<String> = None;
     let t = crate::theme::Tokens::get(ui.ctx());
     let mut nav = crate::menu_nav::Nav::load(ui.ctx());
@@ -711,8 +714,9 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             nav.bar_bottom = Some(ui.max_rect().bottom());
             let mut buttons = Vec::with_capacity(TOP_MENUS.len());
             for top in TOP_MENUS {
-                let mine: Vec<&MenuItem> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(top)).collect();
                 let r = ui.menu_button(egui::RichText::new(top).color(t.text_dim), |ui| {
+                    let items = items.get_or_insert_with(|| menu_items(app));
+                    let mine: Vec<&MenuItem> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(top)).collect();
                     ui.set_min_width(220.0);
                     if mine.is_empty() {
                         ui.weak("(coming soon)");

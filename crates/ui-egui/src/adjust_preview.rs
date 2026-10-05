@@ -141,7 +141,7 @@ pub fn region(doc: &Document, target: LayerId) -> Rect {
     if r.is_empty() {
         return r;
     }
-    r.inflate(crate::canvas::effect_reach(&doc.layers)).intersect(&doc.bounds())
+    r.inflate(photocraft_engine::damage::chain_reach(doc, target)).intersect(&doc.bounds())
 }
 
 /// Per-dialog preview state on the app.

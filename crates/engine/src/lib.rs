@@ -21,6 +21,7 @@ pub mod channel_cmds;
 pub mod color_cmds;
 pub mod commands;
 pub mod comps_cmds;
+pub mod damage;
 pub mod display_color;
 pub mod distort_cmds;
 pub mod edit_cmds;
@@ -138,8 +139,15 @@ pub struct DocState {
     /// Increments on every change; UIs re-render when it moves.
     pub revision: u64,
     pub saved_revision: u64,
-    /// Area changed by the latest revision (None = assume everything changed).
+    /// Area changed by the latest revision (None = assume everything changed), complete: grown
+    /// by the effects of the changed layers and their groups (see [`damage`]).
     pub last_damage: Option<photocraft_geom::Rect>,
+    /// `last_damage` was set by a command as the pixels it painted, not yet grown by effects
+    /// ([`Session::execute`] completes it). Set with [`DocState::set_pixel_damage`].
+    pub pixel_damage: bool,
+    /// Damage of recent revisions, oldest first: (revision reached, area changed to reach it).
+    /// Filled by [`Session::execute`]; see [`DocState::damage_since`].
+    pub damage_log: std::collections::VecDeque<(u64, Option<photocraft_geom::Rect>)>,
     /// Coalescing key of the latest history step (see [`Session::execute`]'s `coalesce` param).
     pub coalesce: Option<String>,
     /// Channels panel: targeted channel and eye toggles (view state, not history).
@@ -164,12 +172,53 @@ impl DocState {
             revision: 1,
             saved_revision: 1,
             last_damage: None,
+            pixel_damage: false,
+            damage_log: std::collections::VecDeque::new(),
             coalesce: None,
             channel_view: Default::default(),
             isolated_layers: Vec::new(),
             fx_collapsed: Vec::new(),
         }
     }
+    /// The area changed since revision `seen` (the union of every revision after it), or `None`
+    /// when unknown (a revision not in the log, or one that changed everything).
+    pub fn damage_since(&self, seen: u64) -> Option<photocraft_geom::Rect> {
+        if seen == self.revision {
+            return Some(photocraft_geom::Rect::EMPTY);
+        }
+        if seen > self.revision {
+            return None;
+        }
+        let mut want = seen + 1;
+        let mut d = photocraft_geom::Rect::EMPTY;
+        for &(rev, dmg) in &self.damage_log {
+            if rev < want {
+                continue;
+            }
+            if rev != want {
+                return None;
+            }
+            d = d.union(&dmg?);
+            want += 1;
+        }
+        (want == self.revision + 1).then_some(d)
+    }
+
+    /// Report the pixels a command painted (a brush stroke's dabs); [`Session::execute`] grows
+    /// them by the effects of the changed layers.
+    pub fn set_pixel_damage(&mut self, r: photocraft_geom::Rect) {
+        self.last_damage = Some(r);
+        self.pixel_damage = true;
+    }
+
+    /// Log the damage of the step that reached the current revision.
+    fn log_damage(&mut self, damage: Option<photocraft_geom::Rect>) {
+        self.damage_log.push_back((self.revision, damage));
+        while self.damage_log.len() > 64 {
+            self.damage_log.pop_front();
+        }
+    }
+
     /// The selected layers in bottom-to-top document order, always including the active layer.
     /// Robust against stale state: ids no longer in the document are skipped, and if the active
     /// layer was changed without updating the set, the selection is just the active layer.
@@ -333,10 +382,39 @@ impl Session {
         // Last-resort guard (AGENTS.md, Never crash): a command that panics anyway fails with an
         // error instead of taking the app down. `edit` only commits a document after its closure
         // returns, so the documents are unchanged.
+        let before: Vec<(photocraft_doc::DocId, u64, Arc<Document>)> = self.docs.iter().map(|st| (st.doc.id, st.revision, st.doc.clone())).collect();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &run_params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("`{id}` failed with an internal error (logged); the document is unchanged"))));
         self.coalesce_request = None;
         self.color_restrict = None;
+        // Log what changed, so the canvas can repaint just that even when several commands ran
+        // since its last frame. One step: the command's own damage; several: compare documents.
+        for st in &mut self.docs {
+            let Some((_, rev, doc)) = before.iter().find(|(id, _, _)| *id == st.doc.id) else { continue };
+            if st.revision == *rev {
+                continue;
+            }
+            let damage = if st.revision == rev + 1 {
+                if st.pixel_damage
+                    && let Some(r) = st.last_damage.filter(|r| !r.is_empty())
+                {
+                    let grown = r.inflate(damage::changed_reach(doc, &st.doc)).intersect(&st.doc.bounds());
+                    st.last_damage = Some(grown);
+                }
+                st.last_damage
+            } else {
+                damage::between(doc, &st.doc)
+            };
+            st.pixel_damage = false;
+            // Revisions skipped in the middle are covered by this one entry.
+            st.damage_log.retain(|(r, _)| *r <= *rev);
+            if st.revision > rev + 1 {
+                for skipped in rev + 1..st.revision {
+                    st.damage_log.push_back((skipped, Some(photocraft_geom::Rect::EMPTY)));
+                }
+            }
+            st.log_damage(damage);
+        }
         let r = r?;
         edit_menu_cmds::after_command(self, id);
         automate_cmds::after_command(self, id);
@@ -369,13 +447,14 @@ impl Session {
         channel_cmds::fix_view(st);
         let key = self.coalesce_request.clone();
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
+        st.last_damage = damage::between(&before, &st.doc);
+        st.pixel_damage = false;
         if key.is_none() || st.coalesce != key || !st.history.can_undo() {
             st.history.record(label, before);
             st.history.trim(&st.doc);
         }
         st.coalesce = key;
         st.revision += 1;
-        st.last_damage = None;
         Ok(r)
     }
 
@@ -403,10 +482,10 @@ impl Session {
         st.coalesce = None;
         match st.history.undo(st.doc.clone()) {
             Some(d) => {
+                st.last_damage = damage::between(&st.doc, &d);
                 st.doc = d;
                 fix_active(st);
                 st.revision += 1;
-                st.last_damage = None;
                 true
             }
             None => false,
@@ -418,10 +497,10 @@ impl Session {
         st.coalesce = None;
         match st.history.redo(st.doc.clone()) {
             Some(d) => {
+                st.last_damage = damage::between(&st.doc, &d);
                 st.doc = d;
                 fix_active(st);
                 st.revision += 1;
-                st.last_damage = None;
                 true
             }
             None => false,

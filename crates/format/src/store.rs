@@ -215,7 +215,7 @@ impl Sink for Collect<'_> {
             swap_to_le(&mut b, format.sample);
             hash_bytes(&b)
         } else {
-            hash_bytes(tile.bytes())
+            hash_bytes(&tile.bytes())
         };
         if let Some(cache) = self.hash_cache.as_deref_mut() {
             cache.insert(key, (Arc::downgrade(tile), h.clone()));
@@ -231,13 +231,30 @@ impl Sink for Collect<'_> {
     }
 }
 
-fn tile_le(t: &Tile, sample: SampleType) -> std::borrow::Cow<'_, [u8]> {
+/// A tile's bytes in little-endian order: the tile itself (kept in memory while this lives), or
+/// a byte-swapped copy on big-endian machines.
+enum LeBytes<'a> {
+    Native(photocraft_raster::TileBytes<'a>),
+    Swapped(Vec<u8>),
+}
+
+impl std::ops::Deref for LeBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            LeBytes::Native(b) => b,
+            LeBytes::Swapped(b) => b,
+        }
+    }
+}
+
+fn tile_le(t: &Tile, sample: SampleType) -> LeBytes<'_> {
     if cfg!(target_endian = "big") {
         let mut b = t.bytes().to_vec();
         swap_to_le(&mut b, sample);
-        std::borrow::Cow::Owned(b)
+        LeBytes::Swapped(b)
     } else {
-        std::borrow::Cow::Borrowed(t.bytes())
+        LeBytes::Native(t.bytes())
     }
 }
 

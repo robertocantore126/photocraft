@@ -322,7 +322,7 @@ pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
 pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<(egui::TextureId, f32)> {
     let (revision, last_damage, id) = {
         let st = app.session.documents().get(idx)?;
-        (st.revision, st.last_damage.map(|r| if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) }), st.doc.id)
+        (st.revision, st.last_damage, st.doc.id)
     };
     let (mut doc, mut preview_key) = display_doc(app, idx);
     // A flipped view draws a GPU machine's canvas through here: an adjustment dialog's preview of
@@ -388,6 +388,14 @@ fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), now: (u64, u6
     if seen.1 == now.1 ^ display_key && seen.0 + 1 == now.0 {
         return last_damage;
     }
+    // Several edits since that frame: the union of their damage, when every one is known.
+    if seen.1 == now.1 ^ display_key
+        && seen.0 < now.0
+        && let Some(st) = app.session.documents().get(idx)
+        && let Some(d) = st.damage_since(seen.0)
+    {
+        return Some(d);
+    }
     // Between an adjustment dialog's previews (and the document): the target's area.
     if seen.0 == now.0
         && let Some(st) = app.session.documents().get(idx)
@@ -397,7 +405,8 @@ fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), now: (u64, u6
     }
     let l = live_stroke(app, idx).filter(|l| seen.0 == now.0 && l.display_key() == now.1)?;
     let r = l.since(seen.1 ^ display_key)?;
-    Some(if r.is_empty() { r } else { r.inflate(effect_reach(&l.stroke.doc.layers)) })
+    let reach = l.stroke.layer().map_or_else(|| effect_reach(&l.stroke.doc.layers), |id| photocraft_engine::damage::chain_reach(&l.stroke.doc, id));
+    Some(if r.is_empty() { r } else { r.inflate(reach) })
 }
 
 /// How far beyond an edit's damage rect the composite can change: layer effects (shadows, glows,
@@ -423,12 +432,7 @@ pub(crate) fn effect_reach(layers: &[photocraft_doc::Layer]) -> i32 {
 /// Returns false if there is no GPU canvas.
 fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
     let Some(gpu) = app.gpu.clone() else { return false };
-    let Some((revision, last_damage, id)) = app
-        .session
-        .documents()
-        .get(idx)
-        .map(|st| (st.revision, st.last_damage.map(|r| if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) }), st.doc.id))
-    else {
+    let Some((revision, last_damage, id)) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage, st.doc.id)) else {
         return false;
     };
     let (doc, raw_key) = display_doc(app, idx);
@@ -485,19 +489,31 @@ fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
 
 /// Point the wgpu compositor at what the view shows, and size its memory budget from Memory
 /// Usage, the document's pixels and History, and physical memory: on full refreshes (pixels
-/// counted once per structural change, not per brush dab) and whenever the preference changes.
+/// counted once per structural change, not per brush dab), whenever the preference changes,
+/// and with a scratch disk whenever the tiles in memory move by more than 64 MB.
 fn gpu_budget(app: &mut PhotocraftApp, gpu: &crate::gpu_canvas::GpuCanvas, idx: usize, partial: bool, visible: DRect) {
     gpu.set_focus(Some(visible));
     let allowance = u64::from(app.session.prefs().performance.memory_usage_mb).saturating_mul(1 << 20);
-    if partial && app.perf.gpu_budget_allowance == allowance && gpu.memory_budget().is_some() {
+    // With a scratch disk the tiles in memory are one cheap counter (at most the tile budget),
+    // so partial refreshes follow it too: edits rarely refresh everything, and a budget sized
+    // while the document was empty would let the GPU pages grow past Memory Usage.
+    let spill = photocraft_raster::spill::enabled();
+    let resident = if spill { photocraft_raster::spill::stats().resident_bytes as u64 } else { 0 };
+    let moved = resident.abs_diff(app.perf.gpu_budget_pixels) > 64 << 20;
+    if partial && app.perf.gpu_budget_allowance == allowance && gpu.memory_budget().is_some() && !(spill && moved) {
         return;
     }
-    let Some(st) = app.session.documents().get(idx) else { return };
-    let pixels = st.history.pixel_bytes(&st.doc) as u64;
+    let pixels = if spill {
+        resident
+    } else {
+        let Some(st) = app.session.documents().get(idx) else { return };
+        st.history.pixel_bytes(&st.doc) as u64
+    };
     let budget = crate::gpu_canvas::memory_budget(allowance, pixels, crate::gpu_canvas::physical_memory());
     gpu.set_memory_budget(budget);
     app.perf.gpu_budget_mb = budget >> 20;
     app.perf.gpu_budget_allowance = allowance;
+    app.perf.gpu_budget_pixels = pixels;
 }
 
 /// Live preview for an open filter dialog: run the filter on the proxy and upload it.

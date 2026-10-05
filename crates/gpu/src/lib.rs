@@ -51,6 +51,10 @@ pub use plan::{Kernel, Plan, Role, Unsupported, plan};
 /// (Posterize, Threshold, Hard Mix, Dissolve) must land on the same side of their thresholds as
 /// the CPU reference, and Color Burn/Dodge amplify input error.
 pub const ACC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float; // default accumulation format; `preferred_acc_format` downgrades to Rgba16Float where 32-bit float isn't renderable
+/// Half-float accumulation: half the memory traffic per pass. Precise enough for 8-bit
+/// documents (an 11-bit mantissa per step, below 1/255 at the end of typical stacks); 16- and
+/// 32-bit documents keep [`ACC_FORMAT`].
+pub const FAST_ACC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Effect intermediates (distances, blurs) and layer shapes.
 const MAP32: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 /// Final effect coverage maps (0..1; half precision is ~1/4000).
@@ -504,6 +508,26 @@ fn first_error<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> (T, Option<wg
 }
 
 impl Compositor {
+    /// Switch the accumulation format (for the next renders) when pipelines for it were built:
+    /// [`FAST_ACC_FORMAT`] halves the GPU memory traffic of every pass. Returns whether `format`
+    /// is now in use. Chunk textures of the old format are dropped.
+    pub fn set_acc_format(&mut self, format: wgpu::TextureFormat) -> bool {
+        if format == self.acc_format {
+            return true;
+        }
+        if !self.kit.pipelines.contains_key(&(Kernel::Blend, format)) {
+            return false;
+        }
+        self.acc_format = format;
+        self.pool.clear();
+        true
+    }
+
+    /// The accumulation format in use.
+    pub fn acc_format(&self) -> wgpu::TextureFormat {
+        self.acc_format
+    }
+
     /// Create a compositor with the default accumulation format ([`ACC_FORMAT`]).
     pub fn new(device: &wgpu::Device) -> Self {
         Self::new_with_format(device, ACC_FORMAT)
@@ -568,6 +592,15 @@ impl Compositor {
         };
         let mut pipelines: HashMap<_, _> =
             Kernel::DRAWN.iter().filter(|k| !k.is_map()).filter_map(|&k| Some(((k, acc_format), pipeline(k, acc_format)?))).collect();
+        // Half-float accumulators too, for 8-bit documents (see `set_acc_format`); an adapter that
+        // can't build them just keeps the main format.
+        if acc_format != FAST_ACC_FORMAT {
+            let (fast, err) =
+                first_error(device, || Kernel::DRAWN.iter().filter(|k| !k.is_map()).filter_map(|&k| Some(((k, FAST_ACC_FORMAT), pipeline(k, FAST_ACC_FORMAT)?))).collect::<Vec<_>>());
+            if err.is_none() {
+                pipelines.extend(fast);
+            }
+        }
         // Effect maps render to R32Float / R16Float, which some adapters (e.g. GL without float
         // render targets) can't: then layer effects use the CPU compositor and the rest stays here.
         let maps = Kernel::DRAWN.iter().filter(|k| k.is_map()).flat_map(|&k| [(k, MAP32), (k, MAP16)]);
@@ -820,8 +853,11 @@ impl Compositor {
     ) -> Result<Stats, Unsupported> {
         let canvas = doc.bounds();
         let region = region.intersect(&canvas);
+        let trace = Trace::new();
         let plan = plan(doc)?;
+        let t_plan = trace.lap();
         self.check_fx(doc, &plan)?;
+        let t_check = trace.lap();
         let mut stats = Stats { passes: plan.passes.len(), slots: plan.slots, ..Default::default() };
         if region.is_empty() {
             return Ok(stats);
@@ -844,7 +880,10 @@ impl Compositor {
                 self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, None), f.region, &mut stats);
             }
         }
+        let t_fx = trace.lap();
         let fr = self.frame_res(device, queue, canvas, &plan);
+        let t_res = trace.lap();
+        let (mut t_cells, mut t_evict) = (0.0, 0.0);
 
         // Page cells; every other frame in reverse, so a repeated full refresh of a document
         // larger than the budget starts with the pages still resident.
@@ -881,8 +920,11 @@ impl Compositor {
             let chunks = grid_rects(part, self.chunk);
             stats.chunks += chunks.len();
             work += part.width() as u64 * part.height() as u64 * plan.passes.len() as u64;
+            trace.lap();
             self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, &fr, &chunks, &mut stats, sink);
+            t_cells += trace.lap();
             let (evicted, bytes) = self.evict();
+            t_evict += trace.lap();
             stats.evicted += evicted;
             freed += bytes;
             if flush && (self.staged >= flush_bytes || work >= FLUSH_WORK || freed >= flush_bytes) {
@@ -911,6 +953,17 @@ impl Compositor {
         self.fx.retain(|(id, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
         stats.evicted += self.evict().0;
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
+        if trace.on {
+            eprintln!(
+                "gpu trace: {} px, {} passes, {} cells, {} chunks: plan {t_plan:.1} ms, check {t_check:.1}, fx {t_fx:.1}, frame res {t_res:.1}, cells {t_cells:.1}, evict {t_evict:.1}, tail {:.1}; {} tiles up",
+                region.width() as u64 * region.height() as u64,
+                stats.passes,
+                stats.cells,
+                stats.chunks,
+                trace.lap(),
+                stats.tiles_uploaded
+            );
+        }
         Ok(stats)
     }
 
@@ -1839,6 +1892,37 @@ pub fn render_to_vec_stats(
         }
     }
     Ok((out, stats))
+}
+
+/// CPU time of [`Compositor::render`]'s phases, printed when `PHOTOCRAFT_GPU_TRACE=1`.
+struct Trace {
+    on: bool,
+    last: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl Trace {
+    fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let on = std::env::var_os("PHOTOCRAFT_GPU_TRACE").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let on = false;
+        Trace { on, last: std::cell::Cell::new(None) }
+    }
+    /// Milliseconds since the previous lap (0 when tracing is off).
+    fn lap(&self) -> f64 {
+        if !self.on {
+            return 0.0;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = std::time::Instant::now();
+            let ms = self.last.get().map_or(0.0, |t| now.duration_since(t).as_secs_f64() * 1000.0);
+            self.last.set(Some(now));
+            ms
+        }
+        #[cfg(target_arch = "wasm32")]
+        0.0
+    }
 }
 
 #[cfg(test)]

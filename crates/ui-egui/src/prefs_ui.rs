@@ -96,10 +96,15 @@ pub fn load(app: &mut PhotocraftApp) {
         return;
     }
     app.prefs_rt.loaded = true;
-    if let Some(text) = app.services.load_prefs.as_mut().and_then(|f| f())
-        && let Err(e) = app.session.load_prefs_json(&text)
-    {
-        app.ui.status = format!("Preferences were reset: {e}");
+    match app.services.load_prefs.as_mut().and_then(|f| f()) {
+        Some(text) => {
+            if let Err(e) = app.session.load_prefs_json(&text) {
+                app.ui.status = format!("Preferences were reset: {e}");
+                app.session.apply_prefs();
+            }
+        }
+        // First launch: the defaults still configure the engine (scratch disk, caches).
+        None => app.session.apply_prefs(),
     }
     crate::dock::restore(app);
     app.prefs_rt.saved_rev = app.session.prefs.rev();

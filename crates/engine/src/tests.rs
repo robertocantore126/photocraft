@@ -297,15 +297,39 @@ fn translate_moves_pixels_and_respects_locks() {
 }
 
 #[test]
-fn damage_is_reported_for_strokes_only() {
+fn damage_is_what_changed() {
     let mut s = session_with_doc();
+    // An empty layer shows nothing new.
     s.execute("layer.new.layer", json!({})).unwrap();
-    assert_eq!(s.active().unwrap().last_damage, None);
+    assert_eq!(s.active().unwrap().last_damage, Some(photocraft_geom::Rect::EMPTY));
     s.execute("paint.stroke", json!({"points": [[10, 10], [20, 10]], "size": 4})).unwrap();
     let d = s.active().unwrap().last_damage.unwrap();
     assert!(d.contains(15, 10) && d.width() < 30);
+    // Undo restores the stroke's tiles only (found by comparing the documents).
     s.execute("edit.undo", json!({})).unwrap();
+    let d = s.active().unwrap().last_damage.unwrap();
+    assert!(d.contains(15, 10) && d.width() <= 256, "{d:?}");
+    // A document-wide change still repaints everything.
+    s.execute("image.canvasSize", json!({"width": 300, "height": 300})).unwrap();
     assert_eq!(s.active().unwrap().last_damage, None);
+}
+
+#[test]
+fn damage_since_unites_several_commands() {
+    let mut s = session_with_doc();
+    let start = s.active().unwrap().revision;
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+    s.execute("select.deselect", json!({})).unwrap();
+    s.execute("paint.stroke", json!({"points": [[10, 10], [20, 10]], "size": 4})).unwrap();
+    s.execute("paint.stroke", json!({"points": [[40, 40], [50, 40]], "size": 4})).unwrap();
+    let st = s.active().unwrap();
+    let d = st.damage_since(start).expect("every step is logged");
+    assert!(d.contains(15, 10) && d.contains(45, 40) && d.width() < 60, "{d:?}");
+    assert_eq!(st.damage_since(st.revision), Some(photocraft_geom::Rect::EMPTY));
+    // A step that changed everything makes the union unknown.
+    s.execute("image.canvasSize", json!({"width": 300, "height": 300})).unwrap();
+    assert_eq!(s.active().unwrap().damage_since(start), None);
 }
 
 #[test]

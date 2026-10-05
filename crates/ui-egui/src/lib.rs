@@ -113,6 +113,9 @@ pub use state::{Tool, UiState};
 
 /// Decode a file: (document, warnings about anything approximated or dropped).
 pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<(Document, Vec<String>), String>>;
+/// [`ImportFn`] that owns the bytes, so the importer can free them early (see
+/// `photocraft_io::import_owned`).
+pub type ImportOwnedFn = Box<dyn Fn(&str, Vec<u8>) -> Result<(Document, Vec<String>), String>>;
 /// Encoder settings chosen in Export As (the file format comes from the name's extension).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportSettings {
@@ -161,6 +164,8 @@ pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
 pub struct Services {
     /// Decode a file's bytes into a document (PSD, PNG, JPEG, …).
     pub import: Option<ImportFn>,
+    /// Preferred over `import` when the caller read the file itself and can hand the bytes over.
+    pub import_owned: Option<ImportOwnedFn>,
     /// Encode a document for a file name (format chosen by extension).
     pub export: Option<ExportFn>,
     /// Show an "open file" dialog; returns (name, bytes).
@@ -465,15 +470,30 @@ impl PhotocraftApp {
         r.truncate(10);
     }
 
+    /// Import `bytes` as a document, handing them to the owning importer when they are owned.
+    fn import_doc(&self, name: &str, bytes: std::borrow::Cow<'_, [u8]>) -> Result<(Document, Vec<String>), String> {
+        match (bytes, self.services.import_owned.as_ref()) {
+            (std::borrow::Cow::Owned(v), Some(import)) => import(name, v),
+            (bytes, _) => {
+                let import = self.services.import.as_ref().ok_or("no importer configured")?;
+                import(name, &bytes)
+            }
+        }
+    }
+
     /// Open a file's bytes as a new document named `name`; returns the import warnings (also
     /// shown to the user). Files from disk go through [`open_file`](Self::open_file), which also
     /// remembers the path. Brush and gradient files go to the preset libraries instead.
     pub fn open_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-        if let Some(r) = preset_files_ui::open(self, name, bytes) {
+        self.open_cow(name, std::borrow::Cow::Borrowed(bytes))
+    }
+
+    /// [`open_bytes`](Self::open_bytes) with bytes the importer may own (and free early).
+    pub(crate) fn open_cow(&mut self, name: &str, bytes: std::borrow::Cow<'_, [u8]>) -> Result<Vec<String>, String> {
+        if let Some(r) = preset_files_ui::open(self, name, &bytes) {
             return r.map(|()| Vec::new());
         }
-        let import = self.services.import.as_ref().ok_or("no importer configured")?;
-        let (doc, warnings) = import(name, bytes)?;
+        let (doc, warnings) = self.import_doc(name, bytes)?;
         // Edit › Color Settings policies apply on open; mismatches can ask what to do.
         // No path yet: a bare name isn't a location to save back to (`open_file` sets the path).
         let (_, color) = self.session.open_document(doc, None);
@@ -496,11 +516,16 @@ impl PhotocraftApp {
     /// Returns the import warnings (also shown to the user). Brush and gradient
     /// files go to the preset libraries, as for interactive opens.
     pub fn open_automation_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+        self.open_automation_cow(name, std::borrow::Cow::Borrowed(bytes))
+    }
+
+    /// [`open_automation_bytes`](Self::open_automation_bytes) with bytes the importer may own.
+    pub(crate) fn open_automation_cow(&mut self, name: &str, bytes: std::borrow::Cow<'_, [u8]>) -> Result<Vec<String>, String> {
         let events_enabled = self.session.prefs().script_events.enabled;
         if events_enabled {
             self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
         }
-        let result = match preset_files_ui::open(self, name, bytes) {
+        let result = match preset_files_ui::open(self, name, &bytes) {
             Some(r) => r.map(|()| Vec::new()),
             None => self.import_automation_document(name, bytes),
         };
@@ -512,9 +537,8 @@ impl PhotocraftApp {
 
     /// The document half of [`open_automation_bytes`](Self::open_automation_bytes): no script
     /// events and no Color Settings policy (which may read user-configured profile paths).
-    fn import_automation_document(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-        let import = self.services.import.as_ref().ok_or("no importer configured")?;
-        let (doc, warnings) = import(name, bytes)?;
+    fn import_automation_document(&mut self, name: &str, bytes: std::borrow::Cow<'_, [u8]>) -> Result<Vec<String>, String> {
+        let (doc, warnings) = self.import_doc(name, bytes)?;
         self.session.add_document(doc, Some(name.to_string()));
         self.sync_views();
         self.ui.status = format!("Opened {name}");
@@ -741,26 +765,39 @@ impl eframe::App for PhotocraftApp {
         if !chrome && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             let _ = menus::invoke(self, &ctx, "view.screenMode.standard", serde_json::json!({}));
         }
+        // Per-section UI time (`ui.inspect` → perf.timings.spans).
+        let mut lap = gpu_canvas::now_ms();
+        let mut split = |perf: &mut gpu_canvas::Perf, name: &'static str| {
+            let now = gpu_canvas::now_ms();
+            perf.span(name, now - lap);
+            lap = now;
+        };
         if chrome {
             panels::title_bar(self, ui);
         }
+        split(&mut self.perf, "ui:title");
         if chrome && self.ui.panels.options_bar {
             panels::options_bar(self, ui);
         }
+        split(&mut self.perf, "ui:options");
         if chrome && self.ui.panels.status_bar {
             panels::status_bar(self, ui);
         }
+        split(&mut self.perf, "ui:status");
         if chrome && self.ui.panels.toolbar {
             panels::toolbar(self, ui);
         }
+        split(&mut self.perf, "ui:toolbar");
         if chrome {
             panels::right_dock(self, ui);
         }
+        split(&mut self.perf, "ui:dock");
         let t = theme::Tokens::get(&ctx);
         let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
             canvas::document_area(self, ui);
         });
+        split(&mut self.perf, "ui:canvas");
         panels::properties_window(self, &ctx);
         brush_panel::window(self, &ctx);
         preset_panels::windows(self, &ctx);
@@ -776,6 +813,7 @@ impl eframe::App for PhotocraftApp {
         wide_angle_ui::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
         notices::show(self, &ctx);
+        split(&mut self.perf, "ui:windows");
         self.automation_input = false;
         self.perf.frame(gpu_canvas::now_ms() - t0);
         // Synthetic input is injected one press/release step per frame: keep frames coming until

@@ -94,7 +94,7 @@ fn run_stroke(s: &mut Session, label: &str, id: LayerId, f: impl FnOnce(&Documen
         f(&pre, surf, pre.selection.as_ref(), lock)
     })?;
     if let Some(st) = s.active_mut() {
-        st.last_damage = Some(dmg);
+        st.set_pixel_damage(dmg);
     }
     Ok(dmg)
 }

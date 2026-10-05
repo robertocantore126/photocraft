@@ -526,7 +526,8 @@ pub fn convert_surface(s: &Surface, from: ColorMode, to: PixelFormat, t: &Transf
     let tile_px = (photocraft_geom::TILE_SIZE * photocraft_geom::TILE_SIZE) as usize;
     let dst_len = tile_px * to.bytes_per_pixel();
     let mut staging = vec![0u8; dst_len * tiles.len()];
-    let jobs: Vec<(&[u8], &mut [u8])> = tiles.iter().map(|(_, t)| t.bytes()).zip(staging.chunks_mut(dst_len.max(1))).collect();
+    let sources: Vec<_> = tiles.iter().map(|(_, t)| t.bytes()).collect();
+    let jobs: Vec<(&[u8], &mut [u8])> = sources.iter().map(|b| &**b).zip(staging.chunks_mut(dst_len.max(1))).collect();
     let kind = match sf.sample {
         SampleType::U8 => SampleKind::U8,
         SampleType::U16 => SampleKind::U16,

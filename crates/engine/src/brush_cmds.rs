@@ -188,7 +188,7 @@ fn layer_id(s: &Session, p: &Value) -> Result<photocraft_doc::LayerId> {
 
 fn damage_json(s: &mut Session, dmg: Rect) -> Value {
     if let Some(st) = s.active_mut() {
-        st.last_damage = Some(dmg);
+        st.set_pixel_damage(dmg);
     }
     json!({ "damage": [dmg.x0, dmg.y0, dmg.width(), dmg.height()] })
 }
@@ -271,6 +271,11 @@ pub struct LiveStroke {
 }
 
 impl LiveStroke {
+    /// The layer being painted (`None`: the stroke targets something else, e.g. a channel).
+    pub fn layer(&self) -> Option<photocraft_doc::LayerId> {
+        self.layer
+    }
+
     /// Start from `paint.stroke` params; their `points` are rendered.
     pub fn begin(s: &Session, p: &Value) -> Result<Self> {
         has_paintable(s).map_err(EngineError::Other)?;

@@ -27,11 +27,16 @@ impl PhotocraftApp {
     /// `path` for File › Save, and `path` goes to the top of Open Recent. Returns the import
     /// warnings (also shown to the user).
     pub fn open_file(&mut self, path: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+        self.open_file_cow(path, std::borrow::Cow::Borrowed(bytes))
+    }
+
+    /// [`open_file`](Self::open_file) with bytes the importer may own (and free early).
+    fn open_file_cow(&mut self, path: &str, bytes: std::borrow::Cow<'_, [u8]>) -> Result<Vec<String>, String> {
         // Brushes/gradients go to the preset libraries (no document, no Open Recent entry).
-        if let Some(r) = crate::preset_files_ui::open(self, path, bytes) {
+        if let Some(r) = crate::preset_files_ui::open(self, path, &bytes) {
             return r.map(|()| Vec::new());
         }
-        let warnings = self.open_bytes(&display_name(path), bytes)?;
+        let warnings = self.open_cow(&display_name(path), bytes)?;
         if let Some(st) = self.session.active_mut() {
             st.path = Some(path.to_string());
         }
@@ -43,7 +48,7 @@ impl PhotocraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &str) -> Result<Vec<String>, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        self.open_file(path, &bytes)
+        self.open_file_cow(path, std::borrow::Cow::Owned(bytes))
     }
 
     #[cfg(target_arch = "wasm32")]
