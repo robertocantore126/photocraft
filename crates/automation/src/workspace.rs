@@ -36,6 +36,91 @@ impl AuthorizedWorkspace {
         Ok(Self { read: open_root(read_root, "read")?, write: open_root(write_root, "write")? })
     }
 
+    /// Open a capability-scoped native pack reader without materializing the file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_read_file(&self, path: &str) -> Result<std::fs::File, AutomationError> {
+        let relative = relative_path(path)?;
+        let root = self.read.as_ref().ok_or_else(|| AutomationError::BadRequest(format!("{DENIED}: read authority is absent")))?;
+        let file = root.dir.open(&relative).map_err(|e| file_error("read", path, e))?;
+        if !file.metadata().map_err(|e| file_error("read", path, e))?.is_file() {
+            return Err(AutomationError::BadRequest("automation path is not a regular file".into()));
+        }
+        Ok(file.into_std())
+    }
+    /// Open a capability-scoped non-truncating read/write handle for append-only commits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_pack_writer(&self, path: &str) -> Result<std::fs::File, AutomationError> {
+        self.pack_writer(path, false)
+    }
+    /// Create a new staging pack without overwriting any existing entry.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_pack_writer(&self, path: &str) -> Result<std::fs::File, AutomationError> {
+        self.pack_writer(path, true)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pack_writer(&self, path: &str, new: bool) -> Result<std::fs::File, AutomationError> {
+        let relative = relative_path(path)?;
+        let root = self.write.as_ref().ok_or_else(|| AutomationError::BadRequest(format!("{DENIED}: write authority is absent")))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).create_new(new);
+        let file = root.dir.open_with(&relative, &options).map_err(|e| file_error("write", path, e))?;
+        if !file.metadata().map_err(|e| file_error("write", path, e))?.is_file() {
+            return Err(AutomationError::BadRequest("automation path is not a regular file".into()));
+        }
+        Ok(file.into_std())
+    }
+
+    /// Atomically publish a completed pack within the granted write directory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn replace_file(&self, from: &str, to: &str) -> Result<(), AutomationError> {
+        let from = relative_path(from)?;
+        let to = relative_path(to)?;
+        let root = self.write.as_ref().ok_or_else(|| AutomationError::BadRequest(format!("{DENIED}: write authority is absent")))?;
+        root.dir.rename(&from, &root.dir, &to).map_err(|e| file_error("publish", to.to_string_lossy().as_ref(), e))
+    }
+
+    /// Import a native document through capability handles, preserving lazy pack tiles.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_document(&self, path: &str) -> Result<photocraft_io::ImportResult, AutomationError> {
+        let file = self.open_read_file(path)?;
+        let workspace = self.clone();
+        let relative = path.to_string();
+        let name = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path);
+        Ok(photocraft_io::import_file_with_opener(name, file, Arc::new(move || workspace.open_read_file(&relative).map_err(std::io::Error::other)))?)
+    }
+    /// Commit a pack without materializing a byte bundle or escaping the write root.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_document_pack(&self, doc: &photocraft_doc::Document, path: &str, mut compact: bool) -> Result<photocraft_format::SaveStats, AutomationError> {
+        let mut existing = if compact { None } else { Some(self.open_pack_writer(path)?) };
+        if let Some(file) = existing.as_mut() {
+            let mut magic = [0; 8];
+            compact = file.metadata().map_err(|e| file_error("write", path, e))?.len() > 0
+                && (file.read_exact(&mut magic).is_err() || &magic != photocraft_format::pack::MAGIC);
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let target = if compact { format!("{path}.{stamp}-{}.pack-tmp", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) } else { path.to_string() };
+        let mut file = if compact {
+            existing.take();
+            self.create_pack_writer(&target)?
+        } else {
+            existing.ok_or_else(|| AutomationError::BadRequest("missing pack writer".into()))?
+        };
+        let workspace = self.clone();
+        let relative = path.to_string();
+        let opener = Arc::new(move || {
+            let relative = relative_path(&relative).map_err(std::io::Error::other)?;
+            let root = workspace.write.as_ref().ok_or_else(|| std::io::Error::other("write authority is absent"))?;
+            root.dir.open(&relative).map(|file| file.into_std())
+        });
+        let stats = photocraft_format::pack::save_file_with_opener(doc, &mut file, &Default::default(), opener)?;
+        drop(file);
+        if compact {
+            self.replace_file(&target, path)?;
+        }
+        Ok(stats)
+    }
+
     /// Read one regular file below the configured read root.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, AutomationError> {
         let relative = relative_path(path)?;
@@ -276,6 +361,14 @@ mod tests {
         ] {
             assert!(workspace.read(path).is_err(), "read accepted {path:?}");
             assert!(workspace.write(path, b"x").is_err(), "write accepted {path:?}");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                assert!(workspace.open_read_file(path).is_err());
+                assert!(workspace.open_pack_writer(path).is_err());
+                assert!(workspace.create_pack_writer(path).is_err());
+                assert!(workspace.replace_file(path, "valid.pcraft").is_err());
+                assert!(workspace.replace_file("valid.pcraft", path).is_err());
+            }
         }
     }
 
@@ -286,9 +379,37 @@ mod tests {
         let read_only = AuthorizedWorkspace::new(Some(&inside), None).unwrap();
         assert_eq!(read_only.read("read.txt").unwrap(), b"canary");
         assert!(read_only.write("blocked.txt", b"x").is_err());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(read_only.open_pack_writer("blocked.pcraft").is_err());
+            assert!(read_only.create_pack_writer("blocked.pcraft").is_err());
+        }
         let write_only = AuthorizedWorkspace::new(None, Some(&inside)).unwrap();
         assert!(write_only.read("read.txt").is_err());
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(write_only.open_read_file("read.txt").is_err());
         write_only.write("written.txt", b"ok").unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pack_handles_append_and_publish_without_truncation() {
+        use std::io::{Seek, SeekFrom};
+        let (inside, _, workspace) = roots("pack-handles");
+        workspace.write("saved.pcraft", b"first").unwrap();
+        let mut file = workspace.open_pack_writer("saved.pcraft").unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b" second").unwrap();
+        drop(file);
+        assert_eq!(workspace.read("saved.pcraft").unwrap(), b"first second");
+        assert!(workspace.create_pack_writer("saved.pcraft").is_err());
+        let mut stage = workspace.create_pack_writer("stage.pcraft").unwrap();
+        stage.write_all(b"replacement").unwrap();
+        stage.sync_all().unwrap();
+        drop(stage);
+        workspace.replace_file("stage.pcraft", "saved.pcraft").unwrap();
+        assert_eq!(workspace.read("saved.pcraft").unwrap(), b"replacement");
+        assert!(!inside.join("stage.pcraft").exists());
     }
 
     #[test]

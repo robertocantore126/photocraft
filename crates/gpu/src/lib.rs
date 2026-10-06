@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use photocraft_color::{PixelFormat, SampleType};
 use photocraft_compose::effects::FieldKind;
-use photocraft_doc::{DocId, Document, Layer, LayerContent, LayerId, Pattern};
+use photocraft_doc::{DocId, Document, LayerContent, LayerId, Pattern};
 use photocraft_geom::{Rect, TILE_SIZE, TileCoord};
 use photocraft_raster::{Surface, Tile};
 
@@ -55,17 +55,26 @@ pub const ACC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float; //
 /// documents (an 11-bit mantissa per step, below 1/255 at the end of typical stacks); 16- and
 /// 32-bit documents keep [`ACC_FORMAT`].
 pub const FAST_ACC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// Effect intermediates (distances, blurs) and layer shapes.
+/// Effect maps: intermediates (distances, blurs), layer shapes and final coverage. Final maps
+/// were half float; a group's shape composited on the GPU from its children's glows then
+/// differed from the CPU's by ~1e-6 at the 0.5/255 inside threshold, enough to move a stroke.
 const MAP32: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
-/// Final effect coverage maps (0..1; half precision is ~1/4000).
-const MAP16: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
-/// Side of the square chunks the canvas is processed in.
+/// Side of the square chunks the canvas is processed in. Natively a chunk is a whole page cell:
+/// every chunk runs every pass of the plan, and passes cost about the same whether they cover
+/// a quarter or all of a cell, so a stroke crossing the 1024 grid used to pay up to 4× the
+/// passes (a 1100×500 region on a 648-pass PSB: 884 → 325 passes, 41 → 31 ms; full refreshes
+/// unchanged). The chunk pool is then 32 MB per slot at half float. The web keeps 1024.
+#[cfg(not(target_arch = "wasm32"))]
+pub const CHUNK: u32 = 2048;
+#[cfg(target_arch = "wasm32")]
 pub const CHUNK: u32 = 1024;
 const STRIDE: u64 = 256;
-const CHUNK_UNIFORM: u64 = 16;
+const CHUNK_UNIFORM: u64 = 32;
 const OP_UNIFORM: u64 = 176;
-/// GPU memory the effect-map cache may hold before evicting layers not drawn this frame.
-pub const FX_BUDGET: usize = 1536 << 20;
+/// GPU memory the effect-map cache may hold before evicting layers not drawn this frame. Maps
+/// are full float and a document-wide group's cover the whole canvas: a 479-layer PSB with 54
+/// effect layers holds 1.3 GB of them, and a smaller cache rebuilt them every slice.
+pub const FX_BUDGET: usize = 2048 << 20;
 /// Largest side of the square pages layer surfaces are stored in on the GPU (smaller when the
 /// device's texture limit is). A chunk only binds the pages of the cell it lies in, so layers of
 /// any size composite on the GPU.
@@ -84,6 +93,10 @@ const FLUSH_WORK: u64 = 1 << 30;
 /// texture's origin.
 pub struct ChunkOut<'a> {
     pub rect: Rect,
+    /// Output level; rect stays in document coordinates.
+    pub mip_level: u32,
+    /// Valid texels at this level, starting at the texture origin.
+    pub pixel_size: [u32; 2],
     pub texture: &'a wgpu::Texture,
     pub view: &'a wgpu::TextureView,
 }
@@ -92,6 +105,12 @@ pub struct ChunkOut<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub passes: usize,
+    /// Chunk passes not run because a cached plan prefix stood in for them (`PrefixSnap`).
+    pub passes_cached: usize,
+    /// Actual chunk passes omitted because a raster layer cannot touch the chunk.
+    pub passes_culled: usize,
+    /// Actual render passes encoded, including clears.
+    pub passes_drawn: usize,
     pub chunks: usize,
     pub slots: u32,
     pub tiles_uploaded: usize,
@@ -177,11 +196,16 @@ struct Resident {
     stamp: u64,
     /// CMYK profile the texels were converted with (`CmykSpace::id`, 0 = built-in / not CMYK).
     cmyk: u64,
+    /// Changes whenever the texels do (`Compositor::gens`): a cached plan prefix that read this
+    /// page is valid while it is unchanged.
+    version: u64,
 }
 
 impl Resident {
     fn bytes(&self) -> u64 {
-        self.region.width() as u64 * self.region.height() as u64 * self.kind.bytes_per_pixel() as u64
+        (0..self.texture.mip_level_count())
+            .map(|level| (self.region.width() >> level).max(1) as u64 * (self.region.height() >> level).max(1) as u64 * self.kind.bytes_per_pixel() as u64)
+            .sum()
     }
 }
 
@@ -260,8 +284,10 @@ struct FxEntry {
     shape_key: u64,
     /// Tiles the shape was rendered from (content, mask): damage is their difference.
     tiles: [Option<fx::Tiles>; 2],
-    /// Groups: a clone pinning the tile pointers `shape_key` hashes.
-    _pin: Option<Layer>,
+    /// Groups: the tiles of every surface the shape was rendered from (`fx::group_surfaces`).
+    parts: Vec<(u64, u8, i32, fx::Tiles)>,
+    /// Changes whenever a map or the region does (see `Resident::version`).
+    version: u64,
     /// The shape on the CPU (distance fields are computed from it) and on the GPU.
     shape_cpu: Vec<f32>,
     shape: Tex,
@@ -273,9 +299,9 @@ struct FxEntry {
 }
 
 impl FxEntry {
+    /// GPU bytes (the CPU copy of the shape is not GPU memory).
     fn bytes(&self) -> usize {
         self.shape.bytes()
-            + self.shape_cpu.len() * 4
             + self.fields.values().map(|(_, t)| t.bytes()).sum::<usize>()
             + self.progs.iter().flat_map(|p| p.maps.iter().flatten()).map(Tex::bytes).sum::<usize>()
     }
@@ -380,8 +406,122 @@ fn texture_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, views: &
     device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("pc_compose_pass"), layout, entries: &e })
 }
 
+// Mip chains average premultiplied colour, then return straight alpha for the layer
+// shader. Transparent colours therefore cannot bleed into zoomed-out edges.
+const MIP_SHADER: &str = r#"
+@group(0) @binding(0) var source: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+fn average(p: vec2<i32>, alpha: bool) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(source));
+    var sum = vec4(0.0);
+    var count = 0.0;
+    for (var y = 0; y < 2; y++) { for (var x = 0; x < 2; x++) {
+        let q = p * 2 + vec2(x, y);
+        if (all(q < size)) {
+            let c = textureLoad(source, q, 0);
+            sum += select(c, vec4(c.rgb * c.a, c.a), alpha);
+            count += 1.0;
+        }
+    }}
+    let c = sum / max(count, 1.0);
+    if (alpha) { return vec4(select(vec3(0.0), c.rgb / max(c.a, 1e-20), c.a > 0.0), c.a); }
+    return c;
+}
+@fragment fn rgba(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return average(vec2<i32>(p.xy), true);
+}
+@fragment fn mask(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return average(vec2<i32>(p.xy), false);
+}
+"#;
+
+struct MipKit {
+    module: wgpu::ShaderModule,
+    layout: wgpu::BindGroupLayout,
+    pipelines: HashMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
+}
+
+impl MipKit {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            module: device
+                .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pc_layer_mips"), source: wgpu::ShaderSource::Wgsl(MIP_SHADER.into()) }),
+            layout: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("pc_layer_mips"), entries: &[tex_entry(0)] }),
+            pipelines: HashMap::new(),
+        }
+    }
+
+    fn generate(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, mask: bool) {
+        let pipeline = self.pipelines.entry((texture.format(), mask)).or_insert_with(|| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pc_layer_mips"),
+                bind_group_layouts: &[Some(&self.layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("pc_layer_mips"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.module,
+                    entry_point: Some(if mask { "mask" } else { "rgba" }),
+                    targets: &[Some(wgpu::ColorTargetState { format: texture.format(), blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+        for level in 1..texture.mip_level_count() {
+            let view = |mip| texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: mip, mip_level_count: Some(1), ..Default::default() });
+            let source = view(level - 1);
+            let target = view(level);
+            let group = texture_group(device, &self.layout, &[&source]);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pc_layer_mips"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+}
+
 /// GPU compositor. Create once per device; call [`Compositor::render`] per refresh.
 pub struct Compositor {
+    pass_culling: bool,
+    /// Inside a nested render (a group's shape, `layer_shape`): the frame, the caches and their
+    /// eviction belong to the render that asked for it.
+    nested: bool,
+    /// Version counter of pages and effect maps (`Resident::version`, `FxEntry::version`).
+    gens: u64,
+    /// The caller vouches that only layer pixels changed since the previous render (a live
+    /// brush stroke): groups keep their cached settings key (`fx::group_key` formats every
+    /// descendant's settings, 3.5 ms for a 400-layer group per dab).
+    pixels_only: bool,
+    /// Cached plan prefixes per page cell (see `PrefixSnap`).
+    prefix: HashMap<(DocId, Cell), PrefixSnap>,
+    /// Per cell: each pass's (signature, input version) at its last refresh, and the first pass
+    /// that changed then (a stroke changes the same one refresh after refresh).
+    prefix_last: HashMap<(DocId, Cell), PrefixSeen>,
+    render_mip: u32,
+    mip_kit: Option<MipKit>,
     kit: Kit,
     pool: Vec<(wgpu::Texture, wgpu::TextureView)>,
     residents: HashMap<ResKey, Resident>,
@@ -389,6 +529,9 @@ pub struct Compositor {
     /// Effect temporaries (R32F, region sized) and the frame they were last used.
     temps: Vec<(Tex, u64)>,
     patterns: HashMap<String, (u64, Tex)>,
+    /// Adjustment LUT textures by content hash, with the frame they were last used in: plans
+    /// rebuild their tables every refresh, which uploaded 16 of them per stroke on a big PSB.
+    luts: HashMap<u64, (wgpu::Texture, wgpu::TextureView, u64)>,
     /// Texture side limit the paging is planned for (the device's, or smaller in tests).
     max_dim: u32,
     /// The device's real texture side limit.
@@ -403,6 +546,8 @@ pub struct Compositor {
     /// What the view shows: a full refresh draws these cells last, so their pages are the
     /// ones still resident for the edits that follow.
     focus: Option<Rect>,
+    /// Canvas slices build only the effect windows they consume; headless stays exact/full.
+    progressive: bool,
     frame: u64,
     /// Cell visits so far (LRU clock of pages).
     stamp: u64,
@@ -508,6 +653,11 @@ fn first_error<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> (T, Option<wg
 }
 
 impl Compositor {
+    /// Disable identity culling for differential tests and same-process A/B measurements.
+    pub fn set_pass_culling(&mut self, enabled: bool) {
+        self.pass_culling = enabled;
+    }
+
     /// Switch the accumulation format (for the next renders) when pipelines for it were built:
     /// [`FAST_ACC_FORMAT`] halves the GPU memory traffic of every pass. Returns whether `format`
     /// is now in use. Chunk textures of the old format are dropped.
@@ -520,6 +670,7 @@ impl Compositor {
         }
         self.acc_format = format;
         self.pool.clear();
+        self.prefix.clear();
         true
     }
 
@@ -595,15 +746,16 @@ impl Compositor {
         // Half-float accumulators too, for 8-bit documents (see `set_acc_format`); an adapter that
         // can't build them just keeps the main format.
         if acc_format != FAST_ACC_FORMAT {
-            let (fast, err) =
-                first_error(device, || Kernel::DRAWN.iter().filter(|k| !k.is_map()).filter_map(|&k| Some(((k, FAST_ACC_FORMAT), pipeline(k, FAST_ACC_FORMAT)?))).collect::<Vec<_>>());
+            let (fast, err) = first_error(device, || {
+                Kernel::DRAWN.iter().filter(|k| !k.is_map()).filter_map(|&k| Some(((k, FAST_ACC_FORMAT), pipeline(k, FAST_ACC_FORMAT)?))).collect::<Vec<_>>()
+            });
             if err.is_none() {
                 pipelines.extend(fast);
             }
         }
         // Effect maps render to R32Float / R16Float, which some adapters (e.g. GL without float
         // render targets) can't: then layer effects use the CPU compositor and the rest stays here.
-        let maps = Kernel::DRAWN.iter().filter(|k| k.is_map()).flat_map(|&k| [(k, MAP32), (k, MAP16)]);
+        let maps = Kernel::DRAWN.iter().filter(|k| k.is_map()).map(|&k| (k, MAP32));
         let (maps, map_error) = first_error(device, || maps.filter_map(|key| Some((key, pipeline(key.0, key.1)?))).collect::<Vec<_>>());
         if let Some(e) = &map_error {
             log::info!("GPU compositor: no effect-map pipelines ({e}); layer effects use the CPU");
@@ -614,9 +766,18 @@ impl Compositor {
         Self {
             kit: Kit { pipelines, bgl0, bgl1, dummy },
             pool: Vec::new(),
+            pass_culling: true,
+            nested: false,
+            gens: 0,
+            pixels_only: false,
+            prefix: HashMap::new(),
+            prefix_last: HashMap::new(),
+            render_mip: 0,
+            mip_kit: None,
             residents: HashMap::new(),
             fx: HashMap::new(),
             temps: Vec::new(),
+            luts: HashMap::new(),
             patterns: HashMap::new(),
             max_dim: 0,
             device_max: device.limits().max_texture_dimension_2d,
@@ -625,6 +786,7 @@ impl Compositor {
             resident_budget: RESIDENT_BUDGET,
             fx_budget: FX_BUDGET as u64,
             focus: None,
+            progressive: false,
             frame: 0,
             stamp: 0,
             staged: 0,
@@ -656,6 +818,9 @@ impl Compositor {
         self.residents.clear();
         self.fx.clear();
         self.temps.clear();
+        self.luts.clear();
+        self.prefix.clear();
+        self.prefix_last.clear();
     }
 
     /// The page side layer surfaces are stored in.
@@ -669,10 +834,10 @@ impl Compositor {
     }
 
     /// Set the GPU memory the compositor may hold for layer pages and effect maps together
-    /// (a quarter of it, at most [`FX_BUDGET`], for effect maps). Uploads and evicted pages in
+    /// (two fifths of it, at most [`FX_BUDGET`], for effect maps). Uploads and evicted pages in
     /// flight during a refresh stay within about a quarter more.
     pub fn set_memory_budget(&mut self, bytes: u64) {
-        self.fx_budget = (FX_BUDGET as u64).min(bytes / 4);
+        self.fx_budget = (FX_BUDGET as u64).min(bytes / 5 * 2);
         self.resident_budget = bytes.saturating_sub(self.fx_budget);
     }
 
@@ -713,6 +878,19 @@ impl Compositor {
     /// The document area the view shows (`None`: unknown). Full refreshes draw its cells last.
     pub fn set_focus(&mut self, focus: Option<Rect>) {
         self.focus = focus;
+    }
+
+    /// Whether only layer pixels changed since the previous render (see `pixels_only`).
+    pub fn set_pixels_only(&mut self, pixels_only: bool) {
+        self.pixels_only = pixels_only;
+    }
+
+    /// Bound effect-map preparation to each requested region, including the full
+    /// dependency apron. The final pixels remain exact; maps outside it wait. The canvas doesn't
+    /// use it: per-cell maps of a document-wide group cost 4.3 s per stroke on a 479-layer PSB
+    /// against 1.7 s for whole-region maps (apron work repeated per cell).
+    pub fn set_progressive(&mut self, progressive: bool) {
+        self.progressive = progressive;
     }
 
     /// GPU memory held by resident layer pages (bytes).
@@ -756,7 +934,7 @@ impl Compositor {
             return Err(Unsupported("layer effects need float effect-map render targets, which this GPU lacks".into()));
         }
         for f in &p.fx {
-            if self.fx_paged(f.region) {
+            if self.progressive || self.fx_paged(f.region) {
                 let side = i64::from(self.page) + 2 * i64::from(Self::fx_apron(doc, f));
                 if side > i64::from(self.device_max) {
                     return Err(Unsupported(format!("effects of `{}` reach too far to build per page", f.layer.name)));
@@ -810,6 +988,56 @@ impl Compositor {
         Ok(stats)
     }
 
+    /// Composite at a reduced resolution, sampling GPU-generated layer/mask mip chains.
+    /// Origins must align to 2^level; at level > 0 blending and effects can differ slightly
+    /// from downsampling the full-resolution composite. Level zero is the exact normal path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_at_mip(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        doc: &Document,
+        region: Rect,
+        level: u32,
+        sink: impl FnMut(&mut wgpu::CommandEncoder, ChunkOut<'_>),
+    ) -> Result<Stats, Unsupported> {
+        Self::validate_mip(region, level)?;
+        let previous = std::mem::replace(&mut self.render_mip, level);
+        let result = self.render(device, queue, doc, region, sink);
+        self.render_mip = previous;
+        result
+    }
+
+    fn validate_mip(region: Rect, level: u32) -> Result<(), Unsupported> {
+        if level > 8 {
+            return Err(Unsupported("composite mip level must be at most 8".into()));
+        }
+        let step = 1i32 << level;
+        if region.x0.rem_euclid(step) != 0 || region.y0.rem_euclid(step) != 0 {
+            return Err(Unsupported("composite mip origin must align to its pixel grid".into()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::render_at_mip`] recorded into a caller-owned encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_at_mip(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        doc: &Document,
+        region: Rect,
+        level: u32,
+        sink: &mut dyn FnMut(&mut wgpu::CommandEncoder, ChunkOut<'_>),
+    ) -> Result<Stats, Unsupported> {
+        Self::validate_mip(region, level)?;
+        let previous = std::mem::replace(&mut self.render_mip, level);
+        let result = self.encode_inner(device, queue, encoder, doc, region, sink, false);
+        self.render_mip = previous;
+        result
+    }
+
     /// Like [`Self::render`] but records into `encoder` without submitting.
     pub fn encode(
         &mut self,
@@ -852,7 +1080,17 @@ impl Compositor {
         flush: bool,
     ) -> Result<Stats, Unsupported> {
         let canvas = doc.bounds();
-        let region = region.intersect(&canvas);
+        let mut region = region.intersect(&canvas);
+        if self.render_mip > 0 {
+            // Native texture mip extents round down. Leave the trailing subpixel edge for
+            // the level-zero refinement rather than writing past the destination mip.
+            let step = 1i32 << self.render_mip;
+            region.x1 = region.x1.min(canvas.x1 / step * step);
+            region.y1 = region.y1.min(canvas.y1 / step * step);
+        }
+        if self.render_mip > 0 && self.mip_kit.is_none() {
+            self.mip_kit = Some(MipKit::new(device));
+        }
         let trace = Trace::new();
         let plan = plan(doc)?;
         let t_plan = trace.lap();
@@ -867,18 +1105,31 @@ impl Compositor {
             // which would render the first frame black; land it on an empty buffer instead.
             queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
         }
-        self.frame += 1;
+        if !self.nested {
+            self.frame += 1;
+        }
         self.stamp += 1;
         self.staged = 0;
 
         // Effect maps of whole regions first (they may render group shapes through sub-plans);
         // regions larger than the limit are built per cell below.
-        let paged: Vec<bool> = plan.fx.iter().map(|f| self.fx_paged(f.region)).collect();
+        let paged: Vec<bool> = plan.fx.iter().map(|f| self.progressive || self.fx_paged(f.region)).collect();
         let aprons: Vec<i32> = plan.fx.iter().zip(&paged).map(|(f, &pg)| if pg { Self::fx_apron(doc, f) } else { 0 }).collect();
         for (f, &pg) in plan.fx.iter().zip(&paged) {
-            if !pg {
-                self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, None), f.region, &mut stats);
+            if pg {
+                continue;
             }
+            // Maps are only read inside their region (`map_value` returns the outside value
+            // beyond it, as for a missing map), and every chunk lies inside `region`. A layer
+            // whose effects, new and cached, lie wholly outside this refresh keeps its maps as
+            // they are until a refresh reaches them: a stroke on a 54-effect PSB re-checked
+            // every one of them (4 ms) before.
+            let key = (f.layer.id, None);
+            let misses = |r: Rect| r.intersect(&region).is_empty();
+            if misses(f.region) && self.fx.get(&key).is_none_or(|e| misses(e.region)) {
+                continue;
+            }
+            self.sync_fx(device, queue, encoder, doc, f, key, f.region, &mut stats);
         }
         let t_fx = trace.lap();
         let fr = self.frame_res(device, queue, canvas, &plan);
@@ -910,20 +1161,22 @@ impl Compositor {
             let cell = (part.x0.div_euclid(page as i32), part.y0.div_euclid(page as i32));
             let cr = cell_rect(cell, page);
             for (i, f) in plan.fx.iter().enumerate() {
+                // Progressive mode uses tile-sized page cells. Cache the complete
+                // cell's effect window so smaller follow-up slices reuse its maps.
                 let pf = cr.intersect(&f.region);
                 if !paged.get(i).copied().unwrap_or(false) || pf.is_empty() {
                     continue;
                 }
-                let window = pf.inflate(aprons.get(i).copied().unwrap_or(0)).intersect(&f.region);
+                let window = fx::slice_window(pf, f.region, aprons.get(i).copied().unwrap_or(0));
                 self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, Some(cell)), window, &mut stats);
             }
-            let chunks = grid_rects(part, self.chunk);
+            let chunks = grid_rects(part, self.chunk << self.render_mip);
             stats.chunks += chunks.len();
             work += part.width() as u64 * part.height() as u64 * plan.passes.len() as u64;
             trace.lap();
-            self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, &fr, &chunks, &mut stats, sink);
+            self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, canvas, &fr, &chunks, &mut stats, sink)?;
             t_cells += trace.lap();
-            let (evicted, bytes) = self.evict();
+            let (evicted, bytes) = if self.nested { (0, 0) } else { self.evict() };
             t_evict += trace.lap();
             stats.evicted += evicted;
             freed += bytes;
@@ -948,20 +1201,26 @@ impl Compositor {
         // Evict this document's textures whose layers are gone (hidden layers stay resident so
         // toggling visibility costs no upload).
         let frame = self.frame;
-        let live: std::collections::HashSet<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
-        self.residents.retain(|(id, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
-        self.fx.retain(|(id, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
-        stats.evicted += self.evict().0;
+        if !self.nested {
+            let live: std::collections::HashSet<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
+            self.residents.retain(|(id, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
+            self.fx.retain(|(id, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
+            stats.evicted += self.evict().0;
+        }
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
+        self.luts.retain(|_, (_, _, used)| frame.saturating_sub(*used) < 240);
         if trace.on {
             eprintln!(
-                "gpu trace: {} px, {} passes, {} cells, {} chunks: plan {t_plan:.1} ms, check {t_check:.1}, fx {t_fx:.1}, frame res {t_res:.1}, cells {t_cells:.1}, evict {t_evict:.1}, tail {:.1}; {} tiles up",
+                "gpu trace: {} px, {} passes, {} cells, {} chunks: plan {t_plan:.1} ms, check {t_check:.1}, fx {t_fx:.1}, frame res {t_res:.1}, cells {t_cells:.1}, evict {t_evict:.1}, tail {:.1}; {} tiles up; drawn {} culled {} cached {}",
                 region.width() as u64 * region.height() as u64,
                 stats.passes,
                 stats.cells,
                 stats.chunks,
                 trace.lap(),
-                stats.tiles_uploaded
+                stats.tiles_uploaded,
+                stats.passes_drawn,
+                stats.passes_culled,
+                stats.passes_cached
             );
         }
         Ok(stats)
@@ -1022,7 +1281,21 @@ impl Compositor {
             .iter()
             .map(|p| (p.tex.as_ref().map_or(Rect::EMPTY, |t| area(t.surface.get())), p.mask.as_ref().map_or(Rect::EMPTY, |m| area(m.surface.get()))))
             .collect();
-        let luts = plan.passes.iter().map(|p| p.lut.as_ref().map(|rows| lut_texture(device, queue, rows))).collect();
+        let frame = self.frame;
+        let luts = plan
+            .passes
+            .iter()
+            .map(|p| {
+                p.lut.as_ref().map(|rows| {
+                    let (t, v, used) = self.luts.entry(lut_hash(rows)).or_insert_with(|| {
+                        let (t, v) = lut_texture(device, queue, rows);
+                        (t, v, frame)
+                    });
+                    *used = frame;
+                    (t.clone(), v.clone())
+                })
+            })
+            .collect();
         let patterns = plan.passes.iter().map(|p| p.pattern.map(|pat| self.pattern_view(device, queue, pat))).collect();
         FrameRes { areas, luts, patterns }
     }
@@ -1039,13 +1312,22 @@ impl Compositor {
         paged: &[bool],
         cell: Cell,
         fr: &FrameRes,
+        chunks: &[Rect],
         stats: &mut Stats,
     ) -> Bound {
         let cr = cell_rect(cell, self.page);
+        let part = chunks.iter().fold(Rect::EMPTY, |a, c| if a.is_empty() { *c } else { a.union(c) });
         let mut views: Vec<(Option<ResidentRef>, Option<ResidentRef>)> = Vec::with_capacity(plan.passes.len());
         let mut keys: Vec<ResKey> = Vec::new();
         let mut maps = Vec::with_capacity(plan.passes.len());
         for (i, p) in plan.passes.iter().enumerate() {
+            // A plain pair missing every chunk is culled in all of them (`run_cell`): its pages
+            // are neither checked nor uploaded.
+            if self.pass_culling && culled_pair(plan, i, part) {
+                views.push((None, None));
+                maps.push(None);
+                continue;
+            }
             let (ta, ma) = fr.areas.get(i).copied().unwrap_or((Rect::EMPTY, Rect::EMPTY));
             let tex =
                 p.tex.as_ref().and_then(|t| self.sync(device, queue, encoder, doc, (t.layer, t.role, cell), t.surface.get(), ta.intersect(&cr), stats)).map(
@@ -1086,18 +1368,52 @@ impl Compositor {
         plan: &Plan<'_>,
         paged: &[bool],
         cell: Cell,
+        canvas: Rect,
         fr: &FrameRes,
         chunks: &[Rect],
         stats: &mut Stats,
         sink: &mut dyn FnMut(&mut wgpu::CommandEncoder, ChunkOut<'_>),
-    ) {
+    ) -> Result<(), Unsupported> {
         if chunks.is_empty() {
-            return;
+            return Ok(());
         }
-        let bound = self.bind_cell(device, queue, encoder, doc, plan, paged, cell, fr, stats);
+        let mut bound = self.bind_cell(device, queue, encoder, doc, plan, paged, cell, fr, chunks, stats);
+        let n = plan.passes.len();
+        let whole = cell_rect(cell, self.page).intersect(&canvas);
+
+        // Cached plan prefix (see `PrefixSnap`): start from it, or build it once a refresh after
+        // refresh changes the same pass (a stroke on one layer).
+        let mut snap: Option<PrefixSnap> = None;
+        let mut build: Option<usize> = None;
+        if !self.nested && self.render_mip == 0 && prefix_cache_enabled() {
+            let key = (doc, cell);
+            let sg: Vec<(u64, u64)> = plan.passes.iter().map(|p| (pass_sig(p, plan), self.input_gen(p, plan, paged, cell))).collect();
+            let (last, last_k) = self.prefix_last.remove(&key).unwrap_or_default();
+            let first_changed = if last.len() == n { last.iter().zip(&sg).position(|(a, b)| a != b).unwrap_or(n) } else { 0 };
+            if let Some(s) = self.prefix.remove(&key)
+                && s.k <= n
+                && s.format == self.acc_format
+                && s.rect == whole
+                && fold_sigs(sg.get(..s.k).unwrap_or(&[])) == s.check
+            {
+                snap = Some(s);
+            }
+            if snap.is_none() && first_changed < n && first_changed >= (n / 5).max(32) && last_k == first_changed {
+                build = Some(first_changed);
+            }
+            let k = if first_changed < n { first_changed } else { last_k };
+            self.prefix_last.insert(key, (sg, k));
+            if build.is_some() {
+                // The prefix is rendered over the whole cell: bind the pages of layers the chunks
+                // culled too, and check it against what it really sampled.
+                bound = self.bind_cell(device, queue, encoder, doc, plan, paged, cell, fr, &[whole], stats);
+                let sg: Vec<(u64, u64)> = plan.passes.iter().map(|p| (pass_sig(p, plan), self.input_gen(p, plan, paged, cell))).collect();
+                self.prefix_last.insert(key, (sg, k));
+            }
+        }
 
         // Chunk pool.
-        while self.pool.len() < plan.slots as usize {
+        while self.pool.len() < plan.slots as usize + 1 {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("pc_compose_chunk"),
                 size: wgpu::Extent3d { width: self.chunk, height: self.chunk, depth_or_array_layers: 1 },
@@ -1115,11 +1431,13 @@ impl Compositor {
             self.pool.push((t, v));
         }
 
-        // Uniforms: chunk records, then one record per pass.
-        let op_base = chunks.len() as u64 * STRIDE;
+        // Uniforms: chunk records (and the whole cell, for a prefix build), then one per pass.
+        let records: Vec<Rect> = chunks.iter().copied().chain(std::iter::once(whole)).collect();
+        let op_base = records.len() as u64 * STRIDE;
         let mut data = vec![0u8; (op_base + plan.passes.len() as u64 * STRIDE) as usize];
-        for (i, c) in chunks.iter().enumerate() {
-            let w = words(&[I(c.x0), I(c.y0), I(c.width() as i32), I(c.height() as i32)]);
+        for (i, c) in records.iter().enumerate() {
+            let step = 1u32 << self.render_mip;
+            let w = words(&[I(c.x0), I(c.y0), I(c.width().div_ceil(step) as i32), I(c.height().div_ceil(step) as i32), I(self.render_mip as i32)]);
             data[i * STRIDE as usize..][..w.len()].copy_from_slice(&w);
         }
         for (i, p) in plan.passes.iter().enumerate() {
@@ -1138,43 +1456,130 @@ impl Compositor {
         queue.write_buffer(&ubuf, 0, &data);
         let bg0 = uniform_group(device, &self.kit.bgl0, &ubuf);
 
-        // Per-pass texture bind groups (chunk-independent: pool slots are reused per chunk).
+        // Each chunk has its own logical-slot aliases. A fresh output picks a physical
+        // texture not referenced by another logical slot or by this pass's inputs. This is
+        // copy-on-write for aliases, including the planner's in-place CopyRect operations.
         let dummy = &self.kit.dummy;
         let resident_views: Vec<&wgpu::TextureView> = bound.keys.iter().map(|k| self.residents.get(k).map_or(dummy, |r| &r.view)).collect();
-        let mut bg1 = Vec::with_capacity(plan.passes.len());
-        for (i, p) in plan.passes.iter().enumerate() {
-            if p.kernel.entry().is_none() {
-                bg1.push(None);
-                continue;
-            }
-            let slot = |s: Option<u32>| s.map_or(dummy, |s| &self.pool[s as usize].1);
-            let (tex, mask) = &bound.views[i];
-            let tv = tex.map_or(slot(p.d), |(k, _)| resident_views[k]);
-            let mv = mask.map_or(dummy, |(k, _)| resident_views[k]);
-            let lv = fr.luts.get(i).and_then(Option::as_ref).map_or(dummy, |(_, v)| v);
-            let map = bound.maps[i].as_ref().map_or(dummy, |(v, _)| v);
-            let pat = fr.patterns.get(i).and_then(Option::as_ref).unwrap_or(dummy);
-            bg1.push(Some(texture_group(device, &self.kit.bgl1, &[slot(p.a), slot(p.b), tv, mv, lv, slot(p.c), map, pat])));
+        let mut groups: HashMap<(usize, [Option<usize>; 4]), wgpu::BindGroup> = HashMap::new();
+        // Jobs: (record index, rect, first pass, build the prefix?). A build renders the passes
+        // before `k` over the whole cell and keeps the slots still to be read; the chunks then
+        // start from it.
+        let mut jobs: Vec<(usize, Rect, usize, bool)> = Vec::new();
+        if let Some(k) = build {
+            let live = live_slots(plan, k);
+            let slots = live
+                .iter()
+                .map(|&l| {
+                    let t = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("pc_compose_prefix"),
+                        size: wgpu::Extent3d { width: whole.width(), height: whole.height(), depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.acc_format,
+                        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    (l, t)
+                })
+                .collect();
+            let sg = self.prefix_last.get(&(doc, cell)).map(|(sg, _)| fold_sigs(sg.get(..k).unwrap_or(&[]))).unwrap_or_default();
+            snap = Some(PrefixSnap { k, check: sg, format: self.acc_format, rect: whole, slots, last_used: self.frame });
+            jobs.push((chunks.len(), whole, 0, true));
         }
-
-        for (ci, c) in chunks.iter().enumerate() {
-            for (i, p) in plan.passes.iter().enumerate() {
+        let start = snap.as_ref().map_or(0, |s| s.k);
+        jobs.extend(chunks.iter().enumerate().map(|(ci, c)| (ci, *c, start, false)));
+        for (ci, c, first, building) in jobs {
+            let c = &c;
+            let end = if building { start } else { n };
+            let mut aliases: Vec<usize> = (0..plan.slots as usize).collect();
+            if first > 0
+                && !building
+                && let Some(s) = &snap
+            {
+                // The slots the prefix left, for this chunk (each in the pool texture of its own
+                // logical slot).
+                for (l, t) in &s.slots {
+                    let Some((dst, _)) = self.pool.get(*l as usize) else { continue };
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: t,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: (c.x0 - s.rect.x0) as u32, y: (c.y0 - s.rect.y0) as u32, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        dst.as_image_copy(),
+                        wgpu::Extent3d { width: c.width(), height: c.height(), depth_or_array_layers: 1 },
+                    );
+                }
+                stats.passes_cached += first;
+            }
+            let mut skip_blend = None;
+            for (i, p) in plan.passes.iter().enumerate().take(end).skip(first) {
+                if skip_blend == Some(i) {
+                    skip_blend = None;
+                    continue;
+                }
+                if self.pass_culling
+                    && p.kernel == Kernel::Content
+                    && let Some(next) = plan.passes.get(i + 1)
+                    && next.kernel == Kernel::Blend
+                    && next.b == Some(p.dst)
+                    && next.identity_region.is_some_and(|r| r.intersect(c).is_empty())
+                    && let Some(source) = next.a.and_then(|a| aliases.get(a as usize)).copied()
+                    && let Some(dst) = aliases.get_mut(next.dst as usize)
+                {
+                    *dst = source;
+                    skip_blend = Some(i + 1);
+                    stats.passes_culled += 2;
+                    continue;
+                }
                 let scissor = match p.clip {
                     Some(clip) => {
                         let r = clip.intersect(c);
                         if r.is_empty() {
                             continue;
                         }
-                        Rect::new(r.x0 - c.x0, r.y0 - c.y0, r.x1 - c.x0, r.y1 - c.y0)
+                        Rect::new(
+                            (r.x0 - c.x0) >> self.render_mip,
+                            (r.y0 - c.y0) >> self.render_mip,
+                            ((r.x1 - c.x0) as u32).div_ceil(1 << self.render_mip) as i32,
+                            ((r.y1 - c.y0) as u32).div_ceil(1 << self.render_mip) as i32,
+                        )
                     }
-                    None => Rect::new(0, 0, c.width() as i32, c.height() as i32),
+                    None => Rect::new(0, 0, c.width().div_ceil(1 << self.render_mip) as i32, c.height().div_ceil(1 << self.render_mip) as i32),
                 };
+                let inputs = [p.a, p.b, p.c, p.d].map(|slot| slot.and_then(|s| aliases.get(s as usize)).copied());
+                let old_dst = aliases.get(p.dst as usize).copied().ok_or_else(|| Unsupported("invalid destination slot".into()))?;
+                let Some(dst_slot) = std::iter::once(old_dst).chain(0..self.pool.len()).find(|candidate| {
+                    !inputs.contains(&Some(*candidate))
+                        && !aliases.iter().enumerate().any(|(logical, physical)| logical != p.dst as usize && physical == candidate)
+                }) else {
+                    continue;
+                };
+                if p.kernel == Kernel::CopyRect && old_dst != dst_slot {
+                    encoder.copy_texture_to_texture(
+                        self.pool[old_dst].0.as_image_copy(),
+                        self.pool[dst_slot].0.as_image_copy(),
+                        wgpu::Extent3d {
+                            width: c.width().div_ceil(1 << self.render_mip),
+                            height: c.height().div_ceil(1 << self.render_mip),
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                if let Some(dst) = aliases.get_mut(p.dst as usize) {
+                    *dst = dst_slot;
+                }
                 match p.kernel {
                     Kernel::CopyRect | Kernel::CopyFull => {
                         // The planner always gives copies a source.
                         let Some(a) = p.a else { continue };
-                        let src = &self.pool[a as usize].0;
-                        let dst = &self.pool[p.dst as usize].0;
+                        let Some(source) = inputs[0] else { continue };
+                        let _ = a;
+                        let src = &self.pool[source].0;
+                        let dst = &self.pool[dst_slot].0;
                         encoder.copy_texture_to_texture(
                             wgpu::TexelCopyTextureInfo {
                                 texture: src,
@@ -1194,7 +1599,22 @@ impl Compositor {
                     }
                     _ => {}
                 }
-                let target = &self.pool[p.dst as usize].1;
+                let group = if p.kernel.entry().is_some() {
+                    Some(groups.entry((i, inputs)).or_insert_with(|| {
+                        let slot = |s: Option<usize>| s.map_or(dummy, |s| &self.pool[s].1);
+                        let (tex, mask) = &bound.views[i];
+                        let tv = tex.map_or(slot(inputs[3]), |(k, _)| resident_views[k]);
+                        let mv = mask.map_or(dummy, |(k, _)| resident_views[k]);
+                        let lv = fr.luts.get(i).and_then(Option::as_ref).map_or(dummy, |(_, v)| v);
+                        let map = bound.maps[i].as_ref().map_or(dummy, |(v, _)| v);
+                        let pat = fr.patterns.get(i).and_then(Option::as_ref).unwrap_or(dummy);
+                        texture_group(device, &self.kit.bgl1, &[slot(inputs[0]), slot(inputs[1]), tv, mv, lv, slot(inputs[2]), map, pat])
+                    }))
+                } else {
+                    None
+                };
+                let target = &self.pool[dst_slot].1;
+                stats.passes_drawn += 1;
                 let clear = p.kernel == Kernel::Clear;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("pc_compose_pass"),
@@ -1218,12 +1638,61 @@ impl Compositor {
                 pass.set_pipeline(&self.kit.pipelines[&(p.kernel, self.acc_format)]);
                 pass.set_scissor_rect(scissor.x0 as u32, scissor.y0 as u32, scissor.width(), scissor.height());
                 pass.set_bind_group(0, &bg0, &[(ci as u64 * STRIDE) as u32, (op_base + i as u64 * STRIDE) as u32]);
-                pass.set_bind_group(1, bg1[i].as_ref(), &[]);
+                pass.set_bind_group(1, group.as_deref(), &[]);
                 pass.draw(0..3, 0..1);
             }
-            let (t, v) = &self.pool[plan.root as usize];
-            sink(encoder, ChunkOut { rect: *c, texture: t, view: v });
+            if building {
+                if let Some(s) = &snap {
+                    for (l, t) in &s.slots {
+                        let Some((src, _)) = aliases.get(*l as usize).and_then(|&p| self.pool.get(p)) else { continue };
+                        encoder.copy_texture_to_texture(
+                            src.as_image_copy(),
+                            t.as_image_copy(),
+                            wgpu::Extent3d { width: c.width(), height: c.height(), depth_or_array_layers: 1 },
+                        );
+                    }
+                }
+                continue;
+            }
+            let physical_root = aliases.get(plan.root as usize).copied().ok_or_else(|| Unsupported("invalid root slot".into()))?;
+            let (t, v) = &self.pool[physical_root];
+            sink(
+                encoder,
+                ChunkOut {
+                    rect: *c,
+                    mip_level: self.render_mip,
+                    pixel_size: [c.width().div_ceil(1 << self.render_mip), c.height().div_ceil(1 << self.render_mip)],
+                    texture: t,
+                    view: v,
+                },
+            );
         }
+        if let Some(mut s) = snap {
+            s.last_used = self.frame;
+            if self.prefix.len() >= PREFIX_CELLS
+                && let Some(old) = self.prefix.iter().min_by_key(|(_, s)| s.last_used).map(|(k, _)| *k)
+            {
+                self.prefix.remove(&old);
+            }
+            self.prefix.insert((doc, cell), s);
+        }
+        Ok(())
+    }
+
+    /// Version of what pass `p` samples in `cell`: its layer and mask pages and its effect map
+    /// (0 for what isn't resident). Looked up whether or not this refresh culled the pass.
+    fn input_gen(&self, p: &plan::Pass<'_>, plan: &Plan<'_>, paged: &[bool], cell: Cell) -> u64 {
+        let page = |key: ResKey| self.residents.get(&key).map_or(0, |r| r.version);
+        let tex = p.tex.as_ref().map_or(0, |t| page((t.layer, t.role, cell)));
+        let mask = p.mask.as_ref().map_or(0, |m| page((m.layer, Role::Mask, cell)));
+        let map = p
+            .map
+            .and_then(|m| {
+                let f = plan.fx.get(m.fx)?;
+                self.fx.get(&(f.layer.id, paged.get(m.fx).copied().unwrap_or(false).then_some(cell))).map(|e| e.version)
+            })
+            .unwrap_or(0);
+        tex.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ mask.rotate_left(21) ^ map.rotate_left(42)
     }
 
     /// Upload changed tiles of `surface` within `region` (its tile area inside one page cell);
@@ -1246,21 +1715,27 @@ impl Compositor {
         let format = surface.format();
         let kind = TexKind::for_surface(key.1, format);
         let cmyk = if format.mode == photocraft_color::ColorMode::Cmyk { self.cmyk } else { 0 };
-        let stale = self.residents.get(&key).is_none_or(|r| r.region != region || r.kind != kind || r.format != format || r.cmyk != cmyk);
+        let needed_mips = if self.render_mip > 0 { 1 + region.width().min(region.height()).ilog2() } else { 1 };
+        let stale = self
+            .residents
+            .get(&key)
+            .is_none_or(|r| r.region != region || r.kind != kind || r.format != format || r.cmyk != cmyk || r.texture.mip_level_count() < needed_mips);
         if stale {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("pc_compose_layer"),
                 size: wgpu::Extent3d { width: region.width(), height: region.height(), depth_or_array_layers: 1 },
-                mip_level_count: 1,
+                mip_level_count: needed_mips,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: kind.format(),
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
             let default_nonzero = surface.default_pixel().iter().any(|v| *v != 0.0);
-            let mut r = Resident { texture, view, region, kind, format, tiles: HashMap::new(), default_nonzero, doc, last_used: 0, stamp: 0, cmyk };
+            self.gens += 1;
+            let mut r =
+                Resident { texture, view, region, kind, format, tiles: HashMap::new(), default_nonzero, doc, last_used: 0, stamp: 0, cmyk, version: self.gens };
             // A new page is assembled straight into a mapped staging buffer and copied in one go
             // (missing tiles read as the default pixel; the buffer starts zeroed).
             let bpp = kind.bytes_per_pixel();
@@ -1310,10 +1785,12 @@ impl Compositor {
             self.residents.insert(key, r);
         }
         // Present: inserted above when it was missing or stale.
+        let fresh_gen = self.gens + 1;
         let r = self.residents.get_mut(&key)?;
         r.last_used = self.frame;
         r.stamp = self.stamp;
         r.doc = doc;
+        let mut mips_dirty = stale;
         let mut blank: Option<Vec<u8>> = None;
         for c in region.tiles() {
             match surface.tile(c) {
@@ -1321,6 +1798,7 @@ impl Compositor {
                     if r.tiles.get(&c).is_some_and(|old| Arc::ptr_eq(old, t)) {
                         continue;
                     }
+                    mips_dirty = true;
                     let bytes = convert_tile(surface, Some(t), kind, c);
                     write_tile(queue, r, c, &bytes);
                     stats.tiles_uploaded += 1;
@@ -1332,6 +1810,7 @@ impl Compositor {
                     if r.tiles.remove(&c).is_none() {
                         continue;
                     }
+                    mips_dirty = true;
                     // A tile that went away reads as the default pixel again.
                     let bytes = blank.get_or_insert_with(|| {
                         if r.default_nonzero {
@@ -1344,6 +1823,17 @@ impl Compositor {
                     self.staged += bytes.len() as u64;
                 }
             }
+        }
+        let changed = mips_dirty && !stale;
+        if changed {
+            r.version = fresh_gen;
+        }
+        let mips = mips_dirty && r.texture.mip_level_count() > 1;
+        if changed {
+            self.gens = fresh_gen;
+        }
+        if mips && let (Some(kit), Some(r)) = (self.mip_kit.as_mut(), self.residents.get(&key)) {
+            kit.generate(device, encoder, &r.texture, key.1 == Role::Mask);
         }
         Some((key, [region.x0, region.y0, region.width() as i32, region.height() as i32]))
     }
@@ -1401,6 +1891,74 @@ impl Compositor {
 
     /// Build or update the effect maps of one layer over `region`: its whole effect region, or
     /// the window of one page cell (`key.1`) grown by the effects' reach.
+    /// `layer`'s shape (`compose::layer_shape`) over `r`. A group's is composited on the GPU (the
+    /// group alone, without its effects, at full opacity over transparency) and read back: the
+    /// CPU composites every descendant per pixel, 0.86 s for a 0.55 MP stroke inside a 400-layer
+    /// group. Artboards (which paint a background) and pixels outside the canvas, which only the
+    /// CPU sees, stay on the CPU.
+    fn layer_shape(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        doc: &Document,
+        layer: &photocraft_doc::Layer,
+        r: Rect,
+    ) -> Vec<f32> {
+        // Small enough for the CPU (descendant surfaces × pixels): the GPU round trip costs ~2 ms.
+        #[cfg(not(target_arch = "wasm32"))]
+        let small = u64::from(r.width()) * u64::from(r.height()) * fx::group_surfaces(layer).len() as u64 <= 2_000_000;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let LayerContent::Group(g) = &layer.content
+            && g.artboard.is_none()
+            && !small
+            && std::env::var_os("PHOTOCRAFT_CPU_GROUP_SHAPE").is_none()
+        {
+            let inside = r.intersect(&doc.bounds());
+            // What this refresh recorded so far (effect maps of the group's own children, for
+            // one) must run before the nested render reads it.
+            let done = std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_compose") }));
+            queue.submit([done.finish()]);
+            if let Some(px) = (!inside.is_empty()).then(|| self.group_alpha_gpu(device, queue, doc, layer, inside)).flatten() {
+                if inside == r {
+                    return px;
+                }
+                let mut out = vec![0.0; r.width() as usize * r.height() as usize];
+                fx::paste(&mut out, r, inside, &px);
+                for strip in [
+                    Rect::new(r.x0, r.y0, r.x1, inside.y0),
+                    Rect::new(r.x0, inside.y1, r.x1, r.y1),
+                    Rect::new(r.x0, inside.y0, inside.x0, inside.y1),
+                    Rect::new(inside.x1, inside.y0, r.x1, inside.y1),
+                ] {
+                    if !strip.is_empty() {
+                        fx::paste(&mut out, r, strip, &fx::shape(doc, layer, strip));
+                    }
+                }
+                return out;
+            }
+        }
+        let _ = (device, queue, encoder);
+        fx::shape(doc, layer, r)
+    }
+
+    /// The alpha of group `layer` alone over `r` (inside the canvas), rendered by this compositor:
+    /// its pages are the ones the document already keeps resident.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn group_alpha_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, doc: &Document, layer: &photocraft_doc::Layer, r: Rect) -> Option<Vec<f32>> {
+        let mut solo = layer.clone();
+        solo.effects.items.clear();
+        (solo.opacity, solo.fill_opacity, solo.blend, solo.visible, solo.clipped) = (1.0, 1.0, photocraft_color::BlendMode::Normal, true, false);
+        let mut sub = doc.clone();
+        sub.layers = vec![solo];
+        let saved = (self.nested, self.render_mip, self.staged, self.focus.take());
+        self.nested = true;
+        self.render_mip = 0;
+        let px = render_to_vec(self, device, queue, &sub, r);
+        (self.nested, self.render_mip, self.staged, self.focus) = saved;
+        px.ok().map(|px| px.iter().map(|p| p[3]).collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sync_fx(
         &mut self,
@@ -1416,8 +1974,14 @@ impl Compositor {
         let layer = f.layer;
         let canvas = doc.bounds();
         let is_group = matches!(layer.content, LayerContent::Group(_));
-        let shape_key = if is_group { fx::group_key(layer, &doc.global_light) } else { fx::shape_key(layer, canvas) };
+        let cached_key = (is_group && self.pixels_only).then(|| self.fx.get(&key).map(|e| e.shape_key)).flatten();
+        let shape_key = match cached_key {
+            Some(k) => k,
+            None if is_group => fx::group_key(layer, &doc.global_light),
+            None => fx::shape_key(layer, canvas),
+        };
         let (content_src, mask_src) = if is_group { (None, None) } else { fx::shape_sources(layer) };
+        let parts = if is_group { fx::group_surfaces(layer) } else { Vec::new() };
         let frame = self.frame;
         let (rw, rh) = (region.width(), region.height());
 
@@ -1426,10 +1990,17 @@ impl Compositor {
         let mut damage = Rect::EMPTY;
         let prev = self.fx.get(&key).filter(|e| e.shape_key == shape_key).map(|e| e.region);
         let mut rebuild = true;
+        // The cached tile snapshot is still exact (same region, every tile the same pointer).
+        let mut same_tiles = false;
+        // The maps moved with the layer (their texels are unchanged, their origin is not).
+        let mut moved = false;
         if prev == Some(region)
             && let Some(e) = self.fx.get(&key)
         {
             rebuild = false;
+            if is_group {
+                damage = fx::group_damage(&e.parts, &parts).unwrap_or(region);
+            }
             for (old, cur) in e.tiles.iter().zip([content_src, mask_src]) {
                 let d = match (old, cur) {
                     (Some(o), Some(s)) => fx::damage(o, s),
@@ -1439,6 +2010,7 @@ impl Compositor {
                 };
                 damage = if damage.is_empty() { d } else { damage.union(&d) };
             }
+            same_tiles = damage.is_empty();
             damage = damage.intersect(&region);
         } else if let Some(old) = prev
             && (old.width(), old.height()) == (rw, rh)
@@ -1446,12 +2018,13 @@ impl Compositor {
         {
             // Moved by whole pixels: maps are computed relative to the region, so if the shape
             // moved unchanged with it, every map is still exact.
-            let v = fx::shape(doc, layer, region);
+            let v = self.layer_shape(device, queue, encoder, doc, layer, region);
             if let Some(e) = self.fx.get_mut(&key)
                 && v == e.shape_cpu
             {
                 e.region = region;
                 rebuild = false;
+                moved = true;
             }
         }
         if rebuild {
@@ -1464,7 +2037,8 @@ impl Compositor {
                     region,
                     shape_key,
                     tiles: [None, None],
-                    _pin: is_group.then(|| layer.clone()),
+                    parts: Vec::new(),
+                    version: 0,
                     shape_cpu: vec![0.0; n],
                     shape,
                     fields: HashMap::new(),
@@ -1475,23 +2049,29 @@ impl Compositor {
             );
             damage = region;
         }
+        // The shape over the damage (compose's own alpha), before the entry is borrowed: a group's
+        // comes from a nested render.
+        let shape = (!region.is_empty() && !damage.is_empty()).then(|| self.layer_shape(device, queue, encoder, doc, layer, damage));
         // Present: kept or (re)inserted above.
         let stamp = self.stamp;
         let Some(e) = self.fx.get_mut(&key) else { return };
         e.last_used = frame;
         e.stamp = stamp;
         e.doc = doc.id;
-        e.tiles = [content_src.map(fx::snapshot), mask_src.map(fx::snapshot)];
+        if !same_tiles {
+            e.tiles = [content_src.map(fx::snapshot), mask_src.map(fx::snapshot)];
+            e.parts = parts.iter().map(|&(id, role, reach, s)| (id, role, reach, fx::snapshot(s))).collect();
+        }
         if region.is_empty() {
             return;
         }
 
+        let mut touched = rebuild || moved || !damage.is_empty();
         let t_trace = web_time_now();
         let mut staged = 0u64;
         // Shape over the damage (compose's own alpha).
-        if !damage.is_empty() {
+        if let Some(v) = shape {
             stats.fx_shapes += 1;
-            let v = fx::shape(doc, layer, damage);
             fx::paste(&mut e.shape_cpu, region, damage, &v);
             e.shape.write_r32(queue, region, damage, &v);
             staged += v.len() as u64 * 4;
@@ -1548,11 +2128,18 @@ impl Compositor {
             if !same {
                 e.progs[i] = ProgState {
                     key: prog.key,
-                    maps: (0..prog.maps).map(|k| prog.stages.iter().any(|s| s.out == Some(k)).then(|| Tex::map(device, "pc_fx_map", region, MAP16))).collect(),
+                    maps: (0..prog.maps).map(|k| prog.stages.iter().any(|s| s.out == Some(k)).then(|| Tex::map(device, "pc_fx_map", region, MAP32))).collect(),
                 };
             }
             stats.fx_programs += 1;
+            touched = true;
             self.run_program(device, queue, encoder, key, i, prog, d, stats);
+        }
+        if touched {
+            self.gens += 1;
+            if let Some(e) = self.fx.get_mut(&key) {
+                e.version = self.gens;
+            }
         }
     }
 
@@ -1587,7 +2174,7 @@ impl Compositor {
         // `MapProgram::temps` rule out.
         let target_of = |i: usize| -> Option<(wgpu::TextureView, wgpu::TextureFormat)> {
             match prog.stages[i].out {
-                Some(k) => Some((finals.get(k)?.clone()?, MAP16)),
+                Some(k) => Some((finals.get(k)?.clone()?, MAP32)),
                 None => Some((temps.get((*assign.get(i)?)?)?.clone(), MAP32)),
             }
         };
@@ -1741,6 +2328,111 @@ fn convert_tile(surface: &Surface, tile: Option<&Arc<Tile>>, kind: TexKind, c: T
         }
     }
     out
+}
+
+/// Each pass's (signature, input version) at a cell's last refresh, and the first that changed.
+type PrefixSeen = (Vec<(u64, u64)>, usize);
+
+/// Plan prefixes kept at once (cells of the documents being painted).
+const PREFIX_CELLS: usize = 4;
+
+/// The composite of a plan's passes before `k` over one page cell: the slots still to be read
+/// from pass `k` on. While a stroke changes one layer, only the passes from that layer's
+/// up run per refresh (a 479-layer PSB: 164 of 648 passes for a layer near the top). Valid
+/// while every earlier pass and what it samples are unchanged (`check`).
+struct PrefixSnap {
+    k: usize,
+    /// `fold_sigs` of the (signature, input version) of the passes before `k`.
+    check: u64,
+    format: wgpu::TextureFormat,
+    /// The cell inside the canvas; texel (0, 0) is its top-left.
+    rect: Rect,
+    /// (logical slot, its contents).
+    slots: Vec<(u32, wgpu::Texture)>,
+    last_used: u64,
+}
+
+/// `PHOTOCRAFT_PREFIX_CACHE=0` turns the plan-prefix cache off (for comparisons).
+fn prefix_cache_enabled() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PHOTOCRAFT_PREFIX_CACHE").ok().as_deref() != Some("0"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    true
+}
+
+fn fold_sigs(sg: &[(u64, u64)]) -> u64 {
+    sg.iter().fold(0xcbf2_9ce4_8422_2325, |h, (s, g)| (h ^ s).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(17) ^ g.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
+
+/// Everything about pass `p` that its output depends on besides what it samples (pages and
+/// effect maps, versioned separately) and its input slots' contents.
+fn pass_sig(p: &plan::Pass<'_>, plan: &Plan<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (p.kernel, p.dst, p.a, p.b, p.c, p.d, p.mode, p.adjust_kind, p.flags, p.gradient, p.clip, p.identity_region).hash(&mut h);
+    p.opacity.to_bits().hash(&mut h);
+    for v in p.color.iter().chain(p.params.iter().flatten()).chain(p.extra.iter()) {
+        v.to_bits().hash(&mut h);
+    }
+    p.lut.as_ref().map(|rows| lut_hash(rows)).hash(&mut h);
+    p.map.map(|m| (m.fx, m.item, m.map, plan.fx.get(m.fx).map(|f| (f.layer.id.0, f.region)))).hash(&mut h);
+    if let Some(pat) = p.pattern {
+        (&pat.id, &pat.name, pat.width, pat.height).hash(&mut h);
+        for (c, t) in pat.surface.tiles() {
+            (c.tx, c.ty, Arc::as_ptr(t) as usize).hash(&mut h);
+        }
+    }
+    p.tex.as_ref().map(|t| (t.layer.0, t.role)).hash(&mut h);
+    p.mask.as_ref().map(|m| (m.layer.0, m.density.to_bits(), m.default.to_bits())).hash(&mut h);
+    h.finish()
+}
+
+/// Logical slots whose contents at pass `k` are still read from `k` on: read before a pass
+/// overwrites them whole (a clipped pass or a rect copy only writes part of its slot).
+fn live_slots(plan: &Plan<'_>, k: usize) -> Vec<u32> {
+    let n = plan.slots as usize;
+    let (mut written, mut live) = (vec![false; n], vec![false; n]);
+    for p in plan.passes.iter().skip(k) {
+        for s in [p.a, p.b, p.c, p.d].into_iter().flatten() {
+            if written.get(s as usize) == Some(&false)
+                && let Some(l) = live.get_mut(s as usize)
+            {
+                *l = true;
+            }
+        }
+        let full = p.clip.is_none() && p.kernel != Kernel::CopyRect;
+        let d = p.dst as usize;
+        if written.get(d) == Some(&false) {
+            if full {
+                written[d] = true;
+            } else if let Some(l) = live.get_mut(d) {
+                *l = true;
+            }
+        }
+    }
+    if written.get(plan.root as usize) == Some(&false)
+        && let Some(l) = live.get_mut(plan.root as usize)
+    {
+        *l = true;
+    }
+    (0..n as u32).filter(|&s| live[s as usize]).collect()
+}
+
+/// Whether pass `i` is the Content of a plain Content/Blend pair that is the backdrop's identity
+/// everywhere in `part` (`run_cell` culls such a pair in every chunk of `part`).
+fn culled_pair(plan: &Plan<'_>, i: usize, part: Rect) -> bool {
+    let (Some(p), Some(next)) = (plan.passes.get(i), plan.passes.get(i + 1)) else { return false };
+    p.kernel == Kernel::Content && next.kernel == Kernel::Blend && next.b == Some(p.dst) && next.identity_region.is_some_and(|r| r.intersect(&part).is_empty())
+}
+
+/// Content hash of LUT rows (the cache key): multiply-xor over the bit patterns.
+fn lut_hash(rows: &[[f32; 4096]]) -> u64 {
+    rows.iter()
+        .flatten()
+        .fold(rows.len() as u64 ^ 0xcbf2_9ce4_8422_2325, |h, v| (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5))
 }
 
 fn lut_texture(device: &wgpu::Device, queue: &wgpu::Queue, rows: &[[f32; 4096]]) -> (wgpu::Texture, wgpu::TextureView) {
@@ -1906,7 +2598,12 @@ impl Trace {
         let on = std::env::var_os("PHOTOCRAFT_GPU_TRACE").is_some();
         #[cfg(target_arch = "wasm32")]
         let on = false;
-        Trace { on, last: std::cell::Cell::new(None) }
+        // The clock starts now: the first lap (planning) counts too.
+        #[cfg(not(target_arch = "wasm32"))]
+        let last = std::cell::Cell::new(on.then(std::time::Instant::now));
+        #[cfg(target_arch = "wasm32")]
+        let last = std::cell::Cell::new(None);
+        Trace { on, last }
     }
     /// Milliseconds since the previous lap (0 when tracing is off).
     fn lap(&self) -> f64 {
@@ -1947,6 +2644,12 @@ mod tests {
             let e = k.entry().unwrap();
             assert!(module.entry_points.iter().any(|ep| ep.name == e), "missing entry point {e}");
         }
+    }
+
+    #[test]
+    fn mip_shader_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(MIP_SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(MIP_SHADER)));
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::empty()).validate(&module).unwrap();
     }
 
     #[test]

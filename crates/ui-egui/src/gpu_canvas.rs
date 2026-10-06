@@ -31,6 +31,107 @@ use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, RenderState, Scr
 use eframe::wgpu;
 use eframe::wgpu::util::DeviceExt as _;
 
+/// Side of a progressive slice: one compositor page cell. A slice costs every pass of the plan
+/// whatever its size, so slices smaller than a cell multiply the total work.
+const SLICE: u32 = photocraft_gpu::PAGE;
+
+/// Damage up to this area (a brush stroke, a dab, a small edit) is composited at once even on a
+/// document refreshed progressively: slicing it would show the stroke in pieces, frames apart.
+pub const SYNC_DAMAGE_PX: u64 = 2048 * 2048;
+
+/// `doc` with every layer's effects off (for the coarse preview).
+fn without_effects(doc: &photocraft_doc::Document) -> photocraft_doc::Document {
+    fn strip(layers: &mut [photocraft_doc::Layer]) {
+        for l in layers {
+            l.effects.items.clear();
+            if let photocraft_doc::LayerContent::Group(g) = &mut l.content {
+                strip(&mut g.children);
+            }
+        }
+    }
+    let mut d = doc.clone();
+    strip(&mut d.layers);
+    d
+}
+
+/// Whether `doc`'s large refreshes go through [`GpuCanvas::refresh_progressive`] (documents
+/// above 1 MP; `PHOTOCRAFT_CANVAS_PROGRESSIVE=0` turns it off). Constant per document, so the
+/// compositor's effect paging doesn't flip between refreshes of one document.
+pub fn progressive_doc(doc: &photocraft_doc::Document) -> bool {
+    doc.size.area() > 1_048_576 && std::env::var("PHOTOCRAFT_CANVAS_PROGRESSIVE").ok().as_deref() != Some("0")
+}
+
+/// Non-overlapping dirty rectangles. Subtraction preserves damage outside the view and
+/// lets new edits invalidate already completed slices without restarting unrelated work.
+#[derive(Default)]
+struct DirtyRegions {
+    rects: Vec<photocraft_geom::Rect>,
+    side: u32,
+}
+
+impl DirtyRegions {
+    fn add(&mut self, rect: photocraft_geom::Rect) {
+        if rect.is_empty() {
+            return;
+        }
+        self.subtract(rect);
+        self.rects.push(rect);
+        // Bound bookkeeping after many overlapping edits; extra repaint is harmless.
+        if self.rects.len() > 256 {
+            let bounds = self.rects.iter().fold(photocraft_geom::Rect::EMPTY, |a, b| if a.is_empty() { *b } else { a.union(b) });
+            self.rects.clear();
+            self.rects.push(bounds);
+        }
+    }
+
+    fn subtract(&mut self, cut: photocraft_geom::Rect) {
+        self.rects = self
+            .rects
+            .drain(..)
+            .flat_map(|r| {
+                let hit = r.intersect(&cut);
+                if hit.is_empty() {
+                    return vec![r];
+                }
+                [
+                    photocraft_geom::Rect::new(r.x0, r.y0, r.x1, hit.y0),
+                    photocraft_geom::Rect::new(r.x0, hit.y1, r.x1, r.y1),
+                    photocraft_geom::Rect::new(r.x0, hit.y0, hit.x0, hit.y1),
+                    photocraft_geom::Rect::new(hit.x1, hit.y0, r.x1, hit.y1),
+                ]
+                .into_iter()
+                .filter(|r| !r.is_empty())
+                .collect()
+            })
+            .collect();
+    }
+
+    fn next(&self, visible: photocraft_geom::Rect) -> Option<photocraft_geom::Rect> {
+        let side = self.side.clamp(64, SLICE) as i32;
+        let center = (i64::from(visible.x0) + i64::from(visible.x1), i64::from(visible.y0) + i64::from(visible.y1));
+        let r = self
+            .rects
+            .iter()
+            .map(|r| r.intersect(&visible))
+            .filter(|r| !r.is_empty())
+            .min_by_key(|r| (i64::from(r.x0) + i64::from(r.x1) - center.0).abs() + (i64::from(r.y0) + i64::from(r.y1) - center.1).abs())
+            .or_else(|| self.rects.first().copied())?;
+        // Align near the viewport centre to avoid uploading four page cells for
+        // the first tile-sized patch. Clip at dirty/view boundaries.
+        let align = |a: i32, b: i32| {
+            (((i64::from(a) + i64::from(b)) / 2).div_euclid(i64::from(side)) * i64::from(side)).clamp(i64::from(a), i64::from(b.saturating_sub(side).max(a)))
+                as i32
+        };
+        let x = align(r.x0, r.x1);
+        let y = align(r.y0, r.y1);
+        Some(photocraft_geom::Rect::new(x, y, x.saturating_add(side).min(r.x1), y.saturating_add(side).min(r.y1)))
+    }
+
+    fn completed(&mut self, rect: photocraft_geom::Rect) {
+        self.subtract(rect);
+    }
+}
+
 /// Default tile side; documents up to this size (and the device limit) use a single texture.
 pub const DEFAULT_TILE: u32 = 8192;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -115,7 +216,16 @@ impl GpuCanvas {
             Some("1") => HighPolicy::Always,
             _ => HighPolicy::Budget,
         };
-        let res = Resources::new(&rs.device, &rs.queue, rs.target_format, high != HighPolicy::Off);
+        let mut res = Resources::new(&rs.device, &rs.queue, rs.target_format, high != HighPolicy::Off);
+        // Pipeline creation is a one-time setup cost, not part of the first document
+        // slice. Initialize it before the app starts accepting document actions.
+        match photocraft_gpu::Compositor::try_new_with_format(&rs.device, photocraft_gpu::Compositor::preferred_acc_format(&rs.adapter)) {
+            Ok(comp) => res.compositor = Some(comp),
+            Err(error) => {
+                log::warn!("{error}; using the CPU compositor");
+                res.compositor_failed = Some(error);
+            }
+        }
         rs.renderer.write().callback_resources.insert(res);
         log::info!("gpu canvas: target {:?}, max texture {max}, tile {tile}, 16F canvas {high:?}", rs.target_format);
         Self { rs: rs.clone(), tile, high }
@@ -173,6 +283,15 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor_focus = focus;
+        }
+    }
+
+    /// The next refreshes change only layer pixels since the previous one (a live brush stroke
+    /// after its first frame): the compositor reuses its group settings keys.
+    pub fn set_pixels_only(&self, pixels_only: bool) {
+        let mut r = self.rs.renderer.write();
+        if let Some(res) = r.callback_resources.get_mut::<Resources>() {
+            res.compositor_pixels_only = pixels_only;
         }
     }
 
@@ -295,6 +414,16 @@ impl GpuCanvas {
         region: photocraft_geom::Rect,
         encode_srgb: bool,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        self.composite_at_mip(doc, region, encode_srgb, 0)
+    }
+
+    fn composite_at_mip(
+        &self,
+        doc: &photocraft_doc::Document,
+        region: photocraft_geom::Rect,
+        encode_srgb: bool,
+        level: u32,
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
         let (device, queue) = (&self.rs.device, &self.rs.queue);
         let size = [doc.size.width, doc.size.height];
         if size[0] == 0 || size[1] == 0 {
@@ -329,14 +458,14 @@ impl GpuCanvas {
         let wanted = if fast { photocraft_gpu::FAST_ACC_FORMAT } else { photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter) };
         comp.set_acc_format(wanted);
         comp.set_focus(res.compositor_focus);
+        comp.set_pixels_only(res.compositor_pixels_only);
         let key = doc.id.0;
         let format = self.format_for(doc.depth, size);
         let fresh = res.docs.get(&key).is_none_or(|d| d.size != size || d.format != format);
         let region = if fresh { doc.bounds() } else { region.intersect(&doc.bounds()) };
-        if let Err(e) = comp.supports(doc) {
-            res.compositor = Some(comp);
-            return Err(e);
-        }
+        // No separate `supports` check: the render plans the document and checks its effects
+        // before any GPU work and fails the same way (a fresh texture is dropped below). Checking
+        // first planned all 479 layers of a PSB twice per brush dab.
         // A full refresh whose layer pages don't fit the memory budget stays on the GPU: the
         // compositor evicts and re-uploads pages cell by cell within the budget. Re-uploading
         // is far cheaper than compositing on the CPU once layers carry effects, adjustments or
@@ -357,14 +486,20 @@ impl GpuCanvas {
         let bgl = &res.encode_bgl;
         // A float canvas keeps values above 1.0 (32-bit documents, for the 32-bit preview).
         let keep_hdr = i32::from(format == FORMAT_HIGH);
-        let result = comp.render(device, queue, doc, region, |enc, out| {
+        let result = comp.render_at_mip(device, queue, doc, region, level, |enc, out| {
             for t in &d.tiles {
                 let [tx, ty, tw, th] = t.rect.map(|v| v as i32);
                 let r = out.rect.intersect(&photocraft_geom::Rect::from_xywh(tx, ty, tw as u32, th as u32));
                 if r.is_empty() {
                     continue;
                 }
-                let offset = [out.rect.x0 - tx, out.rect.y0 - ty, i32::from(encode_srgb), keep_hdr];
+                let step = 1i32 << out.mip_level;
+                let local = photocraft_geom::Rect::new((r.x0 - tx) / step, (r.y0 - ty) / step, (r.x1 - tx) / step, (r.y1 - ty) / step);
+                let Some(target) = t.levels.get(out.mip_level as usize) else { continue };
+                if local.is_empty() {
+                    continue;
+                }
+                let offset = [(out.rect.x0 - tx) / step, (out.rect.y0 - ty) / step, i32::from(encode_srgb), keep_hdr];
                 let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("pc_encode"),
                     contents: &offset.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
@@ -381,7 +516,7 @@ impl GpuCanvas {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("pc_encode"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &t.levels[0],
+                        view: target,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
@@ -393,12 +528,14 @@ impl GpuCanvas {
                 });
                 pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.set_scissor_rect((r.x0 - tx) as u32, (r.y0 - ty) as u32, r.width(), r.height());
+                pass.set_scissor_rect(local.x0 as u32, local.y0 as u32, local.width(), local.height());
                 pass.draw(0..3, 0..1);
             }
         });
         if result.is_ok() {
-            d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+            if level == 0 {
+                d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+            }
             // Wait for the GPU before returning. Without this, edits that arrive faster than the
             // GPU finishes them keep their upload staging in flight, and the driver's memory pool
             // keeps that high-water mark for the rest of the session (4 GB of RAM after 100
@@ -468,6 +605,168 @@ impl GpuCanvas {
         out
     }
 
+    /// Composite one bounded slice, prioritizing visible dirty pixels. `changed` queues
+    /// new damage (None means a full invalidation), while `false` continues prior work.
+    /// This is a soft time budget: a single upload or effect build cannot be interrupted.
+    pub fn refresh_progressive(
+        &self,
+        key: u64,
+        doc: &photocraft_doc::Document,
+        damage: Option<photocraft_geom::Rect>,
+        visible: photocraft_geom::Rect,
+        display: Option<&photocraft_engine::display_color::CanvasDisplay>,
+        changed: bool,
+    ) -> Refresh {
+        let size = [doc.size.width, doc.size.height];
+        let format = self.format_for(doc.depth, size);
+        let region = {
+            let mut renderer = self.rs.renderer.write();
+            let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return Refresh::default() };
+            let fresh = res.docs.get(&key).is_none_or(|d| d.size != size || d.format != format);
+            if fresh && size[0] > 0 && size[1] > 0 {
+                let tex = DocTextures::new(&self.rs.device, res, size, self.tile, format);
+                res.docs.insert(key, tex);
+                res.dirty.remove(&key);
+                res.coarse.remove(&key);
+            }
+            let dirty = res.dirty.entry(key).or_insert_with(|| DirtyRegions { side: SLICE, ..Default::default() });
+            if fresh || changed {
+                dirty.add(if fresh { doc.bounds() } else { damage.unwrap_or(doc.bounds()).intersect(&doc.bounds()) });
+            }
+            let wanted = res.preview_levels.get(&key).copied().unwrap_or(0);
+            let invalid = if fresh { doc.bounds() } else { damage.unwrap_or(doc.bounds()).intersect(&doc.bounds()) };
+            let area = u64::from(invalid.width()) * u64::from(invalid.height());
+            if wanted > 0 && (fresh || (changed && area > 1_048_576)) {
+                let coarse = res.coarse.entry(key).or_insert_with(|| (wanted, DirtyRegions { side: SLICE, ..Default::default() }));
+                if coarse.0 != wanted {
+                    *coarse = (wanted, DirtyRegions { side: SLICE, ..Default::default() });
+                }
+                coarse.1.add(invalid);
+                if let Some(texture) = res.docs.get_mut(&key) {
+                    texture.preview_level = Some(wanted);
+                }
+            } else if changed && let Some((_, coarse)) = res.coarse.get_mut(&key) {
+                coarse.add(invalid);
+            }
+            let coarse = res.coarse.get(&key).and_then(|(level, pending)| pending.next(visible.intersect(&doc.bounds())).map(|r| (r, *level)));
+            let region = coarse.or_else(|| dirty.next(visible.intersect(&doc.bounds())).map(|r| (r, 0)));
+            // Extra views can ask for the same document in one egui frame. Queue
+            // their invalidations, but share one compositor slice across all views.
+            if let Some((_, used)) = res.slice_frame.as_mut() {
+                if *used {
+                    None
+                } else {
+                    *used = region.is_some();
+                    region
+                }
+            } else {
+                region
+            }
+        };
+        let Some((region, level)) = region else { return Refresh::default() };
+        let result = if level > 0 {
+            let step = 1i32 << level;
+            let aligned = photocraft_geom::Rect::new(region.x0.div_euclid(step) * step, region.y0.div_euclid(step) * step, region.x1, region.y1);
+            let t0 = now_ms();
+            // The preview leaves layer effects out: building their maps is most of a first
+            // refresh (3.9 s of a 479-layer PSB's first slice), and the exact slices that follow
+            // draw them. `PHOTOCRAFT_PREVIEW_EFFECTS=1` keeps them.
+            let lite = (std::env::var_os("PHOTOCRAFT_PREVIEW_EFFECTS").is_none()).then(|| without_effects(doc));
+            match self.composite_at_mip(lite.as_ref().unwrap_or(doc), aligned, display.is_some_and(|d| d.encode_srgb), level) {
+                Ok(stats) => Refresh {
+                    kind: "gpu-preview",
+                    px: u64::from(region.width()) * u64::from(region.height()),
+                    composite_ms: now_ms() - t0,
+                    uploads: stats.tiles_uploaded as u64,
+                    ..Default::default()
+                },
+                Err(_) => {
+                    // Unsupported reduced output falls back to the exact slice queue.
+                    let mut renderer = self.rs.renderer.write();
+                    if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
+                        res.coarse.remove(&key);
+                        if let Some(texture) = res.docs.get_mut(&key) {
+                            texture.preview_level = None;
+                        }
+                    }
+                    return Refresh::default();
+                }
+            }
+        } else {
+            self.refresh(key, doc, Some(region), display)
+        };
+        let mut renderer = self.rs.renderer.write();
+        if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
+            if level > 0 {
+                if let Some((_, coarse)) = res.coarse.get_mut(&key) {
+                    coarse.completed(region);
+                }
+            } else if let Some(dirty) = res.dirty.get_mut(&key) {
+                dirty.completed(region);
+                if dirty.rects.is_empty() {
+                    res.coarse.remove(&key);
+                    if let Some(texture) = res.docs.get_mut(&key) {
+                        texture.preview_level = None;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    pub fn pending(&self, key: u64) -> bool {
+        let renderer = self.rs.renderer.read();
+        renderer.callback_resources.get::<Resources>().and_then(|res| res.dirty.get(&key)).is_some_and(|d| !d.rects.is_empty())
+    }
+
+    pub(crate) fn begin_frame(&self, frame: u64) {
+        let mut renderer = self.rs.renderer.write();
+        if let Some(res) = renderer.callback_resources.get_mut::<Resources>()
+            && res.slice_frame.is_none_or(|(seen, _)| seen != frame)
+        {
+            res.slice_frame = Some((frame, false));
+        }
+    }
+
+    /// Select the initial coarse output from device pixels per document pixel.
+    pub fn set_preview_zoom(&self, key: u64, size: [u32; 2], zoom: f32) {
+        let allowed = size[0].min(size[1]).checked_ilog2().unwrap_or(0).min(self.tile.trailing_zeros()).min(8);
+        let level = if zoom.is_finite() && zoom > 0.0 && zoom < 0.5 && std::env::var("PHOTOCRAFT_CANVAS_COARSE").ok().as_deref() != Some("0") {
+            (-zoom.log2()).floor().clamp(0.0, allowed as f32) as u32
+        } else {
+            0
+        };
+        let mut renderer = self.rs.renderer.write();
+        if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
+            res.preview_levels.insert(key, level);
+            if level == 0 {
+                res.coarse.remove(&key);
+                if let Some(texture) = res.docs.get_mut(&key) {
+                    texture.preview_level = None;
+                }
+            }
+        }
+    }
+
+    /// Pixels still dirty, for automation to distinguish first appearance from convergence.
+    pub fn pending_pixels(&self, key: u64) -> u64 {
+        let renderer = self.rs.renderer.read();
+        renderer
+            .callback_resources
+            .get::<Resources>()
+            .and_then(|res| res.dirty.get(&key))
+            .map_or(0, |d| d.rects.iter().fold(0u64, |n, r| n.saturating_add(u64::from(r.width()).saturating_mul(u64::from(r.height())))))
+    }
+
+    /// Coarse display level and the coarse pixels still awaiting their first preview.
+    pub fn preview_info(&self, key: u64) -> Option<(u32, u64)> {
+        let renderer = self.rs.renderer.read();
+        let res = renderer.callback_resources.get::<Resources>()?;
+        let level = res.docs.get(&key)?.preview_level?;
+        let remaining = res.coarse.get(&key).map_or(0, |(_, d)| d.rects.iter().map(|r| u64::from(r.width()) * u64::from(r.height())).sum());
+        Some((level, remaining))
+    }
+
     /// Composite the whole of `doc` with the CPU compositor into document `key`'s texture, band by
     /// band (each band converted and uploaded before the next is rendered), so a huge document
     /// never needs a full-size float composite or texture-format copy in memory.
@@ -522,6 +821,9 @@ impl GpuCanvas {
         // LUTs and identity-transform signatures can outlive document textures. Prune both,
         // or a preserved-ID reopen can skip rebuilding a missing LUT.
         res.luts.retain(|k, _| live.contains(k));
+        res.dirty.retain(|k, _| live.contains(k));
+        res.coarse.retain(|k, _| live.contains(k));
+        res.preview_levels.retain(|k, _| live.contains(k));
         res.display_lut_signatures.retain(|k, _| live.contains(k));
     }
 
@@ -685,6 +987,8 @@ pub struct Perf {
     pub ui_ms: f64,
     /// Worst UI frame of the last ~second (ms).
     pub ui_max_ms: f64,
+    /// Worst UI frame since launch (the rolling maximum can decay during a long refresh).
+    pub ui_peak_ms: f64,
     /// Last canvas refresh: CPU composite (ms).
     pub composite_ms: f64,
     /// Last canvas refresh: conversion + upload (ms).
@@ -715,9 +1019,18 @@ pub struct Perf {
     pub spans: std::collections::BTreeMap<&'static str, f64>,
     #[serde(skip)]
     max_decay: f64,
+    #[serde(skip)]
+    backing_error_seen: Option<String>,
 }
 
 impl Perf {
+    pub(crate) fn new_backing_error(&mut self, error: Option<String>) -> Option<String> {
+        if self.backing_error_seen == error {
+            return None;
+        }
+        self.backing_error_seen = error.clone();
+        error
+    }
     pub fn record(&mut self, kind: &'static str, px: u64, composite_ms: f64, upload_ms: f64) {
         self.last_refresh = kind;
         self.last_refresh_px = px;
@@ -733,6 +1046,7 @@ impl Perf {
         self.spans.insert(name, (ms * 100.0).round() / 100.0);
     }
     pub fn frame(&mut self, ms: f64) {
+        self.ui_peak_ms = self.ui_peak_ms.max(ms);
         self.ui_ms = if self.ui_ms == 0.0 { ms } else { self.ui_ms * 0.9 + ms * 0.1 };
         self.max_decay += 1.0;
         if ms > self.ui_max_ms || self.max_decay > 60.0 {
@@ -927,6 +1241,10 @@ struct Resources {
     encode_pipeline_high: Option<wgpu::RenderPipeline>,
     mip_sampler: wgpu::Sampler,
     docs: HashMap<u64, DocTextures>,
+    dirty: HashMap<u64, DirtyRegions>,
+    coarse: HashMap<u64, (u32, DirtyRegions)>,
+    preview_levels: HashMap<u64, u32>,
+    slice_frame: Option<(u64, bool)>,
     views: HashMap<u64, ViewGpu>,
     out_linear: bool,
     /// The wgpu layer compositor (created on first use).
@@ -937,6 +1255,7 @@ struct Resources {
     /// view shows; applied before every composite.
     compositor_budget: Option<u64>,
     compositor_focus: Option<photocraft_geom::Rect>,
+    compositor_pixels_only: bool,
     encode_bgl: wgpu::BindGroupLayout,
     encode_pipeline: wgpu::RenderPipeline,
     lut_bgl: wgpu::BindGroupLayout,
@@ -1006,6 +1325,8 @@ struct ViewGpu {
 }
 
 struct DocTextures {
+    /// During refinement only this mip is valid across the coarse preview.
+    preview_level: Option<u32>,
     size: [u32; 2],
     format: wgpu::TextureFormat,
     tiles: Vec<Tile>,
@@ -1198,6 +1519,11 @@ impl Resources {
             compositor_failed: None,
             compositor_budget: None,
             compositor_focus: None,
+            compositor_pixels_only: false,
+            dirty: HashMap::new(),
+            coarse: HashMap::new(),
+            preview_levels: HashMap::new(),
+            slice_frame: None,
             encode_bgl,
             encode_pipeline,
         }
@@ -1258,7 +1584,7 @@ impl DocTextures {
                 tiles.push(Tile { rect: [tx, ty, w, h], texture, levels, bind_group, _uniform: uniform });
             }
         }
-        Self { size, format, tiles }
+        Self { size, format, tiles, preview_level: None }
     }
 
     /// Write `size` pixels at document `origin` from `texels` (in the texture format, row stride
@@ -1419,7 +1745,15 @@ impl CallbackTrait for CanvasCallback {
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
-        let data = self.uniforms(screen.size_in_pixels, screen.pixels_per_point, res.out_linear, &res.style);
+        let mut data = self.uniforms(screen.size_in_pixels, screen.pixels_per_point, res.out_linear, &res.style);
+        if let Some(level) = res.docs.get(&self.params.doc).and_then(|d| d.preview_level) {
+            if let Some(mode) = data.get_mut(8) {
+                *mode = 0.0;
+            }
+            if let Some(lod) = data.get_mut(9) {
+                *lod = level as f32;
+            }
+        }
         let (bgl, sampler) = (&res.view_bgl, &res.sampler);
         let v = res.views.entry(self.params.view_key).or_insert_with(|| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1689,6 +2023,58 @@ fn fs(in: V) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressive_measurement_preserves_lifetime_frame_peak() {
+        let mut perf = Perf::default();
+        perf.frame(120.0);
+        for _ in 0..100 {
+            perf.frame(5.0);
+        }
+        assert_eq!(perf.ui_max_ms, 5.0);
+        assert_eq!(perf.ui_peak_ms, 120.0);
+    }
+
+    #[test]
+    fn progressive_damage_keeps_offscreen_pixels_and_merges_edits() {
+        use photocraft_geom::Rect;
+        let bounds = Rect::new(0, 0, 1024, 512);
+        let visible = Rect::new(512, 0, 1024, 512);
+        let mut dirty = DirtyRegions { side: 256, ..Default::default() };
+        dirty.add(bounds);
+        let first = dirty.next(visible).expect("visible work");
+        assert_eq!(first.intersect(&visible), first);
+        dirty.completed(first);
+        dirty.add(first); // An edit during the pending full refresh.
+        let mut covered = vec![false; 1024 * 512];
+        let mut slices = 0;
+        while let Some(rect) = dirty.next(visible) {
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    covered[y as usize * 1024 + x as usize] = true;
+                }
+            }
+            dirty.completed(rect);
+            slices += 1;
+            assert!(slices < 1024, "scheduler must finish");
+        }
+        assert!(covered.into_iter().all(|p| p));
+    }
+
+    #[test]
+    fn progressive_invalidations_bound_bookkeeping_and_cover_new_damage() {
+        use photocraft_geom::Rect;
+        let mut dirty = DirtyRegions::default();
+        for x in 0..1000 {
+            dirty.add(Rect::new(x * 2, 0, x * 2 + 1, 1));
+        }
+        assert!(dirty.rects.len() <= 256);
+        for x in 0..1000 {
+            let pixel = Rect::new(x * 2, 0, x * 2 + 1, 1);
+            assert!(dirty.rects.iter().any(|r| r.intersect(&pixel) == pixel));
+        }
+        assert!(dirty.next(Rect::EMPTY).is_some(), "idle work drains offscreen damage");
+    }
 
     #[test]
     fn gpu_budget_follows_memory_usage_and_ram() {

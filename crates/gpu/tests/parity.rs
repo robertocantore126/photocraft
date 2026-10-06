@@ -737,6 +737,33 @@ fn fx_check(g: &mut Gpu, doc: &Document, what: &str) -> photocraft_gpu::Stats {
 }
 
 #[test]
+fn progressive_effect_windows_match_cpu_across_slices_and_edits() {
+    let Some(mut g) = gpu() else { return };
+    g.comp.set_progressive(true);
+    g.paged.set_progressive(true);
+    let mut failures = Vec::new();
+    for depth in [SampleType::U8, SampleType::U16] {
+        for (name, fx) in effect_cases() {
+            let mut d = fx_doc(180, 140, depth);
+            d.patterns.push(checker_pattern());
+            let mut l = blob("fx", d.pixel_format(), 90.0, 70.0, 35.0, [0.9, 0.4, 0.2]);
+            l.effects.items = fx;
+            d.layers.push(l);
+            for rect in [Rect::new(40, 30, 90, 80), Rect::new(90, 30, 140, 80), Rect::new(70, 80, 120, 130)] {
+                if let Err(e) = diff_rect(&mut g, &d, rect, &format!("progressive {name} {depth:?}")) {
+                    failures.push(e);
+                }
+            }
+            d.layers[1].surface_mut().unwrap().fill_rect(Rect::new(80, 60, 105, 90), &[0.1, 0.8, 0.4, 1.0]);
+            if let Err(e) = diff_rect(&mut g, &d, Rect::new(70, 50, 120, 100), &format!("edited progressive {name} {depth:?}")) {
+                failures.push(e);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn layer_effects_every_kind() {
     let Some(mut g) = gpu() else { return };
     let mut failures = Vec::new();
@@ -888,6 +915,58 @@ fn layer_effects_update_incrementally() {
     // A change of shape with the move rebuilds.
     d.layers[1].surface_mut().unwrap().fill_rect(Rect::new(300, 300, 310, 310), &[1.0, 1.0, 1.0, 0.5]);
     fx_check(&mut g, &d, "moved and painted");
+}
+
+#[test]
+fn group_effects_update_incrementally() {
+    let Some(mut g) = gpu() else { return };
+    let mut d = fx_doc(420, 360, SampleType::U8);
+    let fmt = d.pixel_format();
+    // A child whose own effect reaches 12 px past it, a child with a feathered mask, and a nested
+    // group with a shadow of its own: each moves the outer group's alpha beyond the dab.
+    let mut glowing = blob("glowing", fmt, 120.0, 120.0, 50.0, [0.9, 0.4, 0.2]);
+    glowing.effects.items = vec![Effect::OuterGlow(glow(FxPaint::Color(Color::rgb(1.0, 1.0, 0.4)), GlowTechnique::Softer, 12.0, 0.0, GlowSource::Edge))];
+    let mut masked = blob("masked", fmt, 280.0, 120.0, 55.0, [0.2, 0.6, 0.9]);
+    let mut m = LayerMask::reveal_all();
+    m.surface = photocraft_raster::Surface::with_default(PixelFormat::GRAY8, &[0.0]);
+    m.surface.fill_rect(Rect::new(230, 70, 330, 170), &[1.0]);
+    m.feather = 6.0;
+    masked.mask = Some(m);
+    let mut inner = Layer::group("inner", vec![blob("deep", fmt, 200.0, 260.0, 45.0, [0.3, 0.9, 0.3])]);
+    inner.effects.items = vec![Effect::DropShadow(shadow(BlendMode::Multiply, 0.7, 120.0, 8.0, 6.0, 0.0))];
+    let mut grp = Layer::group("outer", vec![glowing, masked, inner]);
+    grp.effects.items = vec![
+        Effect::DropShadow(shadow(BlendMode::Multiply, 0.8, 135.0, 10.0, 8.0, 0.0)),
+        Effect::Stroke(stroke(4.0, StrokePosition::Outside, FxPaint::Color(Color::rgb(1.0, 1.0, 1.0)))),
+    ];
+    d.layers.push(grp);
+    let first = fx_check(&mut g, &d, "initial");
+    assert!(first.fx_shapes >= 1, "{first:?}");
+    fn child(d: &mut Document, i: usize) -> &mut Layer {
+        match d.layers.last_mut().map(|l| &mut l.content) {
+            Some(LayerContent::Group(g)) => &mut g.children[i],
+            _ => panic!("not a group"),
+        }
+    }
+    // Dabs at a child's edge (its glow moves), on the feathered mask, and in the nested group.
+    child(&mut d, 0).surface_mut().unwrap().fill_rect(Rect::new(160, 100, 185, 125), &[0.1, 0.1, 0.9, 1.0]);
+    let s = fx_check(&mut g, &d, "dab beside a glowing child");
+    assert!(s.fx_pixels < first.fx_pixels / 4, "partial {} vs full {}", s.fx_pixels, first.fx_pixels);
+    child(&mut d, 1).mask.as_mut().unwrap().surface.fill_rect(Rect::new(330, 100, 345, 130), &[1.0]);
+    let s = fx_check(&mut g, &d, "dab on a feathered mask");
+    assert!(s.fx_pixels < first.fx_pixels / 4, "partial {} vs full {}", s.fx_pixels, first.fx_pixels);
+    match &mut child(&mut d, 2).content {
+        LayerContent::Group(g) => g.children[0].surface_mut().unwrap().fill_rect(Rect::new(240, 250, 262, 270), &[0.9, 0.9, 0.9, 1.0]),
+        _ => panic!("not a group"),
+    }
+    let s = fx_check(&mut g, &d, "dab in a nested group with effects");
+    assert!(s.fx_pixels < first.fx_pixels / 4, "partial {} vs full {}", s.fx_pixels, first.fx_pixels);
+    // Erasing part of a child shrinks the group's shape there.
+    child(&mut d, 0).surface_mut().unwrap().fill_rect(Rect::new(70, 70, 120, 120), &[0.0, 0.0, 0.0, 0.0]);
+    fx_check(&mut g, &d, "erase in a child");
+    // A child's settings change: everything is rebuilt, still exact.
+    child(&mut d, 1).opacity = 0.5;
+    fx_check(&mut g, &d, "child opacity");
 }
 
 #[test]
@@ -1254,6 +1333,22 @@ fn big_doc() -> Document {
 }
 
 #[test]
+fn progressive_effect_pages_preserve_aprons_groups_masks_and_clipping() {
+    let _gamma = TEXT_GAMMA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut g) = gpu() else { return };
+    g.comp.set_progressive(true);
+    g.paged.set_progressive(true);
+    let mut d = big_doc();
+    for rect in [Rect::new(480, 480, 550, 550), Rect::new(720, 120, 850, 270), Rect::new(230, 590, 530, 720)] {
+        diff_rect(&mut g, &d, rect, "progressive page boundary").unwrap_or_else(|e| panic!("{e}"));
+    }
+    d.layers[3].surface_mut().unwrap().fill_rect(Rect::new(500, 490, 530, 530), &[0.1, 0.1, 0.9, 1.0]);
+    diff_rect(&mut g, &d, Rect::new(470, 450, 570, 570), "progressive after page-corner dab").unwrap_or_else(|e| panic!("{e}"));
+    g.comp.set_progressive(false);
+    diff_rect(&mut g, &d, Rect::new(470, 450, 570, 570), "return to exact full-map mode").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn documents_larger_than_the_texture_limit() {
     let _gamma = TEXT_GAMMA.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut g) = gpu() else { return };
@@ -1325,4 +1420,209 @@ fn the_focused_view_stays_resident_after_a_full_refresh() {
         let cpu = photocraft_compose::render(&d, view);
         assert!(worst_diff(&cpu.px, &out).0 <= TOL);
     }
+}
+
+#[test]
+fn culling_aliases_match_unculled_and_cpu_randomized() {
+    let Some(mut g) = gpu() else { return };
+    let rects = [Rect::new(0, 0, 80, 64), Rect::new(240, 100, 340, 180), Rect::new(480, 0, 560, 64)];
+    let modes = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference];
+    let mut culled_total = 0;
+    for seed in 0..16u32 {
+        let mut d = base_doc(576, 256);
+        // Test culling independently of the known integer-adjustment rounding discrepancy.
+        d.depth = SampleType::F32;
+        for i in 0..10u32 {
+            let x = (rnd(seed + 100, i) * 540.0) as i32 - 20;
+            let y = (rnd(seed + 200, i) * 210.0) as i32;
+            let fmt = match seed % 3 {
+                0 => PixelFormat::RGBA8,
+                1 => PixelFormat::RGBA16,
+                _ => PixelFormat::RGBA32F,
+            };
+            let mut layer = noise_layer("sparse", fmt, Rect::new(x, y, x + 24, y + 30), seed * 41 + i, 0.0);
+            layer.blend = modes[((seed + i) % 4) as usize];
+            layer.opacity = 0.3 + 0.7 * rnd(seed + 300, i);
+            if i % 3 == 0 {
+                layer.mask = Some(mask(Rect::new(x, y, x + 17, y + 20), seed + i, 0.0));
+            }
+            if i % 5 == 0 {
+                layer.clipped = true;
+            }
+            if i == 4 {
+                let mut group = Layer::group("nested", vec![layer]);
+                group.blend = if seed % 2 == 0 { BlendMode::PassThrough } else { BlendMode::Normal };
+                group.opacity = 0.75;
+                d.layers.push(group);
+            } else {
+                d.layers.push(layer);
+            }
+        }
+        let mut adj = Layer::new("invert", LayerContent::Adjustment(Adjustment::Invert));
+        adj.mask = Some(mask(Rect::new(20, 0, 60, 30), seed + 99, 0.0));
+        d.layers.push(adj);
+        for rect in rects {
+            g.comp.set_pass_culling(false);
+            g.paged.set_pass_culling(false);
+            let old = diff_rect(&mut g, &d, rect, "unculled random").unwrap();
+            g.comp.set_pass_culling(true);
+            g.paged.set_pass_culling(true);
+            let new = diff_rect(&mut g, &d, rect, "culled random").unwrap();
+            assert_eq!(old.passes_culled, 0);
+            culled_total += new.passes_culled;
+            assert!(new.passes_drawn <= old.passes_drawn);
+        }
+    }
+    assert!(culled_total > 0);
+}
+
+#[test]
+fn culling_preserves_nontransparent_surface_defaults() {
+    let Some(mut g) = gpu() else { return };
+    let mut d = base_doc(576, 32);
+    let mut layer = Layer::raster("opaque default", PixelFormat::RGBA8);
+    if let LayerContent::Raster(surface) = &mut layer.content {
+        *surface = photocraft_raster::Surface::with_default(PixelFormat::RGBA8, &[0.8, 0.1, 0.3, 1.0]);
+    }
+    d.layers.push(layer);
+    let stats = diff_rect(&mut g, &d, Rect::new(480, 0, 560, 32), "opaque default").unwrap();
+    assert_eq!(stats.passes_culled, 0);
+}
+
+fn read_mip(g: &mut Gpu, doc: &Document, level: u32) -> Vec<[f32; 4]> {
+    let step = 1 << level;
+    let size = [doc.size.width.div_ceil(step), doc.size.height.div_ceil(step)];
+    let row = (size[0] * 16).div_ceil(256) * 256;
+    let buffer = g.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mip_test"),
+        size: row as u64 * size[1] as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    g.comp
+        .render_at_mip(&g.device, &g.queue, doc, doc.bounds(), level, |encoder, out| {
+            assert_eq!(out.mip_level, level);
+            encoder.copy_texture_to_buffer(
+                out.texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (out.rect.y0 as u64 / step as u64) * row as u64 + out.rect.x0 as u64 / step as u64 * 16,
+                        bytes_per_row: Some(row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d { width: out.pixel_size[0], height: out.pixel_size[1], depth_or_array_layers: 1 },
+            );
+        })
+        .unwrap();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+    let data = buffer.slice(..).get_mapped_range().unwrap();
+    let mut pixels = Vec::new();
+    for scanline in data.chunks_exact(row as usize) {
+        for pixel in scanline[..size[0] as usize * 16].chunks_exact(16) {
+            pixels.push(std::array::from_fn(|i| f32::from_le_bytes(pixel[i * 4..i * 4 + 4].try_into().unwrap())));
+        }
+    }
+    pixels
+}
+
+#[test]
+fn gpu_mips_preserve_alpha_edges_masks_and_tile_updates() {
+    let Some(mut g) = gpu() else { return };
+    for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+        let mut doc = Document::new("mips", Size::new(512, 256), ColorMode::Rgb, fmt.sample);
+        let mut layer = Layer::raster("checker", fmt);
+        let mut values = Vec::new();
+        for _y in 0..256 {
+            for x in 0..512 {
+                values.extend(if x % 2 == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 1.0, 0.0] });
+            }
+        }
+        layer.surface_mut().unwrap().write_region(doc.bounds(), &values);
+        let mut mask = LayerMask::reveal_all();
+        mask.surface.fill_rect(doc.bounds(), &[0.5]);
+        layer.mask = Some(mask);
+        doc.layers.push(layer);
+        for level in 1..=3 {
+            let pixels = read_mip(&mut g, &doc, level);
+            for pixel in pixels {
+                assert!((pixel[0] - 1.0).abs() < TOL && pixel[2].abs() < TOL && (pixel[3] - 0.25).abs() < TOL, "{fmt:?}: {pixel:?}");
+            }
+        }
+        doc.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 256, 256), &[0.0, 1.0, 0.0, 1.0]);
+        let pixels = read_mip(&mut g, &doc, 2);
+        assert!(pixels[0][1] > 0.99 && (pixels[0][3] - 0.5).abs() < TOL);
+        check(&mut g, &doc, "100% after mip generation");
+        assert!(g.comp.render_at_mip(&g.device, &g.queue, &doc, doc.bounds(), 32, |_, _| {}).is_err());
+        assert!(g.comp.render_at_mip(&g.device, &g.queue, &doc, Rect::new(1, 0, 30, 20), 2, |_, _| {}).is_err());
+    }
+}
+
+#[test]
+fn culling_keeps_feather_coverage_outside_mask_tiles() {
+    let Some(mut g) = gpu() else { return };
+    let mut doc = base_doc(512, 32);
+    doc.depth = SampleType::F32;
+    let mut layer = Layer::raster("feather", PixelFormat::RGBA8);
+    layer.surface_mut().unwrap().fill_rect(doc.bounds(), &[1.0, 0.0, 0.0, 1.0]);
+    let mut m = LayerMask::hide_all();
+    m.surface.fill_rect(Rect::new(240, 0, 256, 32), &[1.0]);
+    m.feather = 24.0;
+    layer.mask = Some(m);
+    doc.layers.push(layer);
+    let stats = diff_rect(&mut g, &doc, Rect::new(256, 0, 288, 32), "feather spill beyond mask tile").unwrap();
+    assert_eq!(stats.passes_culled, 0);
+}
+
+#[test]
+fn prefix_cache_follows_a_stroke_and_drops_on_changes_below() {
+    let _gamma = TEXT_GAMMA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut g) = gpu() else { return };
+    let mut d = big_doc();
+    // Filler layers under everything else push the stroke layer deep into the plan.
+    for i in 0..40 {
+        let x = 20 + (i * 97) % 900;
+        let y = 20 + (i * 61) % 700;
+        d.layers.insert(2, noise_layer(&format!("filler{i}"), PixelFormat::RGBA8, Rect::new(x, y, x + 160, y + 120), 200 + i as u32, 0.3));
+    }
+    check(&mut g, &d, "full");
+    fn ga(d: &mut Document) -> &mut photocraft_raster::Surface {
+        let g = d.layers.iter_mut().find(|l| l.name == "g").unwrap();
+        match &mut g.content {
+            LayerContent::Group(g) => g.children[0].surface_mut().unwrap(),
+            _ => panic!("not a group"),
+        }
+    }
+    let region = Rect::new(300, 520, 760, 760);
+    let cached = std::cell::Cell::new(0usize);
+    let dab = |d: &mut Document, i: i32, what: &str, g: &mut Gpu| {
+        ga(d).fill_rect(Rect::new(330 + i * 37, 560 + (i % 3) * 40, 370 + i * 37, 600 + (i % 3) * 40), &[0.2, 0.9, 0.3, 1.0]);
+        let s = diff_rect(g, d, region, what).unwrap_or_else(|e| panic!("{e}"));
+        cached.set(cached.get() + s.passes_cached);
+        s
+    };
+    for i in 0..4 {
+        dab(&mut d, i, &format!("stroke dab {i}"), &mut g);
+    }
+    assert!(cached.get() > 0, "a stroke on one layer starts from a cached prefix");
+    // Changes below the stroke layer: each must drop the cached prefix (the CPU agrees).
+    d.layers.iter_mut().find(|l| l.name == "filler3").unwrap().surface_mut().unwrap().fill_rect(Rect::new(0, 0, 1100, 900), &[0.9, 0.1, 0.1, 0.5]);
+    dab(&mut d, 4, "pixels below changed", &mut g);
+    d.layers.iter_mut().find(|l| l.name == "invert").unwrap().opacity = 0.25;
+    dab(&mut d, 5, "adjustment below changed", &mut g);
+    d.layers.iter_mut().find(|l| l.name == "top").unwrap().visible = false;
+    dab(&mut d, 6, "layer below hidden", &mut g);
+    if let Some(Effect::OuterGlow(gl)) = d.layers.iter_mut().find(|l| l.name == "big").unwrap().effects.items.last_mut() {
+        gl.common.opacity = 0.3;
+    }
+    dab(&mut d, 7, "effect below changed", &mut g);
+    d.layers.iter_mut().find(|l| l.name == "big").unwrap().surface_mut().unwrap().fill_rect(Rect::new(400, 600, 500, 700), &[0.0, 0.0, 0.0, 0.0]);
+    dab(&mut d, 8, "effect layer pixels below changed", &mut g);
+    for i in 9..12 {
+        dab(&mut d, i, &format!("stroke continues {i}"), &mut g);
+    }
+    // And the whole document still matches after all of it.
+    check(&mut g, &d, "full after");
 }

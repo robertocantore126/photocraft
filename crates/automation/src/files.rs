@@ -27,7 +27,7 @@ pub fn open_bytes(name: &str, bytes: &[u8]) -> Result<Opened, AutomationError> {
 /// Open a document from disk. Directory bundles and `.pcraft` ZIPs load
 /// natively; everything else goes through `photocraft-io` (PSD, PNG, …).
 pub fn open(path: &Path) -> Result<Opened, AutomationError> {
-    if path.is_dir() {
+    if path.is_dir() || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
         return Ok(Opened { document: photocraft_format::load_path(path)?, warnings: Vec::new() });
     }
     let bytes = std::fs::read(path).map_err(|e| AutomationError::Io(format!("{}: {e}", path.display())))?;
@@ -57,7 +57,7 @@ pub fn save(
     if ext == photocraft_format::EXTENSION {
         let mut local = PcraftWriter::new();
         let w = writer.unwrap_or(&mut local);
-        w.save_path(doc, path, &previews(doc))?;
+        w.save_path(doc, path, &SaveOptions::default())?;
         return Ok(Vec::new());
     }
     let r = photocraft_io::export(doc, &ext, opts)?;

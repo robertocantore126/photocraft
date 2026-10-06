@@ -211,6 +211,9 @@ async fn agent_completes_ten_scripted_tasks() {
     assert_eq!((doc["mode"].as_str(), doc["width"].as_u64()), (Some("Cmyk"), Some(45)), "task 10");
     assert_eq!(doc["layers"].as_array().unwrap().len(), 4, "task 10");
 
+    // An open native document reads its tiles from its file, so it keeps the file open: close
+    // it before the server (which shuts down in its own task) and the directory go away.
+    tool(&c, "doc_close", json!({})).await;
     c.cancel().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

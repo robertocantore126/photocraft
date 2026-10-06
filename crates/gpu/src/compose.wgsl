@@ -8,6 +8,10 @@
 struct Chunk {
     origin: vec2<i32>,
     size: vec2<i32>,
+    mip_level: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 struct Op {
@@ -70,7 +74,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
 }
 
 fn local(pos: vec4<f32>) -> vec2<i32> { return vec2<i32>(floor(pos.xy)); }
-fn doc_px(p: vec2<i32>) -> vec2<i32> { return chunk.origin + p; }
+fn doc_px(p: vec2<i32>) -> vec2<i32> { return chunk.origin + p * i32(1u << chunk.mip_level); }
 
 fn inside(p: vec2<i32>, size: vec2<i32>) -> bool {
     return p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y;
@@ -88,7 +92,8 @@ fn mask_value(d: vec2<i32>) -> f32 {
     if ((op.flags & F_MASK_TEX) != 0u) {
         let m = d - op.mask_origin;
         if (inside(m, op.mask_size)) {
-            v = textureLoad(mask_tex, m, 0).r;
+            let level = min(chunk.mip_level, textureNumLevels(mask_tex) - 1u);
+            v = textureLoad(mask_tex, m / i32(1u << level), i32(level)).r;
         }
     }
     return 1.0 - op.mask_density * (1.0 - v);
@@ -614,7 +619,8 @@ fn layer_texel(d: vec2<i32>) -> vec4<f32> {
     if ((op.flags & F_TEX) != 0u) {
         let q = d - op.tex_origin;
         if (inside(q, op.tex_size)) {
-            return textureLoad(layer_tex, q, 0);
+            let level = min(chunk.mip_level, textureNumLevels(layer_tex) - 1u);
+            return textureLoad(layer_tex, q / i32(1u << level), i32(level));
         }
     }
     return op.color;

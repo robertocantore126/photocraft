@@ -449,6 +449,14 @@ pub fn sample_gradient(g: &Gradient, t: f32) -> [f32; 4] {
     PreparedGradient::new(g).sample(t)
 }
 
+/// `sample_gradient` at `n` evenly spaced points of [0, 1], converting the stops once (a
+/// 4096-entry table converted them 4096 times: 2.5 ms per 10-effect layer on every GPU plan).
+pub fn sample_gradient_n(g: &Gradient, n: usize) -> Vec<[f32; 4]> {
+    let p = PreparedGradient::new(g);
+    let last = n.saturating_sub(1).max(1) as f32;
+    (0..n).map(|k| p.sample(k as f32 / last)).collect()
+}
+
 // Prepared only for one paint call: CMYK conversions must use that call's active profile.
 struct PreparedGradient {
     color: Vec<(f32, [f32; 3])>,

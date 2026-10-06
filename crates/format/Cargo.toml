@@ -16,11 +16,15 @@ photocraft-raster = { workspace = true }
 photocraft-doc = { workspace = true }
 photocraft-codecs = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# Exact f64 parsing: without it the manifest moved shape paths, transforms and effect
+# reference points by one ULP on every save/open (a 479-layer PSB: 70 layers differed).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
 blake3 = { version = "1.8", default-features = false, features = ["pure"] }
 ruzstd = "0.9"
+crc32fast = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

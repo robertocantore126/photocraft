@@ -37,12 +37,41 @@ impl Tile {
         }
         Tile::from_vec(data)
     }
-    fn from_vec(data: Vec<u8>) -> Self {
+    pub fn from_vec(data: Vec<u8>) -> Self {
         Tile { cell: spill::Cell::new(data) }
+    }
+    /// Construct a tile without reading its compressed document extent.
+    pub fn lazy(len: usize, backing: Arc<dyn spill::TileBacking>, extent: spill::PackedExtent) -> Self {
+        Tile { cell: spill::Cell::lazy(len, backing, extent) }
+    }
+    /// Whether pixel bytes are resident; inspecting this never reads the backing.
+    pub fn is_resident(&self) -> bool {
+        self.cell.is_resident()
+    }
+    pub fn pack_backing(&self, id: [u8; 16]) -> Option<(Arc<dyn spill::TileBacking>, spill::PackedExtent)> {
+        self.cell.pack_backing(id)
+    }
+    pub fn pack_extent(&self, id: [u8; 16]) -> Option<spill::PackedExtent> {
+        self.cell.pack_extent(id)
+    }
+    /// Copy compressed bytes without decoding. Read and CRC errors are propagated.
+    pub fn packed_bytes(&self) -> Result<Vec<u8>, String> {
+        self.cell.packed()
+    }
+    pub fn attach_backing(&self, backing: Arc<dyn spill::TileBacking>, extent: spill::PackedExtent) {
+        self.cell.attach(backing, extent);
     }
     /// The tile's bytes (read back from the scratch disk if needed).
     pub fn bytes(&self) -> TileBytes<'_> {
         TileBytes(self.cell.read())
+    }
+    /// Read pixels while propagating backing corruption or disk errors.
+    pub fn try_bytes(&self) -> Result<TileBytes<'_>, String> {
+        let bytes = self.bytes();
+        if let Some(error) = self.cell.read_error() {
+            return Err(error);
+        }
+        Ok(bytes)
     }
     pub fn bytes_mut(&mut self) -> TileBytesMut<'_> {
         TileBytesMut(self.cell.write())
@@ -58,7 +87,9 @@ impl Tile {
 
 impl Clone for Tile {
     fn clone(&self) -> Self {
-        Tile::from_vec(self.bytes().to_vec())
+        let tile = Tile::from_vec(self.bytes().to_vec());
+        tile.cell.set_read_error(self.cell.read_error());
+        tile
     }
 }
 
@@ -139,6 +170,15 @@ impl Surface {
     }
     pub fn tiles(&self) -> impl Iterator<Item = (&TileCoord, &Arc<Tile>)> {
         self.tiles.iter()
+    }
+    /// Install an already allocated tile, validating its format-dependent size.
+    pub fn insert_tile(&mut self, c: TileCoord, tile: Arc<Tile>) -> Result<(), String> {
+        let expected = (TILE_SIZE * TILE_SIZE) as usize * self.format.bytes_per_pixel();
+        if tile.len() != expected {
+            return Err("tile length does not match surface format".into());
+        }
+        self.tiles.insert(c, tile);
+        Ok(())
     }
     pub fn tile(&self, c: TileCoord) -> Option<&Arc<Tile>> {
         self.tiles.get(&c)

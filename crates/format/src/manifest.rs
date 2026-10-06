@@ -91,8 +91,14 @@ pub struct DocM {
     #[serde(default)]
     pub text_styles: photocraft_doc::TextStyles,
     /// Web slices (user and layer-based; layer ids are remapped on load).
-    #[serde(default, skip_serializing_if = "photocraft_doc::Slices::is_empty")]
+    #[serde(default, skip_serializing_if = "slices_default")]
     pub slices: photocraft_doc::Slices,
+}
+
+/// Slices are left out only when they say nothing: an empty list can still carry the group name
+/// a PSD gave them, which a round trip must keep.
+fn slices_default(s: &photocraft_doc::Slices) -> bool {
+    *s == photocraft_doc::Slices::default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

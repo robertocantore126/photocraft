@@ -43,7 +43,7 @@ fn hash_bytes(b: &[u8]) -> Hash {
     blake3::hash(b).to_hex().to_string()
 }
 
-fn png(img: &Rgba8Image) -> Result<Vec<u8>> {
+pub(crate) fn png(img: &Rgba8Image) -> Result<Vec<u8>> {
     let image = photocraft_codecs::Image::from_u8(img.width, img.height, photocraft_codecs::ChannelLayout::Rgba, img.pixels.clone())
         .map_err(|e| FormatError::Unsupported(format!("preview: {e}")))?;
     photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).map_err(|e| FormatError::Unsupported(format!("preview: {e}")))
@@ -190,6 +190,9 @@ pub struct SaveStats {
     pub objects_removed: usize,
     /// Bytes of the manifest.
     pub manifest_bytes: usize,
+    /// Packs: the file's size after the save, and the bytes its newest commit references.
+    pub pack_bytes: u64,
+    pub pack_live_bytes: u64,
 }
 
 #[derive(Default)]
@@ -442,8 +445,21 @@ impl PcraftWriter {
         if path.is_dir() || s.ends_with('/') || s.ends_with('\\') {
             self.save_dir(doc, path, opts)
         } else {
-            let (bytes, stats) = self.save_zip(doc, opts)?;
-            write_atomic(path, &bytes)?;
+            // Existing ZIP bundles are replaced only after a complete new pack is durable.
+            if path.exists() {
+                use std::io::Read;
+                let mut old = std::fs::File::open(path)?;
+                let mut magic = [0; 8];
+                if old.read_exact(&mut magic).is_err() || &magic != crate::pack::MAGIC {
+                    return crate::pack::save_compact_path(doc, path, opts);
+                }
+            }
+            let stats = crate::pack::save_path(doc, path, opts)?;
+            // Appending keeps every tile a save replaced: rewrite the pack once that outweighs
+            // what the document still uses.
+            if crate::pack::wants_compaction(&stats) {
+                return crate::pack::save_compact_path(doc, path, opts);
+            }
             Ok(stats)
         }
     }

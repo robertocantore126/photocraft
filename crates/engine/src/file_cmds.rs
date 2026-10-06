@@ -162,6 +162,10 @@ pub(crate) fn encode(doc: &Document, path: &str, quality: Option<f64>) -> Result
 }
 
 pub(crate) fn save_doc(doc: &Document, path: &str, quality: Option<f64>) -> Result<Vec<String>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
+        return photocraft_io::export_path(doc, std::path::Path::new(path), &Default::default()).map_err(|e| EngineError::Other(format!("{path}: {e}")));
+    }
     let (bytes, warnings) = encode(doc, path, quality)?;
     write_file(path, &bytes)?;
     Ok(warnings)
@@ -231,8 +235,10 @@ fn close_others(s: &mut Session, p: &Value) -> Result<Value> {
 /// "Revert" history state); the document is clean afterwards.
 fn revert(s: &mut Session) -> Result<Value> {
     let path = s.active().and_then(|d| d.path.clone()).ok_or(EngineError::Other("the document has never been saved".into()))?;
-    let bytes = read_file(&path)?;
-    let fresh = import(&file_name(&path), &bytes)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let fresh = photocraft_io::import_path(std::path::Path::new(&path)).map_err(|e| EngineError::Other(e.to_string()))?.document;
+    #[cfg(target_arch = "wasm32")]
+    let fresh = import(&file_name(&path), &read_file(&path)?)?;
     s.edit("Revert", |doc, active| {
         let (id, name) = (doc.id, doc.name.clone());
         *doc = fresh;

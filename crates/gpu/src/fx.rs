@@ -31,6 +31,13 @@ use photocraft_raster::{Surface, Tile};
 
 use crate::plan::{Kernel, stroke_widths};
 
+/// The exact map window for a canvas slice. Include the complete program/field
+/// dependency apron and retain the effect region's original boundary conditions.
+pub(crate) fn slice_window(requested: Rect, effect_region: Rect, apron: i32) -> Rect {
+    let inside = requested.intersect(&effect_region);
+    if inside.is_empty() { Rect::EMPTY } else { inside.inflate(apron.max(0)).intersect(&effect_region) }
+}
+
 /// Input of a map stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum In {
@@ -524,13 +531,18 @@ pub(crate) fn snapshot(s: &Surface) -> Tiles {
     s.tiles().map(|(c, t)| (*c, t.clone())).collect()
 }
 
-/// Union of the tiles that differ between `old` and `s`.
+/// Union of the pixels that differ between `old` and `s`: whole tiles that appeared or went away,
+/// and within a tile replaced by another the rectangle of changed pixels (a dab, not the tile:
+/// the effect maps re-rendered over it cost CPU time per pixel).
 pub(crate) fn damage(old: &Tiles, s: &Surface) -> Rect {
     let mut d = Rect::EMPTY;
     let mut add = |r: Rect| d = if d.is_empty() { r } else { d.union(&r) };
+    let bpp = s.format().bytes_per_pixel();
     for (c, t) in s.tiles() {
-        if old.get(c).is_none_or(|o| !Arc::ptr_eq(o, t)) {
-            add(c.rect());
+        match old.get(c) {
+            Some(o) if Arc::ptr_eq(o, t) => {}
+            Some(o) => add(tile_diff(*c, o, t, bpp)),
+            None => add(c.rect()),
         }
     }
     for c in old.keys() {
@@ -539,6 +551,32 @@ pub(crate) fn damage(old: &Tiles, s: &Surface) -> Rect {
         }
     }
     d
+}
+
+/// Rectangle of the pixels that differ between two versions of tile `c` (empty when none does).
+fn tile_diff(c: TileCoord, old: &Tile, new: &Tile, bpp: usize) -> Rect {
+    let (a, b) = (old.bytes(), new.bytes());
+    let side = photocraft_geom::TILE_SIZE as usize;
+    let row = side * bpp;
+    if bpp == 0 || a.len() != b.len() || a.len() != row * side {
+        return c.rect();
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (side, side, 0, 0);
+    for (y, (ra, rb)) in a.chunks_exact(row).zip(b.chunks_exact(row)).enumerate() {
+        if ra == rb {
+            continue;
+        }
+        let first = ra.iter().zip(rb).position(|(p, q)| p != q).unwrap_or(0) / bpp;
+        let last = (row - 1 - ra.iter().rev().zip(rb.iter().rev()).position(|(p, q)| p != q).unwrap_or(0)) / bpp;
+        (x0, x1) = (x0.min(first), x1.max(last + 1));
+        y0 = y0.min(y);
+        y1 = y + 1;
+    }
+    if x1 == 0 {
+        return Rect::EMPTY;
+    }
+    let r = c.rect();
+    Rect::new(r.x0 + x0 as i32, r.y0 + y0 as i32, r.x0 + x1 as i32, r.y0 + y1 as i32)
 }
 
 /// The surfaces a non-group layer's shape is read from: (content, mask).
@@ -574,31 +612,48 @@ pub(crate) fn shape_key(layer: &Layer, canvas: Rect) -> u64 {
     h.finish()
 }
 
-/// Deep identity of a group (children, their pixels by tile pointer, settings).
+/// Streams `Debug` output into a hasher (no string allocated per field).
+struct HashWrite<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+impl std::fmt::Write for HashWrite<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Identity of a group's settings and structure: its descendants, their kinds, settings and
+/// surface formats, but not their pixels. Those are [`group_surfaces`], diffed tile by tile, so
+/// a stroke inside a group with layer effects re-renders its shape over the stroke only (a
+/// whole-document group of a 479-layer PSB took 1.6 s per dab when its key hashed every tile).
 pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
+    use std::fmt::Write as _;
     fn surface_fp(s: &Surface, h: &mut std::collections::hash_map::DefaultHasher) {
-        format!("{:?}{:?}", s.format(), s.default_pixel()).hash(h);
-        for (c, t) in s.tiles() {
-            (c.tx, c.ty, Arc::as_ptr(t) as usize).hash(h);
-        }
+        let _ = write!(HashWrite(h), "{:?}{:?}", s.format(), s.default_pixel());
     }
     fn walk(l: &Layer, h: &mut std::collections::hash_map::DefaultHasher) {
         l.id.0.hash(h);
-        (l.visible, l.clipped, l.opacity.to_bits(), l.fill_opacity.to_bits(), format!("{:?}", l.blend)).hash(h);
+        (l.visible, l.clipped, l.opacity.to_bits(), l.fill_opacity.to_bits()).hash(h);
+        let _ = write!(HashWrite(h), "{:?}", l.blend);
         match &l.content {
             LayerContent::Group(g) => {
+                h.write_u8(1);
                 for c in &g.children {
                     walk(c, h);
                 }
             }
             LayerContent::Fill(f) => {
-                format!("{f:?}").hash(h);
+                h.write_u8(2);
+                let _ = write!(HashWrite(h), "{f:?}");
                 if let Some(c) = &l.fill_cache {
                     surface_fp(&c.surface, h);
                 }
             }
-            LayerContent::Adjustment(a) => format!("{a:?}").hash(h),
+            LayerContent::Adjustment(a) => {
+                h.write_u8(3);
+                let _ = write!(HashWrite(h), "{a:?}");
+            }
             _ => {
+                h.write_u8(4);
                 if let Some(s) = l.surface() {
                     surface_fp(s, h);
                 }
@@ -608,7 +663,7 @@ pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
             (m.enabled, m.density.to_bits(), m.feather.to_bits()).hash(h);
             surface_fp(&m.surface, h);
         }
-        format!("{:?}{:?}", l.vector_mask, l.effects).hash(h);
+        let _ = write!(HashWrite(h), "{:?}{:?}", l.vector_mask, l.effects);
         h.write_u8(0xfe);
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -626,6 +681,74 @@ pub(crate) fn group_key(layer: &Layer, light: &GlobalLight) -> u64 {
         _ => walk(layer, &mut h),
     }
     h.finish()
+}
+
+/// A surface a group's shape is rendered from: (layer id, role 0 content / 1 fill / 2 mask,
+/// reach, surface). The reach is how far (px) a pixel change in it can move the group's alpha:
+/// the layer's own effect reach plus those of the groups between it and `group`, plus a mask's
+/// feather spread. The group's own effects don't count (its shape is its alpha before them).
+pub(crate) fn group_surfaces(group: &Layer) -> Vec<(u64, u8, i32, &Surface)> {
+    fn own(l: &Layer) -> i32 {
+        if photocraft_compose::effects::has_effects(l) { photocraft_compose::effects::margin(l).max(0) } else { 0 }
+    }
+    fn feather(px: f32) -> i32 {
+        let sigma = photocraft_compose::masks::feather_sigma(px);
+        if sigma > 0.0 { (sigma * 3.0).ceil() as i32 + 2 } else { 0 }
+    }
+    fn walk<'a>(l: &'a Layer, up: i32, out: &mut Vec<(u64, u8, i32, &'a Surface)>) {
+        let reach = up.saturating_add(own(l));
+        match &l.content {
+            LayerContent::Group(g) => {
+                for c in &g.children {
+                    walk(c, reach, out);
+                }
+            }
+            LayerContent::Fill(_) => {
+                if let Some(c) = &l.fill_cache {
+                    out.push((l.id.0, 1, reach, &c.surface));
+                }
+            }
+            LayerContent::Adjustment(_) => {}
+            _ => {
+                if let Some(s) = l.surface() {
+                    out.push((l.id.0, 0, reach, s));
+                }
+            }
+        }
+        if let Some(m) = &l.mask {
+            out.push((l.id.0, 2, reach.saturating_add(feather(m.feather)), &m.surface));
+        }
+    }
+    let mut out = Vec::new();
+    if let LayerContent::Group(g) = &group.content {
+        for c in &g.children {
+            walk(c, 0, &mut out);
+        }
+        if let Some(m) = &group.mask {
+            out.push((group.id.0, 2, feather(m.feather), &m.surface));
+        }
+    }
+    out
+}
+
+/// What changed in a group's surfaces since `old` (from [`group_surfaces`]), each change grown by
+/// its reach; `None` when the surfaces themselves differ (the caller re-renders everything).
+pub(crate) fn group_damage(old: &[(u64, u8, i32, Tiles)], now: &[(u64, u8, i32, &Surface)]) -> Option<Rect> {
+    if old.len() != now.len() {
+        return None;
+    }
+    let mut d = Rect::EMPTY;
+    for ((id, role, reach, tiles), (nid, nrole, nreach, s)) in old.iter().zip(now) {
+        if (id, role, reach) != (nid, nrole, nreach) {
+            return None;
+        }
+        let r = damage(tiles, s);
+        if !r.is_empty() {
+            let r = r.inflate(*reach);
+            d = if d.is_empty() { r } else { d.union(&r) };
+        }
+    }
+    Some(d)
 }
 
 #[cfg(test)]

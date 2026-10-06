@@ -115,6 +115,11 @@ pub use state::{Tool, UiState};
 pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<(Document, Vec<String>), String>>;
 /// [`ImportFn`] that owns the bytes, so the importer can free them early (see
 /// `photocraft_io::import_owned`).
+/// Native path importer retaining lazy pack handles.
+pub type ImportPathFn = Box<dyn Fn(&str) -> Result<(Document, Vec<String>), String>>;
+/// Streaming native document save.
+pub type SavePathFn = Box<dyn Fn(&Document, &str, bool) -> Result<Vec<String>, String>>;
+pub type PickOpenPathFn = Box<dyn FnMut() -> Option<String>>;
 pub type ImportOwnedFn = Box<dyn Fn(&str, Vec<u8>) -> Result<(Document, Vec<String>), String>>;
 /// Encoder settings chosen in Export As (the file format comes from the name's extension).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -166,6 +171,11 @@ pub struct Services {
     pub import: Option<ImportFn>,
     /// Preferred over `import` when the caller read the file itself and can hand the bytes over.
     pub import_owned: Option<ImportOwnedFn>,
+    pub import_path: Option<ImportPathFn>,
+    pub save_path: Option<SavePathFn>,
+    pub pick_open_path: Option<PickOpenPathFn>,
+    pub automation_import_path: Option<ImportPathFn>,
+    pub automation_save_path: Option<SavePathFn>,
     /// Encode a document for a file name (format chosen by extension).
     pub export: Option<ExportFn>,
     /// Show an "open file" dialog; returns (name, bytes).
@@ -494,6 +504,10 @@ impl PhotocraftApp {
             return r.map(|()| Vec::new());
         }
         let (doc, warnings) = self.import_doc(name, bytes)?;
+        self.open_imported(name, doc, warnings)
+    }
+
+    pub(crate) fn open_imported(&mut self, name: &str, doc: Document, warnings: Vec<String>) -> Result<Vec<String>, String> {
         // Edit › Color Settings policies apply on open; mismatches can ask what to do.
         // No path yet: a bare name isn't a location to save back to (`open_file` sets the path).
         let (_, color) = self.session.open_document(doc, None);
@@ -565,6 +579,14 @@ impl PhotocraftApp {
     /// File › Open: the platform dialog returns the chosen file's path (native; the web delivers
     /// picks through the inbox instead).
     pub fn open_dialog_file(&mut self) {
+        if let Some(pick) = self.services.pick_open_path.as_mut() {
+            if let Some(path) = pick()
+                && let Err(e) = self.open_path(&path)
+            {
+                self.open_failed(&path, &e);
+            }
+            return;
+        }
         let picked = self.services.pick_open.as_mut().and_then(|f| f());
         if let Some((path, bytes)) = picked
             && let Err(e) = self.open_file(&path, &bytes)
@@ -588,10 +610,14 @@ impl PhotocraftApp {
             Some(p) => p,
             None => self.services.pick_save.as_mut().and_then(|f| f(&suggested)).ok_or("cancelled")?,
         };
-        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let (bytes, warnings) = export(&st.doc, &path, &ExportSettings::default())?;
-        let write = self.services.write.as_mut().ok_or("no writer configured")?;
-        write(&path, &bytes)?;
+        let warnings = if let Some(save) = self.services.save_path.as_ref() {
+            save(&st.doc, &path, st.path.as_deref() != Some(path.as_str()))?
+        } else {
+            let export = self.services.export.as_ref().ok_or("no exporter configured")?;
+            let (bytes, warnings) = export(&st.doc, &path, &ExportSettings::default())?;
+            self.services.write.as_mut().ok_or("no writer configured")?(&path, &bytes)?;
+            warnings
+        };
         if let Some(st) = self.session.active_mut() {
             st.path = Some(path.clone());
             st.saved_revision = st.revision;
@@ -615,10 +641,18 @@ impl PhotocraftApp {
     pub fn save_automation(&mut self, path: Option<String>) -> Result<(String, Vec<String>), String> {
         let state = self.session.active().ok_or("no document")?;
         let target = path.or_else(|| state.path.clone()).ok_or("document has no relative path; pass `path`")?;
-        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let (bytes, warnings) = export(&state.doc, &target, &ExportSettings::default())?;
-        let write = self.services.automation_write.as_mut().ok_or("automation write authority is not configured")?;
-        write(&target, &bytes)?;
+        let warnings = if target.to_ascii_lowercase().ends_with(".pcraft") && self.services.automation_save_path.is_some() {
+            self.services.automation_save_path.as_ref().ok_or("automation save authority is not configured")?(
+                &state.doc,
+                &target,
+                state.path.as_deref() != Some(target.as_str()),
+            )?
+        } else {
+            let export = self.services.export.as_ref().ok_or("no exporter configured")?;
+            let (bytes, warnings) = export(&state.doc, &target, &ExportSettings::default())?;
+            self.services.automation_write.as_mut().ok_or("automation write authority is not configured")?(&target, &bytes)?;
+            warnings
+        };
         if let Some(state) = self.session.active_mut() {
             state.path = Some(target.clone());
             state.saved_revision = state.revision;
@@ -812,6 +846,7 @@ impl eframe::App for PhotocraftApp {
         camera_raw_ui::show(self, &ctx);
         wide_angle_ui::show(self, &ctx);
         canvas::extra_windows(self, &ctx);
+        report_tile_error(self, photocraft_raster::spill::stats().last_error);
         notices::show(self, &ctx);
         split(&mut self.perf, "ui:windows");
         self.automation_input = false;
@@ -825,6 +860,14 @@ impl eframe::App for PhotocraftApp {
                 let _ = w.send(serde_json::json!({"ok": true, "result": null}));
             }
         }
+    }
+}
+
+/// Deferred backing reads can fail during compositing, after opening succeeded.
+/// Keep the failure visible without posting the same sticky error on every frame.
+fn report_tile_error(app: &mut PhotocraftApp, error: Option<String>) {
+    if let Some(error) = app.perf.new_backing_error(error) {
+        notices::error(app, format!("Image data storage error: {error}"));
     }
 }
 
@@ -1130,6 +1173,25 @@ impl PhotocraftApp {
 
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod backing_error_tests {
+    use super::*;
+
+    #[test]
+    fn progressive_backing_read_error_posts_once_and_can_reappear_after_recovery() {
+        let mut app = PhotocraftApp::new(Session::new(), Services::default());
+        let error = Some("tile backing read failed (CRC mismatch); a tile was lost".to_string());
+        report_tile_error(&mut app, error.clone());
+        report_tile_error(&mut app, error.clone());
+        assert!(app.ui.status_error);
+        assert_eq!(app.ui.notices.len(), 1);
+        assert!(app.ui.notices[0].error && app.ui.notices[0].title.contains("CRC mismatch"));
+        report_tile_error(&mut app, None);
+        report_tile_error(&mut app, error);
+        assert_eq!(app.ui.notices.len(), 2);
+    }
+}
 
 #[cfg(test)]
 mod clipboard_tests {

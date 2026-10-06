@@ -376,6 +376,20 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
         }
         "app.open" => match s("path") {
             Some(path) => {
+                if path.to_ascii_lowercase().ends_with(".pcraft")
+                    && let Some(import) = app.services.automation_import_path.as_ref()
+                {
+                    let opened = import(path);
+                    return wrap(opened.map(|(doc, warnings)| {
+                        app.session.add_document(doc, Some(path.to_string()));
+                        app.sync_views();
+                        app.push_recent(path);
+                        app.ui.status = format!("Opened {path}");
+                        app.ui.status_error = false;
+                        crate::notices::io_warnings(app, &format!("Opened {path}"), &warnings);
+                        json!({"path":path,"name":path,"warnings":warnings})
+                    }));
+                }
                 let opened = match app.services.automation_read.as_mut() {
                     Some(read) => read(path),
                     None => Err("automation read authority is not configured".into()),
@@ -428,6 +442,8 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
             "fps": app.fps,
             "timings": app.perf,
             "tiles": photocraft_raster::spill::stats(),
+            "canvasPendingPixels": app.session.active().and_then(|st| app.gpu.as_ref().map(|g| g.pending_pixels(st.doc.id.0))).unwrap_or(0),
+            "canvasPreview": app.session.active().and_then(|st| app.gpu.as_ref().and_then(|g| g.preview_info(st.doc.id.0))).map(|(level, px)| json!({"level": level, "pendingPixels": px})),
             "compositor": app.gpu.as_ref().and_then(|g| g.compositor_bytes()).map(|(r, fx)| json!({"residentBytes": r, "fxBytes": fx})),
         },
         "brush": {"size": app.session.tools.brush.size, "hardness": app.session.tools.brush.hardness, "opacity": app.session.tools.brush.opacity},

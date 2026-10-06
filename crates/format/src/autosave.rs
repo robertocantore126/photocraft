@@ -130,8 +130,7 @@ fn worker(rx: Receiver<Job>, bundle: PathBuf, sidecar: PathBuf, last: Arc<Mutex<
             job = newer;
         }
         let r = (|| {
-            std::fs::create_dir_all(&bundle)?;
-            let stats = writer.save_dir(&job.snapshot, &bundle, &job.opts)?;
+            let stats = writer.save_path(&job.snapshot, &bundle, &job.opts)?;
             write_atomic(&sidecar, &serde_json::to_vec_pretty(&job.info)?)?;
             Ok(stats)
         })();
@@ -154,7 +153,7 @@ pub fn list_recovery(recovery_dir: &Path) -> Vec<RecoveryEntry> {
             && let Ok(info) = serde_json::from_slice::<RecoveryInfo>(&bytes)
         {
             let bundle = recovery_dir.join(format!("{}.pcraft", info.key));
-            if bundle.join(crate::store::MANIFEST).is_file() {
+            if bundle.is_file() || bundle.join(crate::store::MANIFEST).is_file() {
                 out.push(RecoveryEntry { info, bundle });
             }
         }
@@ -176,7 +175,11 @@ pub fn discard_recovery(recovery_dir: &Path, entry: &RecoveryEntry) -> Result<()
 fn remove_entry(dir: &Path, key: &str) -> Result<()> {
     let bundle = dir.join(format!("{key}.pcraft"));
     if bundle.exists() {
-        std::fs::remove_dir_all(bundle)?;
+        if bundle.is_dir() {
+            std::fs::remove_dir_all(bundle)?;
+        } else {
+            std::fs::remove_file(bundle)?;
+        }
     }
     let sidecar = dir.join(format!("{key}.json"));
     if sidecar.exists() {

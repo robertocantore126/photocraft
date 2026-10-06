@@ -25,13 +25,57 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLoc
 
 use crate::scratch_file::{Extent, ScratchFile};
 
+/// Persistent compressed tile extent. Bytes use LZ4 block encoding and CRC-32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PackedExtent {
+    pub offset: u64,
+    pub len: u32,
+    pub crc32: u32,
+}
+
+/// Read-only document backing; retained by every lazy tile and never freed by eviction.
+pub trait TileBacking: Send + Sync + std::fmt::Debug {
+    fn identity(&self) -> [u8; 16];
+    /// Durable commit marker used to distinguish divergent copies of one pack.
+    fn anchor(&self) -> Option<(u64, [u8; 40])> {
+        None
+    }
+    fn read_packed(&self, extent: PackedExtent) -> Result<Vec<u8>, String>;
+}
+
+#[derive(Clone)]
+enum Slot {
+    Scratch(Arc<ScratchFile>, Extent),
+    Pack(Arc<dyn TileBacking>, PackedExtent),
+}
+impl Slot {
+    fn read(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Scratch(file, extent) => {
+                let mut bytes = Vec::new();
+                file.read_into(*extent, &mut bytes).map_err(|e| e.to_string())?;
+                Ok(bytes)
+            }
+            Self::Pack(file, extent) => file.read_packed(*extent),
+        }
+    }
+    fn release(self) {
+        if let Self::Scratch(file, extent) = self {
+            file.free(extent);
+        }
+    }
+}
+
 /// One tile's bytes and where they live.
 pub(crate) struct Cell {
     data: RwLock<Option<Vec<u8>>>,
     /// Byte length of the tile (fixed for its lifetime).
     len: usize,
+    error: Mutex<Option<String>>,
     /// A copy on disk that matches `data` (kept while the tile is unchanged).
-    slot: Mutex<Option<(Arc<ScratchFile>, Extent)>>,
+    slot: Mutex<Option<Slot>>,
+    // Keep a few immutable pack aliases so autosave and Save As do not invalidate normal saves.
+    packs: Mutex<Vec<(Arc<dyn TileBacking>, PackedExtent)>>,
     /// Touched since the clock hand last passed.
     referenced: AtomicBool,
 }
@@ -39,12 +83,87 @@ pub(crate) struct Cell {
 impl Cell {
     pub(crate) fn new(bytes: Vec<u8>) -> Arc<Cell> {
         let len = bytes.len();
-        let cell = Arc::new(Cell { data: RwLock::new(Some(bytes)), len, slot: Mutex::new(None), referenced: AtomicBool::new(true) });
+        let cell = Arc::new(Cell {
+            data: RwLock::new(Some(bytes)),
+            len,
+            error: Mutex::new(None),
+            slot: Mutex::new(None),
+            packs: Mutex::new(Vec::new()),
+            referenced: AtomicBool::new(true),
+        });
         M.live.fetch_add(1, Ordering::Relaxed);
         M.resident.fetch_add(len, Ordering::Relaxed);
         M.register(&cell);
         maybe_evict();
         cell
+    }
+
+    pub(crate) fn lazy(len: usize, backing: Arc<dyn TileBacking>, extent: PackedExtent) -> Arc<Cell> {
+        let cell = Arc::new(Cell {
+            data: RwLock::new(None),
+            len,
+            error: Mutex::new(None),
+            slot: Mutex::new(Some(Slot::Pack(backing, extent))),
+            packs: Mutex::new(Vec::new()),
+            referenced: AtomicBool::new(false),
+        });
+        M.live.fetch_add(1, Ordering::Relaxed);
+        M.register(&cell);
+        cell
+    }
+
+    pub(crate) fn is_resident(&self) -> bool {
+        self.data.read().unwrap_or_else(PoisonError::into_inner).is_some()
+    }
+    pub(crate) fn read_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+    pub(crate) fn set_read_error(&self, error: Option<String>) {
+        *self.error.lock().unwrap_or_else(PoisonError::into_inner) = error;
+    }
+    pub(crate) fn pack_backing(&self, id: [u8; 16]) -> Option<(Arc<dyn TileBacking>, PackedExtent)> {
+        if self.read_error().is_some() {
+            return None;
+        }
+        let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(Slot::Pack(file, extent)) if file.identity() == id => Some((file.clone(), *extent)),
+            _ => self.packs.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(file, _)| file.identity() == id).cloned(),
+        }
+    }
+    pub(crate) fn pack_extent(&self, id: [u8; 16]) -> Option<PackedExtent> {
+        self.pack_backing(id).map(|(_, extent)| extent)
+    }
+
+    pub(crate) fn packed(&self) -> Result<Vec<u8>, String> {
+        // Hold the pixel read lock before the slot lock, as in eviction and mutation.
+        let data = self.data.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(error) = self.read_error() {
+            return Err(error);
+        }
+        let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(slot) => slot.read(),
+            None => data.as_ref().map(|bytes| lz4_flex::block::compress(bytes)).ok_or_else(|| "tile has no readable backing".into()),
+        }
+    }
+
+    pub(crate) fn attach(&self, backing: Arc<dyn TileBacking>, extent: PackedExtent) {
+        let _data = self.data.read().unwrap_or_else(PoisonError::into_inner);
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = slot.replace(Slot::Pack(backing.clone(), extent)) {
+            match old {
+                Slot::Pack(file, old_extent) if file.identity() != backing.identity() => {
+                    let mut packs = self.packs.lock().unwrap_or_else(PoisonError::into_inner);
+                    packs.retain(|(old, _)| old.identity() != file.identity() && old.identity() != backing.identity());
+                    if packs.len() >= 4 {
+                        packs.remove(0);
+                    }
+                    packs.push((file, old_extent));
+                }
+                old => old.release(),
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -80,9 +199,10 @@ impl Cell {
         let mut w = self.data.write().unwrap_or_else(PoisonError::into_inner);
         let loaded = w.is_none();
         self.load(&mut w);
-        if let Some((file, extent)) = self.slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            file.free(extent);
+        if let Some(slot) = self.slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            slot.release();
         }
+        self.packs.lock().unwrap_or_else(PoisonError::into_inner).clear();
         if loaded {
             // Evicting here could only pick other tiles (this one is locked), so it is safe, and
             // a long run of writes to spilled tiles must not outgrow the budget.
@@ -98,17 +218,16 @@ impl Cell {
         }
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let bytes = match slot {
-            Some((file, extent)) => {
-                let mut packed = Vec::new();
-                match file.read_into(extent, &mut packed).map_err(|e| e.to_string()).and_then(|()| unpack(&packed, self.len)) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        M.error(format!("scratch read failed ({e}); a tile was lost"));
-                        vec![0; self.len]
-                    }
+            Some(slot) => match slot.read().and_then(|packed| unpack(&packed, self.len)) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.set_read_error(Some(e.clone()));
+                    M.error(format!("tile backing read failed ({e}); a tile was lost"));
+                    vec![0; self.len]
                 }
-            }
+            },
             None => {
+                self.set_read_error(Some("tile has no readable backing".into()));
                 M.error("a spilled tile had no scratch copy; it was lost".into());
                 vec![0; self.len]
             }
@@ -127,7 +246,7 @@ impl Cell {
             let packed = lz4_flex::block::compress(bytes);
             let extent = file.write(&packed).map_err(|e| format!("scratch write to {} failed: {e}", file.path().display()))?;
             M.written.fetch_add(packed.len() as u64, Ordering::Relaxed);
-            *slot = Some((file.clone(), extent));
+            *slot = Some(Slot::Scratch(file.clone(), extent));
         }
         drop(slot);
         *w = None;
@@ -143,8 +262,8 @@ impl Drop for Cell {
         if resident {
             M.resident.fetch_sub(self.len, Ordering::Relaxed);
         }
-        if let Some((file, extent)) = self.slot.get_mut().unwrap_or_else(PoisonError::into_inner).take() {
-            file.free(extent);
+        if let Some(slot) = self.slot.get_mut().unwrap_or_else(PoisonError::into_inner).take() {
+            slot.release();
         }
         M.live.fetch_sub(1, Ordering::Relaxed);
     }

@@ -47,6 +47,17 @@ impl PhotocraftApp {
     /// Read and open the file at `path` (see [`open_file`](Self::open_file)).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &str) -> Result<Vec<String>, String> {
+        if !crate::preset_files_ui::is_preset_file(path)
+            && let Some(import) = self.services.import_path.as_ref()
+        {
+            let (doc, warnings) = import(path)?;
+            let warnings = self.open_imported(&display_name(path), doc, warnings)?;
+            if let Some(state) = self.session.active_mut() {
+                state.path = Some(path.to_string());
+            }
+            self.push_recent(path);
+            return Ok(warnings);
+        }
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         self.open_file_cow(path, std::borrow::Cow::Owned(bytes))
     }
@@ -84,6 +95,12 @@ impl PhotocraftApp {
         for f in files {
             let path = f.path().to_string_lossy().to_string();
             let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
+            if f.path().is_absolute() && self.services.import_path.is_some() {
+                if let Err(error) = self.open_path(&path) {
+                    self.open_failed(&name, &error);
+                }
+                continue;
+            }
             let opened =
                 crate::read_dropped(&*f).and_then(|bytes| if f.path().is_absolute() { self.open_file(&path, &bytes) } else { self.open_bytes(&name, &bytes) });
             if let Err(e) = opened {

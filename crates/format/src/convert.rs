@@ -24,6 +24,11 @@ pub(crate) trait Fetch {
     /// Canonical (little-endian) tile bytes of the given expected length.
     fn tile(&mut self, hash: &str, len: usize) -> Result<Vec<u8>>;
     fn blob(&mut self, hash: &str) -> Result<Arc<Vec<u8>>>;
+    fn tile_object(&mut self, hash: &str, format: PixelFormat) -> Result<Arc<Tile>> {
+        let mut bytes = self.tile(hash, tile_len(&format))?;
+        swap_to_le(&mut bytes, format.sample);
+        Ok(Arc::new(Tile::from_vec(bytes)))
+    }
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -289,15 +294,13 @@ impl Loader<'_> {
         }
         swap_to_le(&mut dp, f.sample);
         let mut s = Surface::with_default(f, &decode_pixel(&f, &dp));
-        let len = tile_len(&f);
         for t in &m.tiles {
             let c = TileCoord::new(t.tx, t.ty);
             if s.tile(c).is_some() {
                 return Err(FormatError::corrupt(format!("duplicate tile ({}, {})", t.tx, t.ty)));
             }
-            let mut bytes = self.fetch.tile(&t.hash, len)?;
-            swap_to_le(&mut bytes, f.sample);
-            s.tile_mut(c).bytes_mut().copy_from_slice(&bytes);
+            let tile = self.fetch.tile_object(&t.hash, f)?;
+            s.insert_tile(c, tile).map_err(FormatError::corrupt)?;
         }
         Ok(s)
     }

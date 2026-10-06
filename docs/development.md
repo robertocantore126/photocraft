@@ -78,15 +78,35 @@ cargo run -p photocraft-cli -- commands --filter blur                    # the c
 
 ## Native format (.pcraft)
 
-`crates/format` defines the lossless native bundle. It is either a ZIP of STORE entries or a directory with the same layout:
+PhotoCraft writes native files as append-only packs with the eight-byte magic `PCRAFT2\0`.
+A 32-byte header identifies the pack; LZ4 tile and binary records precede a versioned JSON
+manifest, and a CRC-checked 40-byte `PCOMMIT2` footer identifies each complete save.
+Tile references carry offset, compressed length, CRC-32 and raw length. Pixel samples are
+stored in little-endian order at their original model and depth.
 
-- `manifest.json`: the versioned document tree, with migrations in `format/src/migrate.rs`.
-- `tiles/<blake3>.zst` and `blobs/<blake3>.zst`: zstd-compressed objects, content-addressed by the BLAKE3 hash of their uncompressed bytes.
-- `thumb.png` and `composite/preview.png`: previews.
+- `format::load_path` reads the footer and manifest, then installs nonresident tiles. A tile's
+  LZ4 block is decoded only when pixels are requested; native readers keep the backing file
+  open, with independent reading handles per worker. Binary metadata and smart-object source
+  blobs are currently eager because the document model stores them as `Arc<Vec<u8>>`.
+- `PcraftWriter::save_path` appends changed tile/blob records, the new manifest, and a footer.
+  Clean extents are reused, and scratch-backed compressed tile bytes are copied without
+  decoding or recompression. Payloads are synced before the footer, which is then synced.
+  Opening scans backwards for the last complete CRC-valid commit after a torn append.
+- Native Save As uses `pack::save_compact_path`: a fresh compact pack is flushed and atomically
+  replaces the destination. Old snapshots keep their existing read handles. Packs are not
+  automatically compacted during ordinary saves.
+- Optional caller-rendered thumbnails and composite previews remain supported. Native Save
+  does not render a whole document just to create previews.
+- Existing ZIP STORE/zstd and directory bundles still open. `save_to_bytes`/`save_zip` and
+  `save_dir` retain the legacy representation for byte-only/web clients and explicit directory
+  bundles. New native autosaves are packs, with recovery metadata in the existing JSON sidecar;
+  directory recovery entries are still recognized.
 
-Keep one `PcraftWriter` per open document: re-saving then only compresses and writes tiles that changed, and directory bundles garbage-collect unreferenced objects. `format::Autosaver` writes snapshots into a recovery directory on a background thread. `list_recovery` / `recover` / `discard_recovery` implement crash recovery.
-
-`photocraft-io` routes `.pcraft` through this crate in `import`/`export`, detecting it by magic or by extension.
+`photocraft-io::import_path`/`export_path`, the desktop app, CLI and capability-scoped MCP
+use file handles for native packs. Byte import also recognizes the new magic, but necessarily
+retains the supplied full-file bytes. `Tile::try_bytes` reports deferred read/CRC failures;
+failed fallback pixels cannot be laundered into a new pack save, including through COW copies.
+See `crates/format/tests/pack.rs` for model/depth, legacy, corruption and torn-commit regressions.
 
 ## MCP (agents)
 

@@ -138,6 +138,58 @@ pub fn import_owned(name: &str, bytes: Vec<u8>) -> Result<ImportResult, IoError>
     Ok(ImportResult { document, warnings })
 }
 
+/// Import by path, retaining a native pack handle instead of reading its tile payloads.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_path(path: &std::path::Path) -> Result<ImportResult, IoError> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if path.is_dir() || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
+        return Ok(ImportResult { document: photocraft_format::load_path(path)?, warnings: Vec::new() });
+    }
+    let file = std::fs::File::open(path).map_err(photocraft_format::FormatError::from)?;
+    import_file(name, file)
+}
+/// Import an already authorized read handle. Pack tiles retain this handle.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_file(name: &str, file: std::fs::File) -> Result<ImportResult, IoError> {
+    import_file_inner(name, file, None)
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_file_with_opener(name: &str, file: std::fs::File, opener: photocraft_format::pack::ReaderOpener) -> Result<ImportResult, IoError> {
+    import_file_inner(name, file, Some(opener))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn import_file_inner(name: &str, mut file: std::fs::File, opener: Option<photocraft_format::pack::ReaderOpener>) -> Result<ImportResult, IoError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut magic = [0; 8];
+    let pack = file.read_exact(&mut magic).is_ok() && &magic == photocraft_format::pack::MAGIC;
+    if pack {
+        let document = match opener {
+            Some(opener) => photocraft_format::pack::load_file_with_opener(file, &Default::default(), opener)?,
+            None => photocraft_format::pack::load_file(file, &Default::default())?,
+        };
+        return Ok(ImportResult { document, warnings: Vec::new() });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(photocraft_format::FormatError::from)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(photocraft_format::FormatError::from)?;
+    import_owned(name, bytes)
+}
+/// Native saves stream packs to disk and avoid flattening the document for previews.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_path(doc: &Document, path: &std::path::Path, opts: &ExportOptions) -> Result<Vec<String>, IoError> {
+    let name = path.to_string_lossy();
+    if extension(&name) == photocraft_format::EXTENSION {
+        photocraft_format::PcraftWriter::new().save_path(doc, path, &Default::default())?;
+        return Ok(Vec::new());
+    }
+    let result = export(doc, &name, opts)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(photocraft_format::FormatError::from)?;
+    }
+    std::fs::write(path, result.bytes).map_err(photocraft_format::FormatError::from)?;
+    Ok(result.warnings)
+}
+
 fn extension(name_or_ext: &str) -> String {
     name_or_ext.rsplit(['.', '/', '\\']).next().unwrap_or(name_or_ext).to_ascii_lowercase()
 }

@@ -91,6 +91,16 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
     let automation_write = automation.clone().map(|workspace| {
         Box::new(move |path: &str, bytes: &[u8]| workspace.write(path, bytes).map_err(|error| error.to_string())) as photocraft_ui_egui::AutomationWriteFn
     });
+    let automation_import_path = automation.clone().map(|workspace| {
+        Box::new(move |path: &str| {
+            crate::crash_guard::guard("Open", || workspace.open_document(path).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
+        }) as photocraft_ui_egui::ImportPathFn
+    });
+    let automation_save_path = automation.clone().map(|workspace| {
+        Box::new(move |doc: &Document, path: &str, compact: bool| {
+            crate::crash_guard::guard("Save", || workspace.save_document_pack(doc, path, compact).map(|_| Vec::new()).map_err(|e| e.to_string()))
+        }) as photocraft_ui_egui::SavePathFn
+    });
     let automation_command = automation.map(|_| {
         Box::new(|id: &str, params: &serde_json::Value| {
             photocraft_automation::workspace::authorize_desktop_engine_command(id, params).map_err(|error| error.to_string())
@@ -127,6 +137,21 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
             Some(d.save_file()?.to_string_lossy().to_string())
         })),
         write: Some(Box::new(|path: &str, bytes: &[u8]| std::fs::write(path, bytes).map_err(|e| e.to_string()))),
+        import_path: Some(Box::new(|path: &str| {
+            crate::crash_guard::guard("Open", || photocraft_io::import_path(Path::new(path)).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
+        })),
+        save_path: Some(Box::new(|doc: &Document, path: &str, compact: bool| {
+            crate::crash_guard::guard("Save", || {
+                if compact && Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
+                    photocraft_format::pack::save_compact_path(doc, Path::new(path), &Default::default()).map(|_| Vec::new()).map_err(|e| e.to_string())
+                } else {
+                    photocraft_io::export_path(doc, Path::new(path), &Default::default()).map_err(|e| e.to_string())
+                }
+            })
+        })),
+        pick_open_path: Some(Box::new(|| rfd::FileDialog::new().add_filter("All Formats", OPEN_EXTS).pick_file().map(|p| p.to_string_lossy().into_owned()))),
+        automation_import_path,
+        automation_save_path,
         automation_read,
         automation_write,
         automation_command,

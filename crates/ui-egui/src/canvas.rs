@@ -28,6 +28,8 @@ pub struct CanvasCache {
     /// `revision`, so the Navigator never shows a stale CPU image after GPU-path edits.
     pub tex_revision: u64,
     pub tex_preview_key: u64,
+    /// Revision of the document a live brush stroke was drawn over at the last refresh.
+    pub live: Option<u64>,
 }
 
 /// An in-progress pointer gesture on the canvas.
@@ -345,6 +347,7 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) 
         on_gpu: false,
         tex_revision: 0,
         tex_preview_key: 0,
+        live: None,
     });
     if cache.tex_revision != revision || cache.texture.is_none() || cache.tex_preview_key != preview_key {
         let t0 = crate::gpu_canvas::now_ms();
@@ -430,8 +433,9 @@ pub(crate) fn effect_reach(layers: &[photocraft_doc::Layer]) -> i32 {
 /// GPU path: make sure document `idx` is current in the GPU canvas. Brush strokes re-composite
 /// and upload only their damage rect; everything else re-composites the whole document.
 /// Returns false if there is no GPU canvas.
-fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
+fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect, zoom: f32) -> bool {
     let Some(gpu) = app.gpu.clone() else { return false };
+    gpu.begin_frame(app.frame);
     let Some((revision, last_damage, id)) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage, st.doc.id)) else {
         return false;
     };
@@ -447,6 +451,7 @@ fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
     }
     let preview_key = raw_key ^ display_key;
     let size = [doc.size.width, doc.size.height];
+    gpu.set_preview_zoom(id.0, size, zoom);
     let cache = app.canvases.entry(id).or_insert(CanvasCache {
         revision: 0,
         texture: None,
@@ -455,19 +460,40 @@ fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
         on_gpu: false,
         tex_revision: 0,
         tex_preview_key: 0,
+        live: None,
     });
     let present = cache.on_gpu && gpu.has(id.0, size);
     if present && cache.revision == revision && cache.preview_key == preview_key {
         // An adjustment preview composited where the view was: catch up where it moved to.
         if let Some(r) = crate::adjust_preview::uncovered(app, id, raw_key, visible) {
-            let r = gpu.refresh(id.0, &doc, Some(r), display.as_deref());
+            let r = gpu.refresh_progressive(id.0, &doc, Some(r), visible, display.as_deref(), true);
+            if r.kind.starts_with("gpu") {
+                app.perf.gpu_uploads = r.uploads;
+            }
+            app.perf.record(r.kind, r.px, r.composite_ms, r.upload_ms);
+        } else if gpu.pending(id.0) {
+            let r = gpu.refresh_progressive(id.0, &doc, None, visible, display.as_deref(), false);
+            if r.kind.starts_with("gpu") {
+                app.perf.gpu_uploads = r.uploads;
+            }
             app.perf.record(r.kind, r.px, r.composite_ms, r.upload_ms);
         }
         return true;
     }
     let partial = present && damage.is_some();
+    // From a live stroke's second frame on, only its layer's pixels change between refreshes.
+    let live = live_stroke(app, idx).map(|l| l.revision);
+    let pixels_only = partial && live.is_some() && app.canvases.get(&id).is_some_and(|c| c.live == live);
+    gpu.set_pixels_only(pixels_only);
     gpu_budget(app, &gpu, idx, partial, visible);
-    let r = gpu.refresh(id.0, &doc, if partial { damage } else { None }, display.as_deref());
+    // Large refreshes (opening, a full re-render, an edit over most of a big document) go in
+    // slices, the view first; strokes and other small damage are composited at once.
+    let small = partial && damage.is_some_and(|r| u64::from(r.width()) * u64::from(r.height()) <= crate::gpu_canvas::SYNC_DAMAGE_PX);
+    let r = if crate::gpu_canvas::progressive_doc(&doc) && !small {
+        gpu.refresh_progressive(id.0, &doc, if partial { damage } else { None }, visible, display.as_deref(), true)
+    } else {
+        gpu.refresh(id.0, &doc, if partial { damage } else { None }, display.as_deref())
+    };
     if let Some(e) = &r.fallback
         && app.perf.gpu_fallback.as_deref() != Some(e.as_str())
     {
@@ -484,6 +510,7 @@ fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect) -> bool {
     cache.preview_key = preview_key;
     cache.on_gpu = true;
     cache.texture = None;
+    cache.live = live;
     true
 }
 
@@ -984,7 +1011,10 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             hdr: hdr_preview(app, &doc),
         };
         crate::gpu_canvas::GpuCanvas::paint(&painter, rect, params);
-    } else if !flip && ensure_gpu(app, idx, visible_doc_rect(&xf)) {
+    } else if !flip && ensure_gpu(app, idx, visible_doc_rect(&xf), view.zoom * ctx.pixels_per_point()) {
+        if app.gpu.as_ref().is_some_and(|gpu| gpu.pending(doc.id.0)) {
+            ctx.request_repaint();
+        }
         on_gpu = true;
         app.perf.gpu = true;
         // Shadow, checkerboard, document and pixel grid in one custom shader (gpu_canvas.rs).

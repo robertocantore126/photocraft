@@ -194,6 +194,8 @@ pub struct Pass<'a> {
     /// Only pixels inside this rect (document coordinates) are computed; the pass is skipped for
     /// chunks it misses. Consumers of the slot must be clipped alike.
     pub clip: Option<Rect>,
+    /// Outside this rect a plain Content/Blend pair is the backdrop identity.
+    pub identity_region: Option<Rect>,
 }
 
 /// Pixels a pass samples: a surface of the document, or one derived from it on the CPU (a
@@ -244,6 +246,7 @@ impl<'a> Pass<'a> {
             map: None,
             pattern: None,
             clip: None,
+            identity_region: None,
         }
     }
 }
@@ -637,6 +640,27 @@ impl<'a> Planner<'a> {
             return Ok(self.emit(p));
         }
 
+        // Tile extents are conservative and do not fault lazy pixels into RAM. Masks can
+        // only reduce this support; groups, fills and clipping stacks retain the full plan.
+        let identity_region = if visible_clipped.is_empty() && matches!(layer.content, LayerContent::Raster(_)) {
+            layer.surface().and_then(|surface| {
+                let default = photocraft_raster::to_rgba(&surface.format(), &surface.default_pixel());
+                (default[3] == 0.0).then(|| {
+                    let mut support = surface.tile_bounds();
+                    if let Some(mask) = layer.mask.as_ref()
+                        && mask.enabled
+                        && mask.feather == 0.0
+                        && mask.density == 1.0
+                        && mask.surface.default_pixel().first().copied() == Some(0.0)
+                    {
+                        support = support.intersect(&mask.surface.tile_bounds());
+                    }
+                    support
+                })
+            })
+        } else {
+            None
+        };
         let mut content = self.content(layer)?;
         for c in visible_clipped {
             content = self.atop(c, content)?;
@@ -648,6 +672,7 @@ impl<'a> Planner<'a> {
         p.opacity = opacity;
         p.flags = gamma_flag(layer);
         p.extra[3] = photocraft_compose::text_gamma(layer);
+        p.identity_region = identity_region;
         Ok(self.emit(p))
     }
 
@@ -1088,8 +1113,7 @@ impl<'a> Planner<'a> {
                 p.params[2][1] = g.offset.1;
                 p.params[2][2] = 1.0;
                 let mut rows = vec![[0.0f32; 4096]; 4];
-                for k in 0..4096 {
-                    let v = photocraft_compose::effects::sample_gradient(g, k as f32 / 4095.0);
+                for (k, v) in photocraft_compose::effects::sample_gradient_n(g, 4096).into_iter().enumerate() {
                     for (ch, row) in rows.iter_mut().enumerate() {
                         row[k] = v[ch];
                     }

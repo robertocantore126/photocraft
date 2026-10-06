@@ -64,9 +64,17 @@ impl Headless {
             Filesystem::Denied => return Err(AutomationError::BadRequest("automation filesystem access is not granted: read authority is absent".into())),
             Filesystem::TrustedLocal => files::open(path)?,
             Filesystem::Workspace(workspace) => {
-                let bytes = workspace.read(requested)?;
-                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(requested);
-                files::open_bytes(name, &bytes)?
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let imported = workspace.open_document(requested)?;
+                    files::Opened { document: imported.document, warnings: imported.warnings }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let bytes = workspace.read(requested)?;
+                    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(requested);
+                    files::open_bytes(name, &bytes)?
+                }
             }
         };
         let index = self.session.add_document(o.document, Some(requested.to_string()));
@@ -104,9 +112,25 @@ impl Headless {
                 files::save(&doc, &target, format, opts, Some(writer))?
             }
             Filesystem::Workspace(workspace) => {
-                let (bytes, warnings) = files::save_bytes(&doc, target_text, format, opts)?;
-                workspace.write(target_text, &bytes)?;
-                warnings
+                let native = format
+                    .map(|f| f.trim_start_matches('.').eq_ignore_ascii_case("pcraft"))
+                    .unwrap_or_else(|| target.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")));
+                #[cfg(not(target_arch = "wasm32"))]
+                if native {
+                    workspace.save_document_pack(&doc, target_text, stored_path.as_deref() != Some(target_text))?;
+                    Vec::new()
+                } else {
+                    let (bytes, warnings) = files::save_bytes(&doc, target_text, format, opts)?;
+                    workspace.write(target_text, &bytes)?;
+                    warnings
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = native;
+                    let (bytes, warnings) = files::save_bytes(&doc, target_text, format, opts)?;
+                    workspace.write(target_text, &bytes)?;
+                    warnings
+                }
             }
         };
         let is_native = format

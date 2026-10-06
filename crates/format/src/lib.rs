@@ -24,6 +24,7 @@ pub mod autosave;
 mod convert;
 pub mod manifest;
 mod migrate;
+pub mod pack;
 mod store;
 pub mod zip;
 
@@ -95,6 +96,9 @@ impl Default for LoadOptions {
 ///
 /// Bundles written here place the manifest first; re-zipped bundles may reorder entries.
 pub fn is_pcraft(bytes: &[u8]) -> bool {
+    if bytes.starts_with(pack::MAGIC) {
+        return true;
+    }
     if !bytes.starts_with(b"PK\x03\x04") {
         return false;
     }
@@ -119,6 +123,9 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Document> {
 }
 
 pub fn load_from_bytes_with(bytes: &[u8], opts: &LoadOptions) -> Result<Document> {
+    if bytes.starts_with(pack::MAGIC) {
+        return pack::load_memory(bytes.to_vec(), opts);
+    }
     let src = store::ZipSource::new(bytes)?;
     store::load(&src, opts)
 }
@@ -132,6 +139,12 @@ pub fn load_path_with(path: &Path, opts: &LoadOptions) -> Result<Document> {
     if path.is_dir() {
         store::load(&store::DirSource { root: path.to_path_buf() }, opts)
     } else {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0; 8];
+        if file.read_exact(&mut magic).is_ok() && &magic == pack::MAGIC {
+            return pack::load_path(path, opts);
+        }
         let bytes = std::fs::read(path)?;
         load_from_bytes_with(&bytes, opts)
     }
@@ -139,12 +152,18 @@ pub fn load_path_with(path: &Path, opts: &LoadOptions) -> Result<Document> {
 
 /// Read and migrate only the manifest (fast: no tiles are decoded).
 pub fn read_manifest(bytes: &[u8]) -> Result<Manifest> {
+    if bytes.starts_with(pack::MAGIC) {
+        return pack::read_manifest(bytes);
+    }
     let src = store::ZipSource::new(bytes)?;
     store::read_manifest(&src, &LoadOptions::default())
 }
 
 /// The embedded thumbnail, if present (PNG bytes).
 pub fn read_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    if bytes.starts_with(pack::MAGIC) {
+        return pack::read_thumbnail(bytes);
+    }
     let src = store::ZipSource::new(bytes)?;
     let m = store::read_manifest(&src, &LoadOptions::default())?;
     match m.thumbnail {
