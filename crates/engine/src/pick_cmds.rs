@@ -14,12 +14,14 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
 }
 
 /// Layers with visible pixels at (x, y), topmost first (hidden layers and hidden groups skipped).
+/// Fully locked layers, and layers inside a fully locked group, are clicked through: on the
+/// canvas they can't be picked, only from the Layers panel.
 pub fn layers_at(doc: &Document, x: i32, y: i32) -> Vec<LayerId> {
     let rows = doc.walk();
     let mut out = Vec::new();
     for (path, _, l) in rows.iter().rev() {
-        // The layer and every enclosing group must be visible.
-        if !(1..=path.len()).all(|n| doc.layer_at(&path[..n]).is_some_and(|a| a.visible)) {
+        // The layer and every enclosing group must be visible and not fully locked.
+        if !(1..=path.len()).all(|n| doc.layer_at(&path[..n]).is_some_and(|a| a.visible && !a.locks.all)) {
             continue;
         }
         if matches!(l.content, LayerContent::Group(_) | LayerContent::Adjustment(_)) {

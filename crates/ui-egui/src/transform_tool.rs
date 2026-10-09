@@ -317,8 +317,19 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
         }
         ToolEvent::Move { x, y, .. } | ToolEvent::Up { x, y } => {
             let g = pv.gesture;
-            if matches!(ev, ToolEvent::Up { .. }) {
+            let up = matches!(ev, ToolEvent::Up { .. });
+            if up {
                 pv.gesture = None;
+            }
+            // As in Photoshop, a click (no drag) outside the box commits the transform; a drag
+            // there still rotates.
+            if up && let Some(g) = g.filter(|g| matches!(g.hit, Hit::Outside) && (x - g.start[0]).hypot(y - g.start[1]) <= tol * 0.5) {
+                if let Some(s) = app.ui.transform.as_mut() {
+                    s.quad = g.quad0;
+                    s.pivot = g.pivot0;
+                }
+                commit(app);
+                return true;
             }
             if let (Some(g), Some(s)) = (g, app.ui.transform.as_mut()) {
                 apply_drag(s, g, [x, y], mods);
