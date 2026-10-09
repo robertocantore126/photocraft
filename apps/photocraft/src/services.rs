@@ -107,10 +107,16 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
         }) as photocraft_ui_egui::AutomationCommandFn
     });
     Services {
-        background_import: Some(Arc::new(|path, progress, _preview| {
+        background_import: Some(Arc::new(|path, progress, preview| {
             if progress.is_cancelled() { return Err("cancelled".into()); }
             progress.set_fraction(0.05);
-            let result = photocraft_io::import_path(Path::new(path)).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string());
+            let result = photocraft_io::import_path_with_events(Path::new(path), &|document| {
+                progress.set_fraction(0.25);
+                if !progress.is_cancelled() { preview(document); }
+            }, &|done, total| {
+                progress.set_fraction(0.25 + 0.7 * done as f32 / total.max(1) as f32);
+                !progress.is_cancelled()
+            }).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string());
             if progress.is_cancelled() { return Err("cancelled".into()); }
             progress.set_fraction(1.0);
             result

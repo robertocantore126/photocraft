@@ -36,6 +36,7 @@ pub mod pattern_map;
 mod pixels;
 mod psd_export;
 mod psd_import;
+mod psd_bands;
 pub mod raw;
 pub mod slices_map;
 pub mod text_styles_map;
@@ -48,7 +49,7 @@ use photocraft_psd::{PsdError, PsdFile};
 pub use adjust_map::ADJUSTMENT_KEYS;
 pub use flat::document_to_image;
 pub use psd_export::{PsdExportOptions, document_to_psd, document_to_psd_with};
-pub use psd_import::psd_to_document;
+pub use psd_import::{psd_to_document, psd_to_document_with_preview, psd_to_document_with_events};
 
 /// Errors from import/export.
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +171,12 @@ fn import_file_inner(name: &str, mut file: std::fs::File, opener: Option<photocr
         return Ok(ImportResult { document, warnings: Vec::new() });
     }
     file.seek(SeekFrom::Start(0)).map_err(photocraft_format::FormatError::from)?;
+    if magic.starts_with(b"8BPS") && std::env::var("PHOTOCRAFT_PSD_STREAM").as_deref() != Ok("0") {
+        let parsed = PsdFile::from_reader(&mut std::io::BufReader::with_capacity(1 << 20, file))?;
+        let (mut document, warnings) = psd_to_document(&parsed);
+        document.name = name.into();
+        return Ok(ImportResult { document, warnings });
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(photocraft_format::FormatError::from)?;
     import_owned(name, bytes)
@@ -254,4 +261,32 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
     let l = doc.layers.first().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;
     let s = l.surface().ok_or_else(|| IoError::Unsupported("no merged image".into()))?;
     Ok(photocraft_compose::surface_to_buffer(s, doc.bounds()).px)
+}
+
+/// Import with an early, non-editable PSD compatibility preview. Owned input is released
+/// immediately after parsing; the final tree retains the original deterministic layer order.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_path_with_preview(path: &std::path::Path, preview: &dyn Fn(Document)) -> Result<ImportResult, IoError> {
+    import_path_with_events(path, preview, &|_, _| true)
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_path_with_events(path: &std::path::Path, preview: &dyn Fn(Document), progress: &(dyn Fn(usize, usize) -> bool + Sync)) -> Result<ImportResult, IoError> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) { return import_path(path); }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut source = std::fs::File::open(path).map_err(photocraft_format::FormatError::from)?;
+    let mut signature = [0u8; 4];
+    let psd = source.read_exact(&mut signature).is_ok() && &signature == b"8BPS";
+    source.seek(SeekFrom::Start(0)).map_err(photocraft_format::FormatError::from)?;
+    if !psd { return import_path(path); }
+    let file = if std::env::var("PHOTOCRAFT_PSD_STREAM").as_deref() != Ok("0") {
+        PsdFile::from_reader(&mut std::io::BufReader::with_capacity(1 << 20, source))?
+    } else {
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(photocraft_format::FormatError::from)?;
+        PsdFile::from_bytes(&bytes)?
+    };
+    let (mut document, warnings) = psd_to_document_with_events(&file, preview, progress);
+    document.name = name;
+    Ok(ImportResult { document, warnings })
 }

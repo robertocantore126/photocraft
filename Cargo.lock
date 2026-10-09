@@ -3605,6 +3605,7 @@ dependencies = [
  "photocraft-text",
  "photocraft-vector",
  "proptest",
+ "rayon",
  "thiserror 2.0.21",
 ]
 

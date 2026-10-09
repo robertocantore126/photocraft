@@ -47,20 +47,24 @@ pub fn content_bounds(s: &Surface) -> Rect {
     let fmt = s.format();
     let mut dp = vec![0u8; fmt.bytes_per_pixel()];
     photocraft_raster::encode_pixel(&fmt, &s.default_pixel(), &mut dp);
-    let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if c.len() > 1 << 16 {
-        c.retain(|_, e| e.tile.strong_count() > 0);
+    {
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() > 1 << 16 { cache.retain(|_, entry| entry.tile.strong_count() > 0); }
     }
     let mut out = Rect::EMPTY;
     for (coord, t) in s.tiles() {
         let key = Arc::as_ptr(t) as usize;
-        let hit = c.get(&key).filter(|e| e.tile.upgrade().is_some_and(|u| Arc::ptr_eq(&u, t)) && *e.default == *dp).map(|e| e.bounds);
+        let hit = {
+            let cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&key).filter(|e| e.tile.upgrade().is_some_and(|u| Arc::ptr_eq(&u, t)) && *e.default == *dp).map(|e| e.bounds)
+        };
         let b = match hit {
-            Some(b) => b,
+            Some(bounds) => bounds,
             None => {
-                let b = scan(t, &dp);
-                c.insert(key, Entry { tile: Arc::downgrade(t), default: dp.clone().into_boxed_slice(), bounds: b });
-                b
+                // Never hold the shared cache lock over a pixel scan or a scratch read.
+                let bounds = scan(t, &dp);
+                cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, Entry { tile: Arc::downgrade(t), default: dp.clone().into_boxed_slice(), bounds });
+                bounds
             }
         };
         if let Some((x0, y0, x1, y1)) = b {

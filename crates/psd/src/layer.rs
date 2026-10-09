@@ -524,7 +524,7 @@ impl LayerRecord {
         ch.decode(w, h, depth, version)
     }
 
-    fn read(r: &mut Reader<'_>, version: Version) -> Result<(Self, Vec<u64>)> {
+    pub(crate) fn read(r: &mut Reader<'_>, version: Version) -> Result<(Self, Vec<u64>)> {
         let rect = Rect::read(r)?;
         let nch = r.u16()?;
         if nch > MAX_LAYER_CHANNELS {

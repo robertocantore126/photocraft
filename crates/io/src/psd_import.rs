@@ -1,6 +1,7 @@
 //! PSD/PSB → [`Document`].
 
 use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{AlphaChannel, Document, Effects, FillCache, Group, Layer, LayerContent, LayerMask, ShapeLayer, SmartObject, SmartSource, TextLayer};
@@ -51,6 +52,23 @@ pub(crate) struct Ctx<'a> {
     pub warnings: Vec<String>,
     /// Document resolution (type sizes are converted to points with it).
     pub dpi: f32,
+    decoded: BTreeMap<usize, DecodedLayer>,
+}
+
+struct DecodedLayer { surface: Option<Surface>, mask: Option<LayerMask>, warnings: Vec<String> }
+
+/// Decode pixel storage independently; layer ids, effects and the tree are assembled in order.
+fn decode_layer(file: &PsdFile, rec: &LayerRecord, fmt: PixelFormat, mask_fmt: PixelFormat, dpi: f32) -> DecodedLayer {
+    let mut cx = Ctx { file, fmt, mask_fmt, cc: fmt.mode.color_channels(), cmyk: fmt.mode == ColorMode::Cmyk,
+        warnings: Vec::new(), dpi, decoded: BTreeMap::new() };
+    let name = rec.name();
+    let surface = (!rec.section_type().is_folder() && !ADJUSTMENT_KEYS.iter().any(|k| rec.block(k).is_some()))
+        .then(|| cx.record_surface(rec, &name));
+    let mask = cx.record_mask(rec, &name);
+    if std::env::var("PHOTOCRAFT_PSD_PRIME_BOUNDS").as_deref() != Ok("0") {
+        if let Some(surface) = &surface { photocraft_compose::bounds::content_bounds(surface); }
+    }
+    DecodedLayer { surface, mask, warnings: cx.warnings }
 }
 
 fn doc_mode(m: PsdMode) -> Option<ColorMode> {
@@ -107,10 +125,14 @@ impl Ctx<'_> {
     }
 
     fn record_surface(&mut self, rec: &LayerRecord, name: &str) -> Surface {
+        if let Some(decoded) = self.decoded.get_mut(&(rec as *const LayerRecord as usize))
+            && let Some(surface) = decoded.surface.take() { return surface; }
         let r = rec.rect;
         if r.is_empty() || r.size().is_err() {
             return Surface::new(self.fmt);
         }
+        if std::env::var("PHOTOCRAFT_PSD_BANDS").as_deref() != Ok("0")
+            && let Some(surface) = crate::psd_bands::decode(self.file, rec, self.fmt) { return surface; }
         let (w, h) = r.size().unwrap_or((0, 0));
         let s = self.fmt.sample;
         let mut planes = Vec::with_capacity(self.cc + 1);
@@ -133,6 +155,7 @@ impl Ctx<'_> {
     }
 
     fn record_mask(&mut self, rec: &LayerRecord, name: &str) -> Option<LayerMask> {
+        if let Some(decoded) = self.decoded.get_mut(&(rec as *const LayerRecord as usize)) { return decoded.mask.take(); }
         let m = rec.layer_mask()?;
         let (id, rect, default, flags) = match selected_real_mask(rec) {
             Some(real) => (CHANNEL_REAL_USER_MASK, real.rect, real.background, real.flags),
@@ -412,8 +435,60 @@ fn parse_guides(data: &[u8], doc: &mut Document) {
     }
 }
 
+fn merged_surface(file: &PsdFile, all: &[u8], fmt: PixelFormat) -> Surface {
+    let h = &file.header;
+    let (w, hh) = (h.width as usize, h.height as usize);
+    let n = w * hh;
+    let cc = fmt.mode.color_channels();
+    let depth = fmt.sample;
+    let canvas = Rect::new(0, 0, h.width as i32, h.height as i32);
+    let plane = h.row_bytes() * hh;
+    let alpha_idx = if file.merged_has_alpha() { Some(cc) } else { None };
+    let mut planes: Vec<Option<&[u8]>> = (0..cc).map(|c| all.get(c * plane..(c + 1) * plane)).collect();
+    planes.push(alpha_idx.and_then(|a| all.get(a * plane..(a + 1) * plane)));
+    let mut fill = vec![zero_sample(depth); cc];
+    fill.push(max_sample(depth));
+    let mut inv = vec![fmt.mode == ColorMode::Cmyk; cc];
+    inv.push(false);
+    let mut bytes = interleave(&planes, &fill, n, depth, &inv);
+    if fmt.mode == ColorMode::Lab && depth == SampleType::U16 {
+        crate::pixels::lab16_chroma(&mut bytes, cc + 1, true);
+    }
+    let mut s = Surface::from_interleaved(fmt, canvas, &bytes);
+    if alpha_idx.is_some() {
+        // Undo Photoshop's white matting of the merged image.
+        // A band of tile rows at a time (no full-size float copy of the image).
+        let white = photocraft_raster::from_rgba(&fmt, [1.0, 1.0, 1.0, 1.0]);
+        let mut vals = Vec::new();
+        let mut y = canvas.y0;
+        while y < canvas.y1 {
+            let band = Rect::new(canvas.x0, y, canvas.x1, y.saturating_add(TILE_SIZE).min(canvas.y1));
+            s.read_region_into(band, &mut vals);
+            for px in vals.chunks_exact_mut(cc + 1) {
+        let a = px[cc];
+        for c in 0..cc {
+            px[c] = if a <= 0.0 { 0.0 } else { crate::pixels::unmatte(px[c], a, white[c]) };
+        }
+            }
+            s.write_region(band, &vals);
+            y = band.y1;
+        }
+    }
+    s.prune();
+    s
+}
+
 /// Converts a parsed PSD into a document. Never fails: problems become warnings.
 pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
+    psd_to_document_with_preview(file, &|_| {})
+}
+
+/// Decode the compatibility composite before layer pixels, for a read-only opening preview.
+pub fn psd_to_document_with_preview(file: &PsdFile, preview: &dyn Fn(Document)) -> (Document, Vec<String>) {
+    psd_to_document_with_events(file, preview, &|_, _| true)
+}
+
+pub fn psd_to_document_with_events(file: &PsdFile, preview: &dyn Fn(Document), progress: &(dyn Fn(usize, usize) -> bool + Sync)) -> (Document, Vec<String>) {
     let h = &file.header;
     let mut warnings = Vec::new();
     let mode = doc_mode(h.color_mode).unwrap_or_else(|| {
@@ -490,6 +565,7 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
         cmyk: fmt.mode == ColorMode::Cmyk,
         warnings,
         dpi: doc.resolution_dpi,
+        decoded: BTreeMap::new(),
     };
 
     let (w, hh) = (h.width as usize, h.height as usize);
@@ -498,6 +574,14 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
     let merged = file.decode_merged();
     if let Err(e) = &merged {
         cx.warn(format!("merged image could not be decoded: {e}"));
+    }
+
+    if layered && !file.layers().is_empty()
+        && std::env::var("PHOTOCRAFT_PSD_PREVIEW").as_deref() != Ok("0")
+        && let Ok(all) = &merged {
+        let mut initial = doc.clone();
+        initial.layers = vec![Layer::new("Opening preview", LayerContent::Raster(merged_surface(file, all, fmt)))];
+        preview(initial);
     }
 
     if multichannel {
@@ -511,7 +595,33 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
         }
     } else if layered {
         let tree = file.layer_tree();
+        if std::env::var("PHOTOCRAFT_PSD_PARALLEL").as_deref() != Ok("0") {
+            let done = std::sync::atomic::AtomicUsize::new(0);
+            let total = file.layers().len();
+            let decode = |rec: &LayerRecord| {
+                if !progress(done.load(std::sync::atomic::Ordering::Relaxed), total) {
+                    return DecodedLayer { surface: None, mask: None, warnings: Vec::new() };
+                }
+                let layer = decode_layer(file, rec, fmt, cx.mask_fmt, cx.dpi);
+                let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                progress(finished, total);
+                layer
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let decoded: Vec<DecodedLayer> = {
+                use rayon::prelude::*;
+                file.layers().par_iter().map(decode).collect()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let decoded: Vec<DecodedLayer> = file.layers().iter().map(decode).collect();
+            if !progress(total, total) { return (doc, cx.warnings); }
+            for (rec, mut decoded) in file.layers().iter().zip(decoded) {
+                cx.warnings.append(&mut decoded.warnings);
+                cx.decoded.insert(rec as *const LayerRecord as usize, decoded);
+            }
+        }
         doc.layers = cx.build(&tree);
+        cx.decoded.clear();
         // Layer › Link Layers: resource 1026 holds one group id per layer record (0 = unlinked).
         if let Some(Ok(photocraft_psd::resources::ResourceData::LayerGroupInfo(groups))) =
             file.resources.iter().find(|r| r.id == ids::LAYER_GROUP_INFO).and_then(photocraft_psd::resources::ImageResource::parsed)
@@ -522,39 +632,8 @@ pub fn psd_to_document(file: &PsdFile) -> (Document, Vec<String>) {
             && let Ok(all) = &merged
         {
             // Flattened file: the merged image becomes the background layer.
-            let plane = h.row_bytes() * hh;
             let alpha_idx = if file.merged_has_alpha() { Some(cc) } else { None };
-            let mut planes: Vec<Option<&[u8]>> = (0..cc).map(|c| all.get(c * plane..(c + 1) * plane)).collect();
-            planes.push(alpha_idx.and_then(|a| all.get(a * plane..(a + 1) * plane)));
-            let mut fill = vec![zero_sample(depth); cc];
-            fill.push(max_sample(depth));
-            let mut inv = vec![cx.cmyk; cc];
-            inv.push(false);
-            let mut bytes = interleave(&planes, &fill, n, depth, &inv);
-            if fmt.mode == ColorMode::Lab && depth == SampleType::U16 {
-                crate::pixels::lab16_chroma(&mut bytes, cc + 1, true);
-            }
-            let mut s = Surface::from_interleaved(fmt, canvas, &bytes);
-            if alpha_idx.is_some() {
-                // Undo Photoshop's white matting of the merged image.
-                // A band of tile rows at a time (no full-size float copy of the image).
-                let white = photocraft_raster::from_rgba(&fmt, [1.0, 1.0, 1.0, 1.0]);
-                let mut vals = Vec::new();
-                let mut y = canvas.y0;
-                while y < canvas.y1 {
-                    let band = Rect::new(canvas.x0, y, canvas.x1, y.saturating_add(TILE_SIZE).min(canvas.y1));
-                    s.read_region_into(band, &mut vals);
-                    for px in vals.chunks_exact_mut(cc + 1) {
-                        let a = px[cc];
-                        for c in 0..cc {
-                            px[c] = if a <= 0.0 { 0.0 } else { crate::pixels::unmatte(px[c], a, white[c]) };
-                        }
-                    }
-                    s.write_region(band, &vals);
-                    y = band.y1;
-                }
-            }
-            s.prune();
+            let s = merged_surface(file, all, fmt);
             let mut bg = Layer::new("Background", LayerContent::Raster(s));
             if alpha_idx.is_none() {
                 bg.locks.transparency = true;
