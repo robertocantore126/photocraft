@@ -433,6 +433,7 @@ fn viewport_level(visible: DRect, zoom: f32, input_level: u32) -> u32 {
 /// Display cache bounded by the viewport rather than the document's full-resolution canvas.
 #[derive(Clone)]
 pub(crate) struct ViewTexture {
+    last_used: u64,
     revision: u64,
     preview: u64,
     level: u32,
@@ -467,7 +468,10 @@ fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize,
     }
     let key = egui::Id::new(("viewport-cpu", view_id, doc.id.0));
     let cache_id = (doc.id, key.value());
-    let cached = app.view_textures.get(&cache_id).cloned();
+    let cached = app.view_textures.get_mut(&cache_id).map(|entry| {
+        entry.last_used = app.frame;
+        entry.clone()
+    });
     if let Some(cached) = &cached
         && cached.revision == revision
         && cached.preview == preview
@@ -489,12 +493,13 @@ fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize,
     };
     let area =
         DRect::new(reduced.x0.saturating_mul(factor), reduced.y0.saturating_mul(factor), reduced.x1.saturating_mul(factor), reduced.y1.saturating_mul(factor));
-    app.view_textures.insert(cache_id, ViewTexture { revision, preview, level: total_level, area, texture: texture.clone() });
+    app.view_textures.insert(cache_id, ViewTexture { last_used: app.frame, revision, preview, level: total_level, area, texture: texture.clone() });
     Some((texture.id(), area))
 }
 
 #[derive(Clone)]
 pub(crate) struct MipDocument {
+    last_used: u64,
     revision: u64,
     preview: u64,
     level: u32,
@@ -529,7 +534,10 @@ fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
     let cache_key = egui::Id::new(("viewport-mip-document", view_id, doc.id.0));
     let source_visible = photocraft_raster::Surface::mip_bounds(original_visible, input_level);
     let cache_id = (doc.id, cache_key.value());
-    let cached = app.view_mips.get(&cache_id).cloned();
+    let cached = app.view_mips.get_mut(&cache_id).map(|entry| {
+        entry.last_used = app.frame;
+        entry.clone()
+    });
     let proxy = if level == 0 {
         doc.clone()
     } else {
@@ -542,7 +550,7 @@ fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
                 let mut proxy = photocraft_compose::mip_view::document_region(&doc, level, proxy_area).ok()?;
                 proxy.id = photocraft_doc::DocId(doc.id.0 ^ (1 << 56));
                 let proxy = std::sync::Arc::new(proxy);
-                app.view_mips.insert(cache_id, MipDocument { revision, preview, level, area: proxy_area, doc: proxy.clone() });
+                app.view_mips.insert(cache_id, MipDocument { last_used: app.frame, revision, preview, level, area: proxy_area, doc: proxy.clone() });
                 proxy
             }
         }
@@ -562,7 +570,7 @@ fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
         uploaded.filter(|(r, p, l, a)| (*r, *p, *l) == (revision, preview, level) && a.contains_rect(&visible) && gpu.has(output_key, [a.width(), a.height()]));
     let area = existing.map_or(wanted, |(_, _, _, a)| a);
     if existing.is_none() || gpu.pending(output_key) {
-        match gpu.composite_view(&proxy, area, display.as_ref().is_some_and(|d| d.encode_srgb), output_key) {
+        match gpu.composite_view(&proxy, area, display.as_ref().is_some_and(|d| d.encode_srgb), output_key, app.session.documents().get(idx)?.doc.id.0) {
             Ok(stats) => {
                 app.perf.gpu_uploads = stats.tiles_uploaded as u64;
                 app.perf.gpu = true;
@@ -866,6 +874,21 @@ fn texture_buffer<'a>(
     }
 }
 
+/// Keep four saved views per document, plus any views already used this frame. Retiring a
+/// cache referenced by an earlier canvas in this frame could free its egui texture before paint.
+fn trim_view_cache<T>(cache: &mut std::collections::HashMap<(photocraft_doc::DocId, u64), T>, frame: u64, used: impl Fn(&T) -> u64) {
+    let documents: std::collections::HashSet<_> = cache.keys().map(|(doc, _)| *doc).collect();
+    for document in documents {
+        let count = cache.keys().filter(|(doc, _)| *doc == document).count();
+        let mut old: Vec<_> =
+            cache.iter().filter(|((doc, _), entry)| *doc == document && used(entry) < frame).map(|(key, entry)| (used(entry), *key)).collect();
+        old.sort_by_key(|(frame, (_, key))| (*frame, *key));
+        for (_, key) in old.into_iter().take(count.saturating_sub(4)) {
+            cache.remove(&key);
+        }
+    }
+}
+
 pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     // Remove a closed adjustment owner's proxy before collecting its live GPU keys.
     crate::adjust_preview::retain_documents(app);
@@ -886,6 +909,8 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     let documents = app.session.documents();
     app.view_textures.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
     app.view_mips.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
+    trim_view_cache(&mut app.view_textures, app.frame, |entry| entry.last_used);
+    trim_view_cache(&mut app.view_mips, app.frame, |entry| entry.last_used);
     app.cpu_prefix.retain(|id, _| documents.iter().any(|st| st.doc.id == *id));
     if app.filter_preview.as_ref().is_some_and(|preview| !documents.iter().any(|st| st.doc.id == preview.doc)) {
         app.filter_preview = None;

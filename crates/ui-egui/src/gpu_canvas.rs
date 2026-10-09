@@ -333,8 +333,12 @@ impl GpuCanvas {
 
     /// Whether document `doc` has been uploaded with this size.
     pub fn has(&self, doc: u64, size: [u32; 2]) -> bool {
-        let r = self.rs.renderer.read();
-        r.callback_resources.get::<Resources>().and_then(|res| res.docs.get(&doc)).is_some_and(|d| d.size == size)
+        let mut r = self.rs.renderer.write();
+        let Some(res) = r.callback_resources.get_mut::<Resources>() else { return false };
+        let frame = res.slice_frame.map_or(0, |(frame, _)| frame);
+        let Some(texture) = res.docs.get_mut(&doc) else { return false };
+        texture.last_used = frame;
+        texture.size == size
     }
 
     /// Whether [`GpuCanvas::composite`] would draw `doc` with the wgpu compositor (rather than
@@ -455,8 +459,18 @@ impl GpuCanvas {
         region: photocraft_geom::Rect,
         encode_srgb: bool,
         key: u64,
+        owner: u64,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
         let result = self.composite_output(doc, region, encode_srgb, 0, Some(region), key);
+        let mut renderer = self.rs.renderer.write();
+        if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
+            let frame = res.slice_frame.map_or(0, |(frame, _)| frame);
+            if let Some(texture) = res.docs.get_mut(&key) {
+                texture.view_owner = Some(owner);
+                texture.last_used = frame;
+            }
+        }
+        drop(renderer);
         if result.is_ok() {
             if let Some(res) = self.rs.renderer.write().callback_resources.get_mut::<Resources>() {
                 res.dirty.remove(&key);
@@ -796,6 +810,7 @@ impl GpuCanvas {
         if let Some(res) = renderer.callback_resources.get_mut::<Resources>()
             && res.slice_frame.is_none_or(|(seen, _)| seen != frame)
         {
+            res.trim_view_outputs(frame);
             res.slice_frame = Some((frame, false));
             let keys: Vec<(u64, u64)> = res.docs.iter().map(|(&key, d)| (key, d.source_key.unwrap_or(key))).collect();
             if let Some(compositor) = &mut res.compositor {
@@ -919,6 +934,7 @@ impl GpuCanvas {
         res.coarse.retain(|k, _| live.contains(k));
         res.preview_levels.retain(|k, _| live.contains(k));
         res.display_lut_signatures.retain(|k, _| live.contains(k));
+        res.views.retain(|_, view| live.contains(&view.doc));
     }
 
     pub(crate) fn display_lut_signature(&self, doc: u64) -> Option<(u64, u8)> {
@@ -1413,13 +1429,45 @@ fn identity_lut_bytes() -> Vec<u8> {
 }
 
 struct ViewGpu {
+    doc: u64,
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     frame_data: [f32; VIEW_FLOATS],
 }
 
+impl Resources {
+    /// Bound saved viewport outputs per document. Current-frame outputs remain alive until
+    /// callbacks paint; evicted views reconstruct their output on their next `has` miss.
+    fn trim_view_outputs(&mut self, frame: u64) {
+        let owners: std::collections::HashSet<_> = self.docs.values().filter_map(|texture| texture.view_owner).collect();
+        for owner in owners {
+            let count = self.docs.values().filter(|texture| texture.view_owner == Some(owner)).count();
+            let mut old: Vec<_> = self
+                .docs
+                .iter()
+                .filter(|(_, texture)| texture.view_owner == Some(owner) && texture.last_used < frame)
+                .map(|(&key, texture)| (texture.last_used, key))
+                .collect();
+            old.sort_unstable();
+            for (_, key) in old.into_iter().take(count.saturating_sub(4)) {
+                self.docs.remove(&key);
+                self.views.retain(|_, view| view.doc != key);
+                self.luts.remove(&key);
+                self.dirty.remove(&key);
+                self.coarse.remove(&key);
+                self.preview_levels.remove(&key);
+                self.display_lut_signatures.remove(&key);
+                // Source pages/effect jobs are shared by surviving views and remain resident.
+            }
+        }
+    }
+}
+
 struct DocTextures {
     source_key: Option<u64>,
+    /// Original document owning this viewport output (source_key may name a mip/preview).
+    view_owner: Option<u64>,
+    last_used: u64,
     /// During refinement only this mip is valid across the coarse preview.
     preview_level: Option<u32>,
     size: [u32; 2],
@@ -1679,7 +1727,7 @@ impl DocTextures {
                 tiles.push(Tile { rect: [tx, ty, w, h], texture, levels, bind_group, _uniform: uniform });
             }
         }
-        Self { size, format, tiles, preview_level: None, source_key: None }
+        Self { size, format, tiles, preview_level: None, source_key: None, view_owner: None, last_used: 0 }
     }
 
     /// Write `size` pixels at document `origin` from `texels` (in the texture format, row stride
@@ -1865,8 +1913,9 @@ impl CallbackTrait for CanvasCallback {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 ],
             });
-            ViewGpu { buffer, bind_group, frame_data: [f32::NAN; VIEW_FLOATS] }
+            ViewGpu { doc: self.params.doc, buffer, bind_group, frame_data: [f32::NAN; VIEW_FLOATS] }
         });
+        v.doc = self.params.doc;
         if v.frame_data != data {
             queue.write_buffer(&v.buffer, 0, &f32_bytes(&data));
             v.frame_data = data;
