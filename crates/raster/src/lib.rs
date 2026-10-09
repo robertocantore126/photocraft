@@ -573,14 +573,21 @@ impl Surface {
         let bpp = enc.len();
         let shared = std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() != Ok("0");
         let mut solid = None;
+        let mut classified = std::collections::HashMap::new();
         for tc in r.tiles() {
             let tr = tc.rect().intersect(&r);
             if shared && tr == tc.rect() {
                 let unchanged = match self.tiles.get(&tc) {
-                    Some(tile) => tile.solid_pixel.as_deref().map_or_else(
-                        || tile.try_bytes().is_ok_and(|bytes| bytes.chunks_exact(bpp).all(|pixel| pixel == enc.as_slice())),
-                        |pixel| pixel == enc.as_slice(),
-                    ),
+                    Some(tile) => {
+                        let key = Arc::as_ptr(tile) as usize;
+                        *classified.entry(key).or_insert_with(|| {
+                            tile.cell.read_error().is_none()
+                                && tile.solid_pixel.as_deref().map_or_else(
+                                    || tile.try_bytes().is_ok_and(|bytes| bytes.chunks_exact(bpp).all(|pixel| pixel == enc.as_slice())),
+                                    |pixel| pixel == enc.as_slice(),
+                                )
+                        })
+                    }
                     None => enc.as_slice() == self.default_pixel.as_ref(),
                 };
                 if unchanged {
@@ -590,7 +597,7 @@ impl Surface {
                     self.content_bounds_hint = None;
                     self.invalidate_mips(tc);
                     self.tiles.remove(&tc);
-                } else if !self.tiles.get(&tc).is_some_and(|tile| tile.solid_pixel.as_deref() == Some(enc.as_slice())) {
+                } else {
                     let tile = solid.get_or_insert_with(|| Arc::new(Tile::solid(&self.format, &enc)));
                     self.content_bounds_hint = None;
                     self.invalidate_mips(tc);
@@ -643,6 +650,9 @@ impl Surface {
                 }
                 continue;
             };
+            if tile.cell.read_error().is_some() {
+                return false;
+            }
             if let Some(solid) = tile.solid_pixel.as_deref() {
                 if solid != encoded.as_slice() {
                     return false;

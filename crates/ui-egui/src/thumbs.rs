@@ -1,6 +1,6 @@
 //! Visible-row thumbnail requests. Two dedicated workers avoid nested rayon work.
 use photocraft_doc::LayerId;
-use photocraft_geom::{Rect, Size};
+use photocraft_geom::{Rect, Size, TileCoord};
 use photocraft_raster::Surface;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
@@ -162,6 +162,7 @@ pub fn image(surface: &Surface, size: Size, mask: bool) -> Result<egui::ColorIma
     let (ox, oy) = ((64.0 - w / scale) * 0.5, (64.0 - h / scale) * 0.5);
     let mut pixels = vec![egui::Color32::TRANSPARENT; 64 * 64];
     let mut sample = vec![0.0f32; source.channels()];
+    let mut checked_tiles = std::collections::HashSet::new();
     for ty in 0..64 {
         for tx in 0..64 {
             let x0 = ((tx as f64 - ox) * scale).max(0.0);
@@ -176,6 +177,12 @@ pub fn image(surface: &Surface, size: Size, mask: bool) -> Result<egui::ColorIma
             for y in y0.floor() as i32..y1.ceil() as i32 {
                 for x in x0.floor() as i32..x1.ceil() as i32 {
                     let area = (x1.min(x as f64 + 1.0) - x0.max(x as f64)).max(0.0) * (y1.min(y as f64 + 1.0) - y0.max(y as f64)).max(0.0);
+                    let coord = TileCoord::containing(x, y);
+                    if checked_tiles.insert(coord)
+                        && let Some(tile) = source.tile(coord)
+                    {
+                        let _bytes = tile.try_bytes()?;
+                    }
                     source.read_pixel(x, y, &mut sample);
                     let rgba = if mask {
                         let v = sample.first().copied().unwrap_or(0.0);
