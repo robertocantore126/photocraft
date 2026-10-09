@@ -33,6 +33,8 @@
 
 pub mod bounds;
 mod fx;
+#[cfg(not(target_arch = "wasm32"))]
+mod fx_jobs;
 pub mod plan;
 
 use std::collections::HashMap;
@@ -282,6 +284,7 @@ struct FxEntry {
     doc: DocId,
     region: Rect,
     shape_key: u64,
+    async_signature: u64,
     /// Tiles the shape was rendered from (content, mask): damage is their difference.
     tiles: [Option<fx::Tiles>; 2],
     /// Groups: the tiles of every surface the shape was rendered from (`fx::group_surfaces`).
@@ -526,6 +529,9 @@ pub struct Compositor {
     pool: Vec<(wgpu::Texture, wgpu::TextureView)>,
     residents: HashMap<ResKey, Resident>,
     fx: HashMap<FxKey, FxEntry>,
+    #[cfg(not(target_arch = "wasm32"))]
+    fx_jobs: Option<fx_jobs::Jobs>,
+    async_effects: bool,
     /// Effect temporaries (R32F, region sized) and the frame they were last used.
     temps: Vec<(Tex, u64)>,
     patterns: HashMap<String, (u64, Tex)>,
@@ -776,6 +782,9 @@ impl Compositor {
             mip_kit: None,
             residents: HashMap::new(),
             fx: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            fx_jobs: None,
+            async_effects: false,
             temps: Vec::new(),
             luts: HashMap::new(),
             patterns: HashMap::new(),
@@ -962,6 +971,46 @@ impl Compositor {
     pub fn forget_doc(&mut self, doc: DocId) {
         self.residents.retain(|_, r| r.doc != doc);
         self.fx.retain(|_, e| e.doc != doc);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(jobs) = &mut self.fx_jobs {
+            jobs.forget_doc(doc);
+        }
+    }
+
+    /// Enable deferred CPU effect inputs for interactive rendering. Export remains synchronous.
+    pub fn set_async_effects(&mut self, enabled: bool) {
+        self.async_effects = enabled;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !enabled {
+            self.fx_jobs = None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if enabled && self.fx_jobs.is_none() {
+            match fx_jobs::Jobs::new() {
+                Ok(jobs) => self.fx_jobs = Some(jobs),
+                Err(error) => log::warn!("could not start effect workers: {error}"),
+            }
+        }
+    }
+
+    /// Interactive callers keep requesting frames while effects are pending.
+    pub fn effects_pending(&self, doc: DocId) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(jobs) = &self.fx_jobs {
+            return jobs.pending(doc);
+        }
+        let _ = doc;
+        false
+    }
+
+    /// Completed inputs invalidate the affected display cells without changing history.
+    pub fn take_effect_damage(&mut self, doc: DocId) -> Option<Rect> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(jobs) = &mut self.fx_jobs {
+            return jobs.take_damage(doc);
+        }
+        let _ = doc;
+        None
     }
 
     /// GPU memory held by cached effect maps (bytes).
@@ -1984,6 +2033,47 @@ impl Compositor {
         let parts = if is_group { fx::group_surfaces(layer) } else { Vec::new() };
         let frame = self.frame;
         let (rw, rh) = (region.width(), region.height());
+        let vector_shape = matches!(layer.content, LayerContent::Shape(_));
+        let anchor = layer.effects.reference.unwrap_or((f64::from(f.bounds.x0), f64::from(f.bounds.y0)));
+        let progs: Vec<fx::MapProgram> =
+            layer.effects.items.iter().filter(|e| e.enabled()).map(|e| fx::program_with(e, &doc.global_light, vector_shape, &doc.patterns, anchor)).collect();
+        let want = field_reaches(&progs);
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut prepared: Option<fx_jobs::Inputs> = None;
+        #[allow(unused_mut)]
+        let mut async_signature = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.async_effects && !self.nested && !region.is_empty() && progs.iter().any(|p| p.maps > 0) {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (doc.id, shape_key, region).hash(&mut hash);
+            for source in [content_src, mask_src].into_iter().flatten().chain(parts.iter().map(|p| p.3)) {
+                for (coord, tile) in source.tiles() {
+                    (coord, Arc::as_ptr(tile) as usize).hash(&mut hash);
+                }
+            }
+            for prog in &progs {
+                prog.key.hash(&mut hash);
+            }
+            async_signature = hash.finish() | 1;
+            if self.fx.get(&key).is_none_or(|e| e.doc != doc.id || e.async_signature != async_signature) {
+                if let Some(jobs) = &mut self.fx_jobs {
+                    match jobs.poll(key, async_signature, doc, layer, region, &want) {
+                        fx_jobs::Poll::Waiting => {
+                            self.fx.remove(&key);
+                            return;
+                        }
+                        fx_jobs::Poll::Ready(inputs) => {
+                            self.fx.remove(&key);
+                            prepared = Some(inputs);
+                        }
+                        fx_jobs::Poll::Failed(error) => {
+                            log::warn!("{error}; effect inputs use the synchronous fallback");
+                        }
+                    }
+                }
+            }
+        }
 
         // What changed: everything (new settings / size), the position only, some tiles, or
         // nothing.
@@ -2036,6 +2126,7 @@ impl Compositor {
                     doc: doc.id,
                     region,
                     shape_key,
+                    async_signature,
                     tiles: [None, None],
                     parts: Vec::new(),
                     version: 0,
@@ -2051,6 +2142,12 @@ impl Compositor {
         }
         // The shape over the damage (compose's own alpha), before the entry is borrowed: a group's
         // comes from a nested render.
+        #[cfg(not(target_arch = "wasm32"))]
+        let shape = match prepared.as_mut() {
+            Some(inputs) => Some(std::mem::take(&mut inputs.shape)),
+            None => (!region.is_empty() && !damage.is_empty()).then(|| self.layer_shape(device, queue, encoder, doc, layer, damage)),
+        };
+        #[cfg(target_arch = "wasm32")]
         let shape = (!region.is_empty() && !damage.is_empty()).then(|| self.layer_shape(device, queue, encoder, doc, layer, damage));
         // Present: kept or (re)inserted above.
         let stamp = self.stamp;
@@ -2077,12 +2174,6 @@ impl Compositor {
             staged += v.len() as u64 * 4;
         }
 
-        // Programs, and the distance fields they read (max reach per field).
-        let vector_shape = matches!(layer.content, LayerContent::Shape(_));
-        let anchor = layer.effects.reference.unwrap_or((f64::from(f.bounds.x0), f64::from(f.bounds.y0)));
-        let progs: Vec<fx::MapProgram> =
-            layer.effects.items.iter().filter(|e| e.enabled()).map(|e| fx::program_with(e, &doc.global_light, vector_shape, &doc.patterns, anchor)).collect();
-        let want = field_reaches(&progs);
         e.fields.retain(|k, _| want.contains_key(k));
         for (&kind, &reach) in &want {
             let have = e.fields.get(&kind).map(|(r, _)| *r);
@@ -2096,6 +2187,13 @@ impl Compositor {
                 _ => region,
             };
             let reach = have.filter(|r| *r >= reach).unwrap_or(reach);
+            #[cfg(not(target_arch = "wasm32"))]
+            let v = prepared
+                .as_mut()
+                .and_then(|inputs| inputs.fields.remove(&kind))
+                .map(|(_, values)| values)
+                .unwrap_or_else(|| fx::field(kind, reach, &e.shape_cpu, region, out));
+            #[cfg(target_arch = "wasm32")]
             let v = fx::field(kind, reach, &e.shape_cpu, region, out);
             if have.is_none_or(|r| r < reach) {
                 e.fields.insert(kind, (reach, Tex::map(device, "pc_fx_field", region, MAP32)));
@@ -2254,7 +2352,7 @@ fn op_words(p: &plan::Pass<'_>, tex: Option<[i32; 4]>, mask: Option<[i32; 4]>, m
         I(p.adjust_kind),
         U(flags),
         U(0),
-        F(p.opacity),
+        F(if p.map.is_some() && map.is_none() { 0.0 } else { p.opacity }),
         F(density),
         F(mdefault),
         F(0.0),

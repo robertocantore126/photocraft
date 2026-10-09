@@ -449,6 +449,7 @@ impl GpuCanvas {
                 }
             },
         };
+        comp.set_async_effects(std::env::var("PHOTOCRAFT_ASYNC_EFFECTS").ok().as_deref() != Some("0"));
         if let Some(b) = res.compositor_budget {
             comp.set_memory_budget(b);
         }
@@ -716,7 +717,9 @@ impl GpuCanvas {
 
     pub fn pending(&self, key: u64) -> bool {
         let renderer = self.rs.renderer.read();
-        renderer.callback_resources.get::<Resources>().and_then(|res| res.dirty.get(&key)).is_some_and(|d| !d.rects.is_empty())
+        renderer.callback_resources.get::<Resources>().is_some_and(|res| {
+            res.dirty.get(&key).is_some_and(|d| !d.rects.is_empty()) || res.compositor.as_ref().is_some_and(|c| c.effects_pending(photocraft_doc::DocId(key)))
+        })
     }
 
     pub(crate) fn begin_frame(&self, frame: u64) {
@@ -725,6 +728,14 @@ impl GpuCanvas {
             && res.slice_frame.is_none_or(|(seen, _)| seen != frame)
         {
             res.slice_frame = Some((frame, false));
+            let keys: Vec<u64> = res.docs.keys().copied().collect();
+            if let Some(compositor) = &mut res.compositor {
+                for key in keys {
+                    if let Some(damage) = compositor.take_effect_damage(photocraft_doc::DocId(key)) {
+                        res.dirty.entry(key).or_insert_with(|| DirtyRegions { side: SLICE, ..Default::default() }).add(damage);
+                    }
+                }
+            }
         }
     }
 
