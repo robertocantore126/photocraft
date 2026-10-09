@@ -21,6 +21,7 @@ pub mod bounds;
 pub mod effects;
 pub mod fill_layout;
 pub mod masks;
+pub mod mip_view;
 pub mod multichannel;
 pub mod pattern;
 pub mod proxy;

@@ -404,6 +404,9 @@ pub fn preview_from_proxy(proxy: &Document, active: Option<photocraft_doc::Layer
     s.active().map(|d| (*d.doc).clone())
 }
 
+#[path = "filter_region.rs"]
+pub mod region;
+
 /// Cached preview state on the app.
 pub struct FilterPreview {
     pub doc: photocraft_doc::DocId,
@@ -414,6 +417,7 @@ pub struct FilterPreview {
     pub active: Option<photocraft_doc::LayerId>,
     pub k: u32,
     pub result: Option<Arc<Document>>,
+    pub region: Option<region::RegionPreview>,
 }
 
 #[cfg(test)]

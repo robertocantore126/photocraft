@@ -267,6 +267,16 @@ fn display_doc(app: &mut PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>
         let key = 1 + params.to_string().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
         return (std::sync::Arc::new(doc), key);
     }
+    if let Some(preview) = &app.filter_preview
+        && preview.doc == st.doc.id
+        && preview.revision == st.revision
+        && preview.active == st.active_layer
+        && let Some(region) = &preview.region
+        && let Some(result) = &region.result
+        && app.ui.dialogs.iter().any(|d| d.fields.get("__preview").and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        return (result.clone(), region.shown_hash | (1 << 59));
+    }
     // Duotone documents display through their inks.
     if let Some(shown) = photocraft_engine::mode_cmds::display_document(&st.doc) {
         return (std::sync::Arc::new(shown), 1 << 41);
@@ -384,12 +394,195 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) 
     Some((cache.texture.as_ref()?.id(), cache.scale))
 }
 
+fn filter_display_factor(app: &PhotocraftApp, idx: usize) -> u32 {
+    let Some(st) = app.session.documents().get(idx) else { return 1 };
+    app.filter_preview
+        .as_ref()
+        .filter(|p| {
+            p.doc == st.doc.id
+                && p.revision == st.revision
+                && p.active == st.active_layer
+                && app.ui.dialogs.iter().any(|d| d.fields.get("__preview").and_then(serde_json::Value::as_bool) == Some(true))
+        })
+        .and_then(|p| p.region.as_ref())
+        .filter(|r| r.result.is_some())
+        .map_or(1, |r| r.factor)
+}
+
+fn viewport_level(visible: DRect, zoom: f32, input_level: u32) -> u32 {
+    let mut level = if zoom.is_finite() && zoom > 0.0 && zoom < 0.5 { (1.0 / zoom).log2().floor().clamp(1.0, 16.0) as u32 } else { 0 }.max(input_level);
+    while level < 16 && {
+        let reduced = photocraft_raster::Surface::mip_bounds(visible, level);
+        reduced.width() > MAX_TEXTURE - 64 || reduced.height() > MAX_TEXTURE - 64
+    } {
+        level += 1;
+    }
+    level
+}
+
+/// Display cache bounded by the viewport rather than the document's full-resolution canvas.
+#[derive(Clone)]
+pub(crate) struct ViewTexture {
+    revision: u64,
+    preview: u64,
+    level: u32,
+    area: DRect,
+    texture: egui::TextureHandle,
+}
+
+fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform) -> Option<(egui::TextureId, DRect)> {
+    if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
+        return None;
+    }
+    let st = app.session.documents().get(idx)?;
+    let revision = st.revision;
+    let (doc, preview) = display_doc(app, idx);
+    let (display, display_key) = canvas_display(app, &doc);
+    let preview = preview ^ display_key ^ if preview == 0 { std::sync::Arc::as_ptr(&doc) as usize as u64 } else { 0 };
+    let original_bounds = app.session.documents().get(idx)?.doc.bounds();
+    let original_visible = visible_doc_rect(xf).intersect(&original_bounds);
+    let input_level = filter_display_factor(app, idx).trailing_zeros();
+    let total_level = viewport_level(original_visible, xf.zoom * ctx.pixels_per_point(), input_level);
+    let level = total_level.saturating_sub(input_level);
+    let visible = photocraft_raster::Surface::mip_bounds(original_visible, input_level);
+    if visible.is_empty() {
+        return None;
+    }
+    let factor = 1i32 << total_level;
+    let area = visible.inflate((1i32 << level).saturating_mul(32)).intersect(&doc.bounds());
+    let reduced = photocraft_raster::Surface::mip_bounds(area, level);
+    // Display textures are bounded even for hostile view/automation dimensions.
+    if reduced.width() > MAX_TEXTURE || reduced.height() > MAX_TEXTURE {
+        return None;
+    }
+    let key = egui::Id::new(("viewport-cpu", ctx.viewport_id(), idx, doc.id.0));
+    let cache_id = (doc.id, key.value());
+    let cached = app.view_textures.get(&cache_id).cloned();
+    if let Some(cached) = &cached
+        && cached.revision == revision
+        && cached.preview == preview
+        && cached.level == total_level
+        && cached.area.contains_rect(&original_visible)
+    {
+        return Some((cached.texture.id(), cached.area));
+    }
+    let proxy = photocraft_compose::mip_view::document_region(&doc, level, area).ok()?;
+    let buffer = photocraft_compose::render(&proxy, reduced);
+    let image = display_image(display.as_deref(), &buffer);
+    let texture = match cached {
+        Some(mut cached) => {
+            cached.texture.set(image, TextureOptions::LINEAR);
+            cached.texture
+        }
+        None => ctx.load_texture(format!("viewport-{}", doc.id.0), image, TextureOptions::LINEAR),
+    };
+    let area =
+        DRect::new(reduced.x0.saturating_mul(factor), reduced.y0.saturating_mul(factor), reduced.x1.saturating_mul(factor), reduced.y1.saturating_mul(factor));
+    app.view_textures.insert(cache_id, ViewTexture { revision, preview, level: total_level, area, texture: texture.clone() });
+    Some((texture.id(), area))
+}
+
+#[derive(Clone)]
+pub(crate) struct MipDocument {
+    revision: u64,
+    preview: u64,
+    level: u32,
+    area: DRect,
+    doc: std::sync::Arc<Document>,
+}
+
+struct GpuView {
+    key: u64,
+    factor: u32,
+    area: DRect,
+}
+
+/// Composite only the visible rectangle into a texture of that rectangle's size. At low
+/// zoom its layers are native CPU mip surfaces, so GPU upload never needs their level zero.
+fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform, view_id: egui::Id) -> Option<GpuView> {
+    if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
+        return None;
+    }
+    let gpu = app.gpu.clone()?;
+    gpu.begin_frame(app.frame);
+    let revision = app.session.documents().get(idx)?.revision;
+    let (doc, preview) = display_doc(app, idx);
+    let (display, display_key) = canvas_display(app, &doc);
+    let preview = preview ^ display_key ^ if preview == 0 { std::sync::Arc::as_ptr(&doc) as usize as u64 } else { 0 };
+    let original_visible = visible_doc_rect(xf).intersect(&app.session.documents().get(idx)?.doc.bounds());
+    let input_level = filter_display_factor(app, idx).trailing_zeros();
+    let total_level = viewport_level(original_visible, xf.zoom * ctx.pixels_per_point(), input_level);
+    let level = total_level.saturating_sub(input_level);
+    let factor = 1u32 << total_level;
+    gpu_budget(app, &gpu, idx, true, original_visible);
+    let cache_key = egui::Id::new(("viewport-mip-document", view_id, doc.id.0));
+    let source_visible = photocraft_raster::Surface::mip_bounds(original_visible, input_level);
+    let cache_id = (doc.id, cache_key.value());
+    let cached = app.view_mips.get(&cache_id).cloned();
+    let proxy = if level == 0 {
+        doc.clone()
+    } else {
+        match cached {
+            Some(cached) if (cached.revision, cached.preview, cached.level) == (revision, preview, level) && cached.area.contains_rect(&source_visible) => {
+                cached.doc
+            }
+            _ => {
+                let proxy_area = source_visible.inflate((1i32 << level).saturating_mul(64));
+                let mut proxy = photocraft_compose::mip_view::document_region(&doc, level, proxy_area).ok()?;
+                proxy.id = photocraft_doc::DocId(doc.id.0 ^ (1 << 56));
+                let proxy = std::sync::Arc::new(proxy);
+                app.view_mips.insert(cache_id, MipDocument { revision, preview, level, area: proxy_area, doc: proxy.clone() });
+                proxy
+            }
+        }
+    };
+    let visible = photocraft_raster::Surface::mip_bounds(source_visible, level);
+    if visible.is_empty() {
+        return None;
+    }
+    let wanted = visible.inflate(32).intersect(&proxy.bounds());
+    if wanted.width() > MAX_TEXTURE || wanted.height() > MAX_TEXTURE {
+        return None;
+    }
+    let output_key = view_id.with(("viewport-output", doc.id.0)).value();
+    let uploaded_key = egui::Id::new(("viewport-gpu-upload", view_id, doc.id.0));
+    let uploaded: Option<(u64, u64, u32, DRect)> = ctx.data(|d| d.get_temp(uploaded_key));
+    let existing =
+        uploaded.filter(|(r, p, l, a)| (*r, *p, *l) == (revision, preview, level) && a.contains_rect(&visible) && gpu.has(output_key, [a.width(), a.height()]));
+    let area = existing.map_or(wanted, |(_, _, _, a)| a);
+    if existing.is_none() || gpu.pending(output_key) {
+        match gpu.composite_view(&proxy, area, display.as_ref().is_some_and(|d| d.encode_srgb), output_key) {
+            Ok(stats) => {
+                app.perf.gpu_uploads = stats.tiles_uploaded as u64;
+                app.perf.gpu = true;
+                ctx.data_mut(|d| d.insert_temp(uploaded_key, (revision, preview, level, area)));
+            }
+            Err(error) => {
+                app.perf.gpu_fallback = Some(error.0);
+                return None;
+            }
+        }
+    }
+    if gpu.pending(output_key) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    Some(GpuView { key: output_key, factor, area })
+}
+
 /// What changed since a canvas cache showed (`revision`, `preview key`) `seen`, when only a
 /// rectangle did: the last edit's damage, or the live stroke's dabs since then. Cached keys have
 /// the colour display's key folded in (`^ display_key`); `now`'s is still raw.
 fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), now: (u64, u64), display_key: u64, last_damage: Option<DRect>) -> Option<DRect> {
     if seen.1 == now.1 ^ display_key && seen.0 + 1 == now.0 {
         return last_damage;
+    }
+    if seen.0 == now.0
+        && let Some(preview) = &app.filter_preview
+        && let Some(region) = &preview.region
+        && now.1 == (region.shown_hash | (1 << 59))
+    {
+        let reach = app.session.documents().get(idx).map_or(0, |st| effect_reach(&st.doc.layers));
+        return Some(region.damage.inflate(reach));
     }
     // Several edits since that frame: the union of their damage, when every one is known.
     if seen.1 == now.1 ^ display_key
@@ -544,7 +737,7 @@ fn gpu_budget(app: &mut PhotocraftApp, gpu: &crate::gpu_canvas::GpuCanvas, idx: 
 }
 
 /// Live preview for an open filter dialog: run the filter on the proxy and upload it.
-fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u64)> {
+fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, visible: DRect, zoom: f32) -> Option<(u32, u64)> {
     if crate::adjust_preview::on_layer(app, idx) {
         return None;
     }
@@ -558,6 +751,10 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u6
         let st = app.session.documents().get(idx)?;
         (st.doc.id, st.revision, st.doc.clone(), st.active_layer)
     };
+    if std::env::var("PHOTOCRAFT_FILTER_VIEW").as_deref() != Ok("0") && crate::filter_dialog::region::supported(&doc, active, &cmd) {
+        crate::filter_dialog::region::update(app, doc, revision, active, cmd, params, visible, zoom);
+        return None;
+    }
     let k = crate::proxy::factor(&doc);
     let hash = format!("{cmd}{params}").bytes().fold(k as u64 ^ revision.wrapping_mul(0x9e37), |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
     let key = doc_id.0 ^ (1u64 << 61);
@@ -578,7 +775,7 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u6
             app.gpu.as_ref()?.upload_buffer_full(key, &texture_buffer(display.as_deref(), &buf), doc.depth);
             app.perf.record("filter-preview", r.size.area(), t1 - t0, crate::gpu_canvas::now_ms() - t1);
         }
-        app.filter_preview = Some(crate::filter_dialog::FilterPreview { doc: doc_id, revision, hash, proxy, active, k, result });
+        app.filter_preview = Some(crate::filter_dialog::FilterPreview { doc: doc_id, revision, hash, proxy, active, k, result, region: None });
     }
     app.filter_preview.as_ref().filter(|p| p.result.is_some()).map(|p| (p.k, key))
 }
@@ -664,13 +861,20 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     if let Some(gpu) = &app.gpu {
         // Keep each document's texture plus its preview textures (filter preview, adjustment proxy);
         // retaining only document ids freed the previews every frame (blank canvas while previewing).
-        let mut live: Vec<u64> = app.session.documents().iter().flat_map(|st| [st.doc.id.0, st.doc.id.0 ^ (1u64 << 61), st.doc.id.0 ^ (1u64 << 62)]).collect();
+        let mut live: Vec<u64> = app
+            .session
+            .documents()
+            .iter()
+            .flat_map(|st| [st.doc.id.0, st.doc.id.0 ^ (1u64 << 61), st.doc.id.0 ^ (1u64 << 62), st.doc.id.0 ^ (1u64 << 56)])
+            .collect();
         live.extend(crate::adjust_preview::gpu_keys(app));
         gpu.retain(&live);
     }
     // Upload markers must not outlive the resources they describe: native reopen can reuse
     // both the document ID and revision before the next frame while a preview dialog stays open.
     let documents = app.session.documents();
+    app.view_textures.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
+    app.view_mips.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
     if app.filter_preview.as_ref().is_some_and(|preview| !documents.iter().any(|st| st.doc.id == preview.doc)) {
         app.filter_preview = None;
     }
@@ -994,12 +1198,14 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     let img_rect = xf.doc_rect(doc.bounds());
     // Live adjustment previews on big documents use a downsampled proxy (see proxy.rs).
     let mut on_gpu = false;
+    let filter_frame = ensure_filter_preview(app, idx, visible_doc_rect(&xf), view.zoom * ctx.pixels_per_point());
+    if app.filter_preview.as_ref().is_some_and(|p| p.region.as_ref().is_some_and(|r| r.pending())) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
     // A flipped view draws through the CPU path (the GPU canvas shader has no mirroring).
     if app.gpu.is_some()
         && !flip
-        && let Some((k, key)) = ensure_adjust_proxy(app, idx, view.zoom * ctx.pixels_per_point())
-            .or_else(|| ensure_filter_preview(app, idx))
-            .or_else(|| ensure_proxy_preview(app, idx))
+        && let Some((k, key)) = ensure_adjust_proxy(app, idx, view.zoom * ctx.pixels_per_point()).or(filter_frame).or_else(|| ensure_proxy_preview(app, idx))
     {
         on_gpu = true;
         let params = crate::gpu_canvas::ViewParams {
@@ -1017,7 +1223,25 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             hdr: hdr_preview(app, &doc),
         };
         crate::gpu_canvas::GpuCanvas::paint(&painter, rect, params);
-    } else if !flip && ensure_gpu(app, idx, visible_doc_rect(&xf), view.zoom * ctx.pixels_per_point()) {
+    } else if !flip && let Some(frame) = ensure_gpu_view(app, &ctx, idx, &xf, ui.id().with(ctx.viewport_id())) {
+        on_gpu = true;
+        let k = frame.factor as f32;
+        let params = crate::gpu_canvas::ViewParams {
+            doc: frame.key,
+            doc_size: [frame.area.width(), frame.area.height()],
+            zoom: view.zoom * k,
+            center: [view.center[0] / k - frame.area.x0 as f32, view.center[1] / k - frame.area.y0 as f32],
+            shadow: false,
+            pixel_grid,
+            view_key: egui::Id::new(("pc-canvas-viewport", ctx.viewport_id(), idx)).value(),
+            display: sync_display_lut(app, &doc, frame.key),
+            hdr: hdr_preview(app, &doc),
+        };
+        crate::gpu_canvas::GpuCanvas::paint(&painter, rect, params);
+    } else if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0")
+        && !flip
+        && ensure_gpu(app, idx, visible_doc_rect(&xf), view.zoom * ctx.pixels_per_point())
+    {
         if app.gpu.as_ref().is_some_and(|gpu| gpu.pending(doc.id.0)) {
             ctx.request_repaint();
         }
@@ -1053,7 +1277,12 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                 painter.rect_filled(img_rect, 0.0, Color32::WHITE);
             }
         }
-        if let Some((tex, _scale)) = ensure_texture(app, &ctx, idx) {
+        if let Some((tex, area)) = ensure_view_texture(app, &ctx, idx, &xf) {
+            let uv = if flip { Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0)) } else { Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)) };
+            painter.image(tex, xf.doc_rect(area), uv, Color32::WHITE);
+        } else if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0")
+            && let Some((tex, _scale)) = ensure_texture(app, &ctx, idx)
+        {
             let uv = if flip { Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0)) } else { Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)) };
             painter.image(tex, img_rect, uv, Color32::WHITE);
         }
@@ -1613,6 +1842,12 @@ fn sample_eyedropper(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifi
 
 /// Tool state machine. Shared by mouse input and automation.
 pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) {
+    if app.session.active().is_some_and(|st| st.busy) && !matches!(app.ui.tool, Tool::Hand | Tool::Zoom | Tool::Eyedropper) {
+        app.drag = None;
+        app.live_stroke = None;
+        app.ui.status = "Document is busy; pan and zoom remain available".into();
+        return;
+    }
     // View › Snap / Snap To and smart guides (snap_ui.rs).
     let ev = crate::snap_ui::filter_event(app, ev, mods);
     if crate::transform_tool::pointer(app, ev, mods) {

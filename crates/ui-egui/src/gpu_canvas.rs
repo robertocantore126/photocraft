@@ -189,6 +189,7 @@ pub struct GpuCanvas {
     rs: RenderState,
     tile: u32,
     high: HighPolicy,
+    filter_engine: std::sync::Arc<std::sync::OnceLock<Result<photocraft_gpu::filters::FilterEngine, photocraft_gpu::Unsupported>>>,
 }
 
 /// Can `adapter` use `Rgba16Float` as a sampled, filtered, render-target and copy texture?
@@ -228,7 +229,27 @@ impl GpuCanvas {
         }
         rs.renderer.write().callback_resources.insert(res);
         log::info!("gpu canvas: target {:?}, max texture {max}, tile {tile}, 16F canvas {high:?}", rs.target_format);
-        Self { rs: rs.clone(), tile, high }
+        Self { rs: rs.clone(), tile, high, filter_engine: std::sync::Arc::new(std::sync::OnceLock::new()) }
+    }
+
+    /// Filters read back only a bounded window, on the preview worker. Pipeline handles are
+    /// cached per GPU canvas, while unsupported devices/formats use the CPU algorithm.
+    pub fn filter_surface(
+        &self,
+        source: &photocraft_raster::Surface,
+        filter: photocraft_gpu::filters::Filter,
+        area: photocraft_geom::Rect,
+        extent: photocraft_geom::Rect,
+        selection: Option<&photocraft_raster::Surface>,
+    ) -> Result<photocraft_raster::Surface, photocraft_gpu::Unsupported> {
+        if std::env::var("PHOTOCRAFT_GPU_FILTERS").as_deref() == Ok("0") {
+            return Err(photocraft_gpu::Unsupported("GPU filters disabled".into()));
+        }
+        let engine = self.filter_engine.get_or_init(|| photocraft_gpu::filters::FilterEngine::new(&self.rs.device));
+        match engine {
+            Ok(engine) => engine.run_surface(&self.rs.device, &self.rs.queue, source, filter, area, extent, selection),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     /// The canvas texture format for a document of `depth` and `size`: `Rgba16Float` for 16/32-bit
@@ -424,8 +445,39 @@ impl GpuCanvas {
         encode_srgb: bool,
         level: u32,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        self.composite_output(doc, region, encode_srgb, level, None, doc.id.0)
+    }
+
+    /// Composite a bounded viewport texture while retaining source document coordinates.
+    pub fn composite_view(
+        &self,
+        doc: &photocraft_doc::Document,
+        region: photocraft_geom::Rect,
+        encode_srgb: bool,
+        key: u64,
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        let result = self.composite_output(doc, region, encode_srgb, 0, Some(region), key);
+        if result.is_ok() {
+            if let Some(res) = self.rs.renderer.write().callback_resources.get_mut::<Resources>() {
+                res.dirty.remove(&key);
+                res.coarse.remove(&key);
+            }
+        }
+        result
+    }
+
+    fn composite_output(
+        &self,
+        doc: &photocraft_doc::Document,
+        region: photocraft_geom::Rect,
+        encode_srgb: bool,
+        level: u32,
+        output: Option<photocraft_geom::Rect>,
+        key: u64,
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
         let (device, queue) = (&self.rs.device, &self.rs.queue);
-        let size = [doc.size.width, doc.size.height];
+        let output_rect = output.unwrap_or(doc.bounds());
+        let size = [output_rect.width(), output_rect.height()];
         if size[0] == 0 || size[1] == 0 {
             return Err(photocraft_gpu::Unsupported("empty document".into()));
         }
@@ -460,10 +512,9 @@ impl GpuCanvas {
         comp.set_acc_format(wanted);
         comp.set_focus(res.compositor_focus);
         comp.set_pixels_only(res.compositor_pixels_only);
-        let key = doc.id.0;
         let format = self.format_for(doc.depth, size);
         let fresh = res.docs.get(&key).is_none_or(|d| d.size != size || d.format != format);
-        let region = if fresh { doc.bounds() } else { region.intersect(&doc.bounds()) };
+        let region = if fresh { output_rect } else { region.intersect(&output_rect) };
         // No separate `supports` check: the render plans the document and checks its effects
         // before any GPU work and fails the same way (a fresh texture is dropped below). Checking
         // first planned all 479 layers of a PSB twice per brush dab.
@@ -480,6 +531,9 @@ impl GpuCanvas {
             let tex = DocTextures::new(device, res, size, self.tile, format);
             res.docs.insert(key, tex);
         }
+        if let Some(texture) = res.docs.get_mut(&key) {
+            texture.source_key = Some(doc.id.0);
+        }
         let (Some(pipe), Some(d)) = (res.encode_pipeline(format), res.docs.get(&key)) else {
             res.compositor = Some(comp);
             return Err(photocraft_gpu::Unsupported(format!("no {format:?} canvas texture or pipeline")));
@@ -489,7 +543,8 @@ impl GpuCanvas {
         let keep_hdr = i32::from(format == FORMAT_HIGH);
         let result = comp.render_at_mip(device, queue, doc, region, level, |enc, out| {
             for t in &d.tiles {
-                let [tx, ty, tw, th] = t.rect.map(|v| v as i32);
+                let [local_x, local_y, tw, th] = t.rect.map(|v| v as i32);
+                let (tx, ty) = (local_x + output_rect.x0, local_y + output_rect.y0);
                 let r = out.rect.intersect(&photocraft_geom::Rect::from_xywh(tx, ty, tw as u32, th as u32));
                 if r.is_empty() {
                     continue;
@@ -535,7 +590,17 @@ impl GpuCanvas {
         });
         if result.is_ok() {
             if level == 0 {
-                d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+                d.regenerate_mips(
+                    device,
+                    queue,
+                    res,
+                    [
+                        (region.x0 - output_rect.x0) as u32,
+                        (region.y0 - output_rect.y0) as u32,
+                        (region.x1 - output_rect.x0) as u32,
+                        (region.y1 - output_rect.y0) as u32,
+                    ],
+                );
             }
             // Wait for the GPU before returning. Without this, edits that arrive faster than the
             // GPU finishes them keep their upload staging in flight, and the driver's memory pool
@@ -718,7 +783,11 @@ impl GpuCanvas {
     pub fn pending(&self, key: u64) -> bool {
         let renderer = self.rs.renderer.read();
         renderer.callback_resources.get::<Resources>().is_some_and(|res| {
-            res.dirty.get(&key).is_some_and(|d| !d.rects.is_empty()) || res.compositor.as_ref().is_some_and(|c| c.effects_pending(photocraft_doc::DocId(key)))
+            res.dirty.get(&key).is_some_and(|d| !d.rects.is_empty())
+                || res
+                    .compositor
+                    .as_ref()
+                    .is_some_and(|c| c.effects_pending(photocraft_doc::DocId(res.docs.get(&key).and_then(|d| d.source_key).unwrap_or(key))))
         })
     }
 
@@ -728,11 +797,14 @@ impl GpuCanvas {
             && res.slice_frame.is_none_or(|(seen, _)| seen != frame)
         {
             res.slice_frame = Some((frame, false));
-            let keys: Vec<u64> = res.docs.keys().copied().collect();
+            let keys: Vec<(u64, u64)> = res.docs.iter().map(|(&key, d)| (key, d.source_key.unwrap_or(key))).collect();
             if let Some(compositor) = &mut res.compositor {
-                for key in keys {
-                    if let Some(damage) = compositor.take_effect_damage(photocraft_doc::DocId(key)) {
-                        res.dirty.entry(key).or_insert_with(|| DirtyRegions { side: SLICE, ..Default::default() }).add(damage);
+                let sources: std::collections::HashSet<u64> = keys.iter().map(|(_, source)| *source).collect();
+                for source in sources {
+                    if let Some(damage) = compositor.take_effect_damage(photocraft_doc::DocId(source)) {
+                        for &(key, _) in keys.iter().filter(|(_, s)| *s == source) {
+                            res.dirty.entry(key).or_insert_with(|| DirtyRegions { side: SLICE, ..Default::default() }).add(damage);
+                        }
                     }
                 }
             }
@@ -820,6 +892,17 @@ impl GpuCanvas {
     pub fn retain(&self, live: &[u64]) {
         let mut renderer = self.rs.renderer.write();
         let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return };
+        let mut keep = live.to_vec();
+        keep.extend(res.docs.iter().filter_map(|(&key, d)| d.source_key.filter(|source| live.contains(source)).map(|_| key)));
+        let sources: Vec<u64> = res.docs.iter().filter(|(key, _)| !keep.contains(key)).map(|(&key, d)| d.source_key.unwrap_or(key)).collect();
+        if let Some(c) = res.compositor.as_mut() {
+            for source in sources {
+                if !live.contains(&source) {
+                    c.forget_doc(photocraft_doc::DocId(source));
+                }
+            }
+        }
+        let live = keep.as_slice();
         if res.docs.keys().any(|k| !live.contains(k)) {
             let gone: Vec<u64> = res.docs.keys().filter(|k| !live.contains(k)).copied().collect();
             if let Some(c) = res.compositor.as_mut() {
@@ -1336,6 +1419,7 @@ struct ViewGpu {
 }
 
 struct DocTextures {
+    source_key: Option<u64>,
     /// During refinement only this mip is valid across the coarse preview.
     preview_level: Option<u32>,
     size: [u32; 2],
@@ -1595,7 +1679,7 @@ impl DocTextures {
                 tiles.push(Tile { rect: [tx, ty, w, h], texture, levels, bind_group, _uniform: uniform });
             }
         }
-        Self { size, format, tiles, preview_level: None }
+        Self { size, format, tiles, preview_level: None, source_key: None }
     }
 
     /// Write `size` pixels at document `origin` from `texels` (in the texture format, row stride

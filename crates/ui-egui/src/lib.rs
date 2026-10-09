@@ -255,6 +255,8 @@ pub struct PhotocraftApp {
     thumb_documents: Vec<(DocId, std::sync::Weak<Document>)>,
     /// Content bounds cached per (key, revision): scanning a 36 MP layer every frame cost ~77 ms.
     bounds_cache: HashMap<u64, (u64, photocraft_geom::Rect)>,
+    pub(crate) view_textures: HashMap<(DocId, u64), canvas::ViewTexture>,
+    pub(crate) view_mips: HashMap<(DocId, u64), canvas::MipDocument>,
     /// Downsampled proxy of the active document for live previews: (doc, revision, k, proxy).
     pub(crate) proxy: Option<(DocId, u64, u32, std::sync::Arc<Document>)>,
     /// Key of the preview currently uploaded to the GPU (doc, params hash).
@@ -356,6 +358,8 @@ impl PhotocraftApp {
             thumb_queue: thumbs::ThumbQueue::default(),
             thumb_documents: Vec::new(),
             bounds_cache: HashMap::new(),
+            view_textures: HashMap::new(),
+            view_mips: HashMap::new(),
             proxy: None,
             proxy_uploaded: None,
             outline_cache: None,
