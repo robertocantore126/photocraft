@@ -47,6 +47,14 @@ impl PhotocraftApp {
     /// Read and open the file at `path` (see [`open_file`](Self::open_file)).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &str) -> Result<Vec<String>, String> {
+        if !crate::preset_files_ui::is_preset_file(path) && photocraft_engine::jobs::enabled()
+            && !self.automation_input && !self.jobs.force_sync
+            && let Some(import) = self.services.background_import.clone() {
+            self.jobs.io.open(path.into(), import)?;
+            self.ui.status = format!("Opening {path}");
+            self.ui.status_error = false;
+            return Ok(Vec::new());
+        }
         if !crate::preset_files_ui::is_preset_file(path)
             && let Some(import) = self.services.import_path.as_ref()
         {

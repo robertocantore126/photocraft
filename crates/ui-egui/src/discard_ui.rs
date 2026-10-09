@@ -19,6 +19,7 @@ pub struct Prompt {
     /// The document the command was aimed at (`document` param, else the active one), if it has one.
     target: Option<DocId>,
     docs: Vec<DocId>,
+    saving: bool,
 }
 
 fn index_of(app: &PhotocraftApp, id: DocId) -> Option<usize> {
@@ -63,7 +64,7 @@ pub fn intercept(app: &mut PhotocraftApp, id: &str, params: &Value) -> bool {
     if docs.is_empty() {
         return false;
     }
-    let prompt = Prompt { id: id.to_string(), params: params.clone(), target, docs };
+    let prompt = Prompt { id: id.to_string(), params: params.clone(), target, docs, saving: false };
     match &app.discard {
         None => app.discard = Some(prompt),
         // Quitting overrides whatever is pending: it covers every document, so nothing is lost.
@@ -133,6 +134,14 @@ fn save(app: &mut PhotocraftApp, ctx: &egui::Context, doc: DocId) -> bool {
 pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let Some(p) = &app.discard else { return };
     let Some(&doc) = p.docs.first() else { return };
+    if p.saving {
+        let state = index_of(app, doc).and_then(|i| app.session.documents().get(i));
+        if state.is_some_and(|st| st.busy) { ctx.request_repaint_after(std::time::Duration::from_millis(16)); return; }
+        let saved = state.is_none_or(|st| !st.is_dirty());
+        if let Some(prompt) = app.discard.as_mut() { prompt.saving = false; }
+        if saved { advance(app, ctx); return; }
+    }
+    let Some(p) = &app.discard else { return };
     let (exits, reverts) = (p.id == EXIT, p.id == "file.revert");
     let Some(name) = index_of(app, doc).map(|i| app.session.documents()[i].doc.name.clone()) else {
         // Closed by something else while the prompt was up: nothing left to ask about.
@@ -169,8 +178,12 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     cancel |= modal.should_close();
     if cancel {
         app.discard = None;
-    } else if discard_it || (save_it && save(app, ctx, doc)) {
+    } else if discard_it {
         advance(app, ctx);
+    } else if save_it && save(app, ctx, doc) {
+        if index_of(app, doc).and_then(|i| app.session.documents().get(i)).is_some_and(|st| st.busy) {
+            if let Some(prompt) = app.discard.as_mut() { prompt.saving = true; }
+        } else { advance(app, ctx); }
     }
 }
 

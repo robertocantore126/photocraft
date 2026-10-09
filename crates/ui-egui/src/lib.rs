@@ -38,6 +38,8 @@ pub mod enable_rules;
 pub mod eraser_ui;
 pub mod export_dialog;
 pub mod file_open;
+mod jobs;
+mod io_jobs;
 pub mod file_ui;
 pub mod filter_dialog;
 pub mod gallery_ui;
@@ -117,6 +119,9 @@ pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<(Document, Vec<String>), S
 /// [`ImportFn`] that owns the bytes, so the importer can free them early (see
 /// `photocraft_io::import_owned`).
 /// Native path importer retaining lazy pack handles.
+/// Thread-safe worker services are additive; capability-scoped automation keeps its own hooks.
+pub type BackgroundImportFn = std::sync::Arc<dyn Fn(&str, &photocraft_engine::jobs::Progress, &(dyn Fn(Document) + Send + Sync)) -> Result<(Document, Vec<String>), String> + Send + Sync>;
+pub type BackgroundSaveFn = std::sync::Arc<dyn Fn(&Document, &str, bool, &photocraft_engine::jobs::Progress) -> Result<Vec<String>, String> + Send + Sync>;
 pub type ImportPathFn = Box<dyn Fn(&str) -> Result<(Document, Vec<String>), String>>;
 /// Streaming native document save.
 pub type SavePathFn = Box<dyn Fn(&Document, &str, bool) -> Result<Vec<String>, String>>;
@@ -173,6 +178,8 @@ pub struct Services {
     /// Preferred over `import` when the caller read the file itself and can hand the bytes over.
     pub import_owned: Option<ImportOwnedFn>,
     pub import_path: Option<ImportPathFn>,
+    pub background_import: Option<BackgroundImportFn>,
+    pub background_save: Option<BackgroundSaveFn>,
     pub save_path: Option<SavePathFn>,
     pub pick_open_path: Option<PickOpenPathFn>,
     pub automation_import_path: Option<ImportPathFn>,
@@ -219,6 +226,7 @@ pub struct Services {
 
 pub struct PhotocraftApp {
     pub session: Session,
+    jobs: jobs::Jobs,
     pub ui: UiState,
     pub services: Services,
     canvases: HashMap<DocId, canvas::CanvasCache>,
@@ -334,6 +342,7 @@ impl PhotocraftApp {
     pub fn new(session: Session, services: Services) -> Self {
         let mut app = Self {
             session,
+            jobs: Default::default(),
             ui: UiState::default(),
             services,
             canvases: HashMap::new(),
@@ -442,7 +451,18 @@ impl PhotocraftApp {
                 return Ok(serde_json::json!({"pasted": false}));
             }
         }
-        let r = self.session.execute(id, params).map_err(|e| e.to_string());
+        let r = if !self.automation_input && !self.jobs.force_sync {
+            match self.session.prepare_job(id, params.clone()) {
+                Ok(Some(prepared)) => {
+                    let before = prepared.before.clone();
+                    let result = self.jobs.start(prepared);
+                    if result.is_err() { self.session.release_job(&before); }
+                    result
+                }
+                Ok(None) => self.session.execute(id, params).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else { self.session.execute(id, params).map_err(|e| e.to_string()) };
         if r.is_ok() && matches!(id, "edit.copy" | "edit.cut" | "edit.copyMerged") {
             self.clip_external = false;
             self.export_os_clipboard();
@@ -576,7 +596,9 @@ impl PhotocraftApp {
         if events_enabled {
             self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
         }
+        let sync = std::mem::replace(&mut self.jobs.force_sync, true);
         let result = self.run(id, params);
+        self.jobs.force_sync = sync;
         if events_enabled {
             self.session.edit_prefs(|prefs| prefs.script_events.enabled = true);
         }
@@ -617,6 +639,16 @@ impl PhotocraftApp {
             Some(p) => p,
             None => self.services.pick_save.as_mut().and_then(|f| f(&suggested)).ok_or("cancelled")?,
         };
+        if st.busy { return Err("document is busy".into()); }
+        #[cfg(not(target_arch = "wasm32"))]
+        if photocraft_engine::jobs::enabled() && !self.automation_input && !self.jobs.force_sync
+            && let Some(save) = self.services.background_save.clone() {
+            self.jobs.io.save(st.doc.clone(), st.revision, path.clone(), st.path.as_deref() != Some(path.as_str()), save)?;
+            if let Some(st) = self.session.active_mut() { st.busy = true; }
+            self.ui.status = format!("Saving {path}");
+            self.ui.status_error = false;
+            return Ok((path, Vec::new()));
+        }
         let warnings = if let Some(save) = self.services.save_path.as_ref() {
             save(&st.doc, &path, st.path.as_deref() != Some(path.as_str()))?
         } else {
@@ -740,6 +772,7 @@ impl eframe::App for PhotocraftApp {
             self.fonts_ready = true;
         }
         self.frame += 1;
+        self.poll_jobs(ctx);
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame_time) as f32;
         if dt > 0.0 {

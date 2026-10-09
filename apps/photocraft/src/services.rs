@@ -107,6 +107,15 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
         }) as photocraft_ui_egui::AutomationCommandFn
     });
     Services {
+        background_import: Some(Arc::new(|path, progress, _preview| {
+            if progress.is_cancelled() { return Err("cancelled".into()); }
+            progress.set_fraction(0.05);
+            let result = photocraft_io::import_path(Path::new(path)).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string());
+            if progress.is_cancelled() { return Err("cancelled".into()); }
+            progress.set_fraction(1.0);
+            result
+        })),
+        background_save: Some(Arc::new(save_background)),
         import: Some(Box::new(|name: &str, bytes: &[u8]| {
             crate::crash_guard::guard("Open", || photocraft_io::import(name, bytes).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
         })),
@@ -283,4 +292,35 @@ pub fn export_flat(doc: &Document, path: &str) -> Result<Vec<u8>, String> {
         _ => img,
     };
     photocraft_codecs::encode(&img, format, &EncodeOptions::default()).map_err(|e| e.to_string())
+}
+
+/// Stage every background save next to its destination, then commit by the same rename
+/// primitive as the pack writer. A failed/cancelled job never removes the original file.
+fn save_background(doc: &Document, path: &str, _compact: bool, progress: &photocraft_engine::jobs::Progress) -> Result<Vec<String>, String> {
+    if progress.is_cancelled() { return Err("cancelled".into()); }
+    let destination = Path::new(path);
+    if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let extension = destination.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "psd".into());
+    let temporary = destination.with_extension(format!("photocraft-job-{}-{stamp}-{serial}.{extension}", std::process::id()));
+    let reserved = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+    drop(reserved);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    let _cleanup = Cleanup(temporary.clone());
+    progress.set_fraction(0.1);
+    let warnings = photocraft_engine::jobs::with_progress(progress, || {
+        if extension.eq_ignore_ascii_case("pcraft") {
+            photocraft_format::pack::save_compact_path(doc, &temporary, &Default::default()).map(|_| Vec::new()).map_err(|e| e.to_string())
+        } else { photocraft_io::export_path(doc, &temporary, &Default::default()).map_err(|e| e.to_string()) }
+    })?;
+    progress.set_fraction(0.95);
+    if progress.is_cancelled() { return Err("cancelled; destination preserved".into()); }
+    std::fs::rename(&temporary, destination).map_err(|e| format!("could not replace destination; original preserved: {e}"))?;
+    progress.set_fraction(1.0);
+    Ok(warnings)
 }

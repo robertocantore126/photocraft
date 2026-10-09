@@ -418,6 +418,10 @@ fn saves_in_place(path: &str) -> bool {
 }
 
 pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
+    if app.session.active().is_some_and(|st| st.busy)
+        && (id.starts_with("file.save") || id.starts_with("file.export.") || id.starts_with("edit.transform.")
+            || matches!(id, "edit.freeTransform" | "edit.paste" | "edit.pasteSpecial.pasteInPlace")) { return false; }
+
     // Photoshop greys these for the Background layer, other layer kinds or single-layer documents.
     if crate::enable_rules::disabled(app, id) {
         return false;
