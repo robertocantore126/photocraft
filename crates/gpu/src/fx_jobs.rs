@@ -45,7 +45,7 @@ pub(crate) enum Poll {
 
 pub(crate) struct Jobs {
     sender: Option<mpsc::SyncSender<Request>>,
-    receiver: mpsc::Receiver<Reply>,
+    receiver: Mutex<mpsc::Receiver<Reply>>,
     stopped: Arc<AtomicBool>,
     pending: HashMap<(DocId, FxKey), Pending>,
     damage: HashMap<DocId, Rect>,
@@ -94,11 +94,11 @@ impl Jobs {
                 return Err(error);
             }
         }
-        Ok(Self { sender: Some(sender), receiver, stopped, pending: HashMap::new(), damage: HashMap::new(), serial: 0 })
+        Ok(Self { sender: Some(sender), receiver: Mutex::new(receiver), stopped, pending: HashMap::new(), damage: HashMap::new(), serial: 0 })
     }
 
     pub fn collect(&mut self) {
-        while let Ok(reply) = self.receiver.try_recv() {
+        while let Ok(reply) = self.receiver.get_mut().unwrap_or_else(PoisonError::into_inner).try_recv() {
             let Some(pending) = self.pending.get_mut(&reply.key).filter(|p| p.serial == reply.serial) else { continue };
             pending.reply = Some(reply.inputs);
             self.damage.entry(reply.key.0).and_modify(|r| *r = r.union(&reply.region)).or_insert(reply.region);
