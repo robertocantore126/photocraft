@@ -178,7 +178,7 @@ pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), Strin
 pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
     let job = prepare_job(s, id, p)?;
     let label = job.label.clone();
-    let progress = crate::jobs::Progress::default();
+    let progress = photocraft_algo::progress::current().unwrap_or_default();
     s.edit(&label, move |doc, active| job.run(doc, active, &progress))
 }
 
@@ -213,7 +213,7 @@ pub(crate) fn prepare_job(s: &Session, id: &str, p: &Value) -> Result<crate::job
             let content = surf.content_bounds();
             let area = algo::output_area(&fp, content, bounds, sel_bounds);
             *surf = algo::apply_in(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content));
-            return Ok(json!({ "layer": layer.0 }));
+            return Ok(json!({ "layer": layer.0, "filter": serde_json::to_value(&fp).unwrap_or(Value::Null) }));
         }
         let l = doc.layer_mut(layer).ok_or(EngineError::NoLayer(layer))?;
         crate::filters_ext::resolve_in_layer(&mut fp, l, bounds);
@@ -224,7 +224,7 @@ pub(crate) fn prepare_job(s: &Session, id: &str, p: &Value) -> Result<crate::job
                 let sf =
                     SmartFilter { command: id.to_string(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
                 crate::smart_cmds::add_smart_filter(doc, layer, sf, selection.as_ref())?;
-                return Ok(json!({ "layer": layer.0 }));
+                return Ok(json!({ "layer": layer.0, "filter": serde_json::to_value(&fp).unwrap_or(Value::Null) }));
             }
             _ => return Err(EngineError::Other("not a pixel layer".into())),
         };

@@ -70,17 +70,22 @@ impl PhotocraftApp {
                 running.progress.cancel();
             }
             match running.receiver.try_recv() {
-                Ok((prepared, result)) => match self.session.finish_job(prepared, result) {
-                    Ok(_) => {
-                        self.ui.status = format!("{} complete", running.label);
-                        self.ui.status_error = false;
-                        self.sync_views();
+                Ok((prepared, result)) => {
+                    // Esc can arrive after the worker sent its result but before this frame
+                    // collects it. Cancelled snapshots must never reach history or the canvas.
+                    let result = if running.progress.is_cancelled() { Err(photocraft_engine::EngineError::Other("cancelled".into())) } else { result };
+                    match self.session.finish_job(prepared, result) {
+                        Ok(_) => {
+                            self.ui.status = format!("{} complete", running.label);
+                            self.ui.status_error = false;
+                            self.sync_views();
+                        }
+                        Err(error) => {
+                            self.ui.status = error.to_string();
+                            self.ui.status_error = true;
+                        }
                     }
-                    Err(error) => {
-                        self.ui.status = error.to_string();
-                        self.ui.status_error = true;
-                    }
-                },
+                }
                 Err(TryRecvError::Empty) => pending.push(running),
                 Err(TryRecvError::Disconnected) => {
                     self.session.release_job(&running.before);
