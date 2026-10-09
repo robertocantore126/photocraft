@@ -134,11 +134,11 @@ fn reach(layers: &[Layer], depth: u32) -> i32 {
         .iter()
         .filter(|layer| layer.visible)
         .map(|l| {
-            let own = if crate::effects::has_effects(l) { crate::effects::margin(l) } else { 0 };
+            let own = crate::effects::source_margin(l);
             let children = if let LayerContent::Group(g) = &l.content { reach(&g.children, depth + 1) } else { 0 };
             let mask_feather =
                 l.mask.as_ref().filter(|m| m.enabled).map_or(0.0, |m| m.feather).max(l.vector_mask.as_ref().filter(|m| m.enabled).map_or(0.0, |m| m.feather));
-            let mask_halo = (mask_feather.max(0.0).min(1_000_000.0) * 4.0).ceil() as i32;
+            let mask_halo = crate::masks::feather_halo(mask_feather);
             own.saturating_add(mask_halo).saturating_add(children)
         })
         .max()

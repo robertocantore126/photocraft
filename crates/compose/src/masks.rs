@@ -28,14 +28,16 @@ fn cache() -> &'static Mutex<Cache> {
 /// Entries kept (least recently used dropped first).
 const CAPACITY: usize = 64;
 
-fn key(layer: &Layer, canvas: Rect) -> u64 {
+fn key(layer: &Layer, canvas: Rect, output: Option<Rect>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     layer.id.0.hash(&mut h);
+    output.map(|r| (r.x0, r.y0, r.x1, r.y1)).hash(&mut h);
     (canvas.x0, canvas.y0, canvas.x1, canvas.y1).hash(&mut h);
     format!("{:?}", layer.vector_mask).hash(&mut h);
     if let Some(m) = &layer.mask {
         (m.enabled, m.density.to_bits(), m.feather.to_bits()).hash(&mut h);
         format!("{:?}", m.surface.default_pixel()).hash(&mut h);
+        m.surface.content_bounds_hint().map(|r| (r.x0, r.y0, r.x1, r.y1)).hash(&mut h);
         for (c, t) in m.surface.tiles() {
             (c.tx, c.ty, Arc::as_ptr(t) as usize).hash(&mut h);
         }
@@ -97,13 +99,31 @@ fn gaussian(v: &mut [f32], w: usize, h: usize, sigma: f32) {
 /// `None` when the layer has no enabled vector mask and no feathered pixel mask (use the pixel
 /// mask directly). Values outside the computed area are the surface's default.
 pub fn combined_mask(layer: &Layer, canvas: Rect) -> Option<Surface> {
+    combined_mask_impl(layer, canvas, None)
+}
+
+/// Combined mask for an output rectangle, reading the exact three-box feather halo.
+/// Canvas clipping and the default outside value are identical to `combined_mask`.
+pub fn combined_mask_region(layer: &Layer, canvas: Rect, output: Rect) -> Option<Surface> {
+    combined_mask_impl(layer, canvas, Some(output))
+}
+
+/// Three box passes each sample at most this many source pixels away on either axis.
+pub fn feather_halo(px: f32) -> i32 {
+    let sigma = feather_sigma(px);
+    let ideal = (4.0 * sigma * sigma + 1.0).sqrt();
+    let radius = (((ideal.floor() as u32) | 1).max(1) - 1) / 2;
+    radius.saturating_mul(3).saturating_add(2) as i32
+}
+
+fn combined_mask_impl(layer: &Layer, canvas: Rect, output: Option<Rect>) -> Option<Surface> {
     let vm = layer.vector_mask.as_ref().filter(|v| v.enabled);
     let pixel = layer.mask.as_ref().filter(|m| m.enabled);
     let (sv, sp) = (vm.map_or(0.0, |v| feather_sigma(v.feather)), pixel.map_or(0.0, |m| feather_sigma(m.feather)));
     if vm.is_none() && sp <= 0.0 {
         return None;
     }
-    let k = key(layer, canvas);
+    let k = key(layer, canvas, output);
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.tick += 1;
@@ -143,7 +163,11 @@ pub fn combined_mask(layer: &Layer, canvas: Rect) -> Option<Surface> {
             area.union(&b)
         };
     }
-    let area = area.intersect(&canvas);
+    let mut area = area.intersect(&canvas);
+    if let Some(output) = output {
+        let halo = feather_halo(sv).max(feather_halo(sp));
+        area = area.intersect(&output.inflate(halo));
+    }
     let mut s = Surface::with_default(FORMAT, &[p_def * v_out]);
     if !area.is_empty() {
         let (w, h) = (area.width() as usize, area.height() as usize);

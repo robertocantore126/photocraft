@@ -54,6 +54,51 @@ pub fn margin(layer: &Layer) -> i32 {
     m.clamp(0.0, MAX_REACH).ceil() as i32 + 2
 }
 
+/// Input halo required to evaluate the effect stack at an output pixel. Unlike `margin`,
+/// this follows actual kernel support, including both tent passes and bevel derivatives.
+/// It does not allocate a kernel just to discover its radius.
+pub fn source_margin(layer: &Layer) -> i32 {
+    if !has_effects(layer) {
+        return 0;
+    }
+    let positive = |v: f32| if v.is_finite() { f64::from(v.max(0.0)) } else { 0.0 };
+    let tent_support = |v: f32| {
+        if v.is_finite() { 2.0 * ((f64::from(v.max(1.0)) - 1.0) / 2.0).ceil().max(0.0) } else { 0.0 }
+    };
+    let spread_support = |size: f32, spread: f32| {
+        let (radius, width) = spread_split(size, spread);
+        positive(radius).ceil() + tent_support(width)
+    };
+    let mut reach = 0.0f64;
+    for effect in layer.effects.items.iter().filter(|effect| effect.enabled()) {
+        let radius = match effect {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => positive(s.distance.abs()).ceil() + spread_support(s.size, s.spread),
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => {
+                if g.technique == GlowTechnique::Precise {
+                    positive(g.size).ceil()
+                } else {
+                    spread_support(g.size, g.spread)
+                }
+            }
+            Effect::Stroke(s) => positive(s.size).ceil(),
+            Effect::Satin(s) => positive(s.distance.abs()).ceil() + tent_support(s.size),
+            Effect::BevelEmboss(b) => {
+                let geom = bevel_geom(b);
+                let height = if b.technique == BevelTechnique::Smooth {
+                    tent_support(geom.width)
+                } else {
+                    positive(b.size.max(1.0)).ceil() + tent_support(geom.chisel_soft)
+                };
+                height + if b.soften >= 1.0 { tent_support(b.soften) } else { 0.0 } + 1.0
+            }
+            _ => 0.0,
+        };
+        reach = reach.max(radius);
+    }
+    // Distance seed coverage and bilinear offsets need a small boundary neighbourhood.
+    (reach + 3.0).min(f64::from(i32::MAX)) as i32
+}
+
 /// Maximum distance (px) an effect is rendered from the layer's shape.
 pub const MAX_REACH: f32 = 512.0;
 
@@ -965,9 +1010,9 @@ fn bevel_maps(shape: &Map, b: &Bevel, light: &GlobalLight, tex: &TextureCtx, pat
     (maps, g.paint)
 }
 
-/// Effect maps derived from a layer's shape (its alpha), computed once over the layer's whole
-/// region and cropped per render tile. They depend only on the shape, the effect settings and the
-/// global light, never on the backdrop, so they can be cached across tiles and edits.
+/// Effect maps derived from a layer's shape (its alpha), computed over a halo-expanded
+/// region and cropped to the requested output tile. They depend only on the shape, effect
+/// settings and global light, never on the backdrop, so they can be cached across tiles and edits.
 pub struct FxMaps {
     rect: Rect,
     shape: Map,

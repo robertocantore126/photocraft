@@ -531,9 +531,13 @@ pub fn paint_bounds(layer: &Layer) -> Option<Rect> {
 /// The layer's effective mask over `rect` (row-major), read once per tile: the pixel mask
 /// times the rasterized vector mask.
 fn mask_vals(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Vec<f32>> {
-    // Feathers blur across tiles: read the cached, canvas-wide combined mask.
+    // Feather input includes the full three-pass support around this output rectangle.
     if masks::has_feather(layer)
-        && let Some(s) = masks::combined_mask(layer, cx.canvas)
+        && let Some(s) = if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").ok().as_deref() == Some("0") {
+            masks::combined_mask(layer, cx.canvas)
+        } else {
+            masks::combined_mask_region(layer, cx.canvas, rect)
+        }
     {
         let mut v = Vec::new();
         s.read_region_into(rect, &mut v);
@@ -963,13 +967,13 @@ fn composite_layer_plain(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer
     }
 
     if effects::has_effects(layer) {
-        // Neighbourhoods are already captured by the full-region effect maps;
+        // Neighbourhoods are captured by the halo-expanded effect maps;
         // content and effect application only need the output rectangle.
         let Some(mut content) = render_content(layer, rect, cx) else { return };
         for c in clipped.iter().filter(|c| c.visible) {
             composite_atop(c, &mut content, cx);
         }
-        let maps = effect_maps(layer, cx);
+        let maps = effect_maps(layer, rect, cx);
         effects::composite_with_effects_prepared(
             layer,
             &content,
@@ -1034,6 +1038,8 @@ fn layer_identity(layer: &Layer, h: &mut std::collections::hash_map::DefaultHash
     fn surface_fp(s: &Surface) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         s.format().hash(&mut h);
+        // Display proxies may share local pixels while their global effect anchor moves.
+        s.content_bounds_hint().map(|r| (r.x0, r.y0, r.x1, r.y1)).hash(&mut h);
         // Missing tiles read the default pixel, so tile identity alone is not pixel identity.
         for sample in s.default_pixel() {
             sample.to_bits().hash(&mut h);
@@ -1121,12 +1127,17 @@ fn fx_cache() -> &'static std::sync::Mutex<FxCache> {
     C.get_or_init(|| std::sync::Mutex::new(FxCache { map: Default::default(), order: Default::default(), bytes: 0 }))
 }
 
-/// The layer's effect maps over its whole region (layer bounds grown by the effect reach, within
-/// the canvas grown likewise), built once per layer state and shared by every tile.
-fn effect_maps(layer: &Layer, cx: &Ctx) -> std::sync::Arc<effects::FxMaps> {
+/// Effect maps over the requested output plus exact kernel support. Global shape bounds
+/// remain separate: cropping a map must never move a gradient or linked pattern anchor.
+fn effect_maps(layer: &Layer, output: Rect, cx: &Ctx) -> std::sync::Arc<effects::FxMaps> {
     use std::hash::{Hash, Hasher};
     let m = effects::margin(layer);
-    let region = layer_bounds(layer, cx.canvas).inflate(m).intersect(&cx.canvas.inflate(m));
+    let full = layer_bounds(layer, cx.canvas).inflate(m).intersect(&cx.canvas.inflate(m));
+    let region = if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").ok().as_deref() == Some("0") {
+        full
+    } else {
+        full.intersect(&output.inflate(effects::source_margin(layer)))
+    };
     if std::env::var_os("PHOTOCRAFT_FX_NOCACHE").is_some() {
         let shape = render_content(layer, region, cx).map(|b| b.px.iter().map(|p| p[3]).collect()).unwrap_or_default();
         return std::sync::Arc::new(effects::build_maps_prepared(layer, shape, region, &cx.light, &texture_ctx(layer, region, cx), cx.patterns));
@@ -1219,10 +1230,10 @@ fn composite_atop_any(layer: &Layer, base: &mut Buffer, cx: &Ctx) {
     if effects::has_effects(layer) {
         // Effects of a clipped layer are clipped to the base too: render
         // them over the base (treated as opaque) and keep the base's alpha.
-        // The full-region effect maps already capture their neighbourhoods.
+        // The halo-expanded effect maps capture their neighbourhoods.
         let Some(content) = render_content(layer, rect, cx) else { return };
         let mut opaque = Buffer { rect, px: base.px.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect() };
-        let maps = effect_maps(layer, cx);
+        let maps = effect_maps(layer, rect, cx);
         effects::composite_with_effects_prepared(
             layer,
             &content,
