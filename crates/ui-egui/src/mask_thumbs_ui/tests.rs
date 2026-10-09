@@ -71,7 +71,10 @@ fn rows_show_both_mask_thumbnails_with_chains_and_cache_the_vector_one() {
         assert!(thumbs[0].1.right() <= chains[1].1.left() + 0.01);
         let row = crate::layer_row_ui::recorded(&h.ctx).into_iter().find(|r| r.layer == masked).unwrap();
         assert!(row.name.unwrap().left() >= thumbs[1].1.right(), "@{ppp}x the name starts after the masks");
-        assert!(h.state().thumbs.contains_key(&(photocraft_doc::LayerId(masked), THUMB_VECTOR)), "vector thumbnail cached");
+        assert!(
+            h.state().thumbs.contains_key(&(h.state().session.active().unwrap().doc.id, photocraft_doc::LayerId(masked), THUMB_VECTOR)),
+            "vector thumbnail cached"
+        );
     }
 }
 
@@ -79,7 +82,7 @@ fn rows_show_both_mask_thumbnails_with_chains_and_cache_the_vector_one() {
 fn deleting_the_vector_mask_prunes_its_thumbnail() {
     let (s, masked, _) = session();
     let mut h = harness(s, 0, 1.0, 290.0);
-    let key = (photocraft_doc::LayerId(masked), THUMB_VECTOR);
+    let key = (h.state().session.active().unwrap().doc.id, photocraft_doc::LayerId(masked), THUMB_VECTOR);
     assert!(h.state().thumbs.contains_key(&key));
     h.state_mut().run("layer.vectorMask.delete", json!({"layer": masked})).unwrap();
     h.run_steps(3);

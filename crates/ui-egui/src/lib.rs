@@ -249,7 +249,7 @@ pub struct PhotocraftApp {
     pub last_canvas_rect: egui::Rect,
     pub fps: f32,
     last_frame_time: f64,
-    thumbs: HashMap<(photocraft_doc::LayerId, u8), (u64, egui::TextureHandle)>,
+    thumbs: HashMap<thumbs::Key, (u64, egui::TextureHandle)>,
     thumb_queue: thumbs::ThumbQueue,
     /// Snapshots whose live layer/mask keys were last used to prune thumbnail handles.
     thumb_documents: Vec<(DocId, std::sync::Weak<Document>)>,
@@ -898,17 +898,17 @@ impl PhotocraftApp {
         // tracks replacement (including undo and preserved-ID reopen) without retaining pixels.
         if !self.thumbs.is_empty() {
             let mut live = std::collections::HashSet::new();
-            let mut pending: Vec<_> = documents.iter().flat_map(|st| &st.doc.layers).collect();
-            while let Some(layer) = pending.pop() {
-                live.insert((layer.id, mask_thumbs_ui::THUMB_LAYER));
+            let mut pending: Vec<_> = documents.iter().flat_map(|st| st.doc.layers.iter().map(move |layer| (st.doc.id, layer))).collect();
+            while let Some((doc_id, layer)) = pending.pop() {
+                live.insert((doc_id, layer.id, mask_thumbs_ui::THUMB_LAYER));
                 if layer.mask.is_some() {
-                    live.insert((layer.id, mask_thumbs_ui::THUMB_MASK));
+                    live.insert((doc_id, layer.id, mask_thumbs_ui::THUMB_MASK));
                 }
                 if layer.vector_mask.is_some() {
-                    live.insert((layer.id, mask_thumbs_ui::THUMB_VECTOR));
+                    live.insert((doc_id, layer.id, mask_thumbs_ui::THUMB_VECTOR));
                 }
                 if let Some(children) = layer.children() {
-                    pending.extend(children);
+                    pending.extend(children.iter().map(|layer| (doc_id, layer)));
                 }
             }
             // Native files can restore IDs: retain the union across all open documents, rather
@@ -930,7 +930,7 @@ impl PhotocraftApp {
         // Key by content, not document revision: COW tiles change pointer only when their pixels
         // change, so unrelated edits (e.g. painting another layer) don't rebuild this thumbnail.
         let rev = layer.surface().map_or(0, surface_fingerprint) ^ (doc.size.width as u64).rotate_left(40) ^ (doc.size.height as u64).rotate_left(20);
-        let key = (layer.id, mask_thumbs_ui::THUMB_LAYER);
+        let key = (doc.id, layer.id, mask_thumbs_ui::THUMB_LAYER);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
@@ -953,7 +953,7 @@ impl PhotocraftApp {
 
     pub fn mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: photocraft_doc::LayerId, mask: &photocraft_doc::LayerMask) -> egui::TextureId {
         let rev = surface_fingerprint(&mask.surface) ^ (doc.size.width as u64).rotate_left(40) ^ (doc.size.height as u64).rotate_left(20);
-        let key = (id, mask_thumbs_ui::THUMB_MASK);
+        let key = (doc.id, id, mask_thumbs_ui::THUMB_MASK);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
@@ -985,7 +985,7 @@ impl PhotocraftApp {
         if let Some((_, texture)) = self.thumbs.get(&key) {
             return texture.id();
         }
-        // The sentinel never equals a content revision, so the placeholder cannot suppress work.
+        // The placeholder revision differs from this request and cannot suppress its work.
         self.store_thumb(ctx, key, !revision, egui::ColorImage::new([64, 64], vec![egui::Color32::TRANSPARENT; 64 * 64]))
     }
     fn collect_thumbs(&mut self, ctx: &egui::Context) {
@@ -1002,7 +1002,7 @@ impl PhotocraftApp {
         }
     }
 
-    fn store_thumb(&mut self, ctx: &egui::Context, key: (photocraft_doc::LayerId, u8), rev: u64, img: egui::ColorImage) -> egui::TextureId {
+    fn store_thumb(&mut self, ctx: &egui::Context, key: thumbs::Key, rev: u64, img: egui::ColorImage) -> egui::TextureId {
         match self.thumbs.get_mut(&key) {
             Some((r, tex)) => {
                 tex.set(img, egui::TextureOptions::LINEAR);
@@ -1010,7 +1010,7 @@ impl PhotocraftApp {
                 tex.id()
             }
             None => {
-                let tex = ctx.load_texture(format!("thumb-{}-{}", key.0.0, key.1), img, egui::TextureOptions::LINEAR);
+                let tex = ctx.load_texture(format!("thumb-{}-{}-{}", key.0.0, key.1.0, key.2), img, egui::TextureOptions::LINEAR);
                 let id = tex.id();
                 self.thumbs.insert(key, (rev, tex));
                 id

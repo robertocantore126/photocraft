@@ -228,7 +228,7 @@ impl PhotocraftApp {
     /// Cached thumbnail of `l`'s vector mask (see [`vector_thumb_image`]).
     pub fn vector_mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: LayerId, m: &VectorMask) -> egui::TextureId {
         let rev = vector_fingerprint(m) ^ (u64::from(doc.size.width) << 40) ^ (u64::from(doc.size.height) << 20);
-        let key = (id, THUMB_VECTOR);
+        let key = (doc.id, id, THUMB_VECTOR);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {

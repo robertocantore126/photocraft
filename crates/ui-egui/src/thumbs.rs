@@ -1,11 +1,11 @@
 //! Visible-row thumbnail requests. Two dedicated workers avoid nested rayon work.
-use photocraft_doc::LayerId;
+use photocraft_doc::{DocId, LayerId};
 use photocraft_geom::{Rect, Size, TileCoord};
 use photocraft_raster::Surface;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
-pub type Key = (LayerId, u8);
+pub type Key = (DocId, LayerId, u8);
 pub struct Finished {
     pub key: Key,
     pub revision: u64,
@@ -31,14 +31,14 @@ struct Shared {
 }
 pub struct ThumbQueue {
     shared: Arc<Shared>,
-    sender: mpsc::Sender<Finished>,
+    sender: mpsc::SyncSender<Finished>,
     receiver: mpsc::Receiver<Finished>,
     workers: usize,
 }
 impl Default for ThumbQueue {
     fn default() -> Self {
         let shared = Arc::new(Shared { pending: Mutex::new(Pending::default()), wake: Condvar::new(), context: Mutex::new(None) });
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(32);
         #[allow(unused_mut)]
         let mut workers = 0;
         #[cfg(not(target_arch = "wasm32"))]
@@ -118,7 +118,7 @@ impl Drop for ThumbQueue {
 }
 // Workers retain an egui Context only for repaint notification; no GPU or UI calls happen there.
 #[cfg(not(target_arch = "wasm32"))]
-fn worker(shared: Arc<Shared>, sender: mpsc::Sender<Finished>) {
+fn worker(shared: Arc<Shared>, sender: mpsc::SyncSender<Finished>) {
     loop {
         let request = {
             let mut pending = shared.pending.lock().unwrap_or_else(PoisonError::into_inner);
