@@ -50,6 +50,7 @@ enum Slot {
 }
 impl Slot {
     fn read(&self) -> Result<Vec<u8>, String> {
+        let _reading = ActiveRead::new();
         match self {
             Self::Scratch(file, extent) => {
                 let mut bytes = Vec::new();
