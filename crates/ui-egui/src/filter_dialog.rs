@@ -378,8 +378,13 @@ pub fn params_of(f: &Map<String, Value>) -> Value {
 /// Compute a preview document: run `command` with `params` on the proxy (scaled) copy of `doc`.
 pub fn preview_document(doc: &Document, active: Option<photocraft_doc::LayerId>, command: &str, params: &Value, k: u32) -> Option<Document> {
     let proxy = crate::proxy::proxy_document(doc, k);
+    preview_from_proxy(&proxy, active, command, params, k)
+}
+
+/// Reuse the immutable dialog proxy while changing only command parameters.
+pub fn preview_from_proxy(proxy: &Document, active: Option<photocraft_doc::LayerId>, command: &str, params: &Value, k: u32) -> Option<Document> {
     let mut s = photocraft_engine::Session::new();
-    s.add_document(proxy, None);
+    s.add_document(proxy.clone(), None);
     if let Some(id) = active {
         s.select_layer(id).ok()?;
     }
@@ -404,6 +409,9 @@ pub struct FilterPreview {
     pub doc: photocraft_doc::DocId,
     pub revision: u64,
     pub hash: u64,
+    /// Immutable input, retained until the dialog closes or the source revision changes.
+    pub proxy: Arc<Document>,
+    pub active: Option<photocraft_doc::LayerId>,
     pub k: u32,
     pub result: Option<Arc<Document>>,
 }

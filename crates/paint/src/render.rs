@@ -10,6 +10,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+
+fn parallel_brush() -> bool {
+    !cfg!(target_arch = "wasm32") && std::env::var("PHOTOCRAFT_PARALLEL_BRUSH").as_deref() != Ok("0")
+}
+
 use photocraft_color::{BlendMode, PixelFormat};
 use photocraft_geom::Rect;
 use photocraft_raster::{Surface, from_rgba_into, to_rgba};
@@ -134,7 +141,11 @@ impl BrushContext {
     pub fn rasterize(&self, d: &Dab, dual: bool, rect: Rect, out: &mut Vec<f32>) {
         let (w, h) = (rect.width() as usize, rect.height() as usize);
         out.clear();
-        out.resize(w * h, 0.0);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(len) = w.checked_mul(h) else { return };
+        out.resize(len, 0.0);
         let b = &self.brush;
         let (hardness, mips) = if dual { (b.dual_brush.hardness, self.dual_tip.as_deref()) } else { (b.hardness, self.tip.as_deref()) };
         let aliased = b.aliased && !dual;
@@ -163,7 +174,7 @@ impl BrushContext {
             }
             None => (0, 1.0, 1.0, 1.0),
         };
-        for yy in 0..h {
+        let raster_row = |(yy, row): (usize, &mut [f32])| {
             let y = rect.y0 + yy as i32;
             let dy = y as f32 + 0.5 - cy;
             for xx in 0..w {
@@ -212,9 +223,17 @@ impl BrushContext {
                 if wet {
                     val *= 0.5 + 0.5 * smoothstep(0.5, 1.0, rn);
                 }
-                out[yy * w + xx] = val * d.alpha;
+                if let Some(dst) = row.get_mut(xx) {
+                    *dst = val * d.alpha;
+                }
             }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if len >= 65_536 && parallel_brush() {
+            out.par_chunks_mut(w).enumerate().for_each(raster_row);
+            return;
         }
+        out.chunks_mut(w).enumerate().for_each(raster_row);
     }
 
     /// One dab's dense footprint (for the sequential retouch tools).
@@ -285,59 +304,70 @@ impl CoverageMap {
         let (t0x, t0y) = (rect.x0.div_euclid(COV_TILE), rect.y0.div_euclid(COV_TILE));
         let (t1x, t1y) = ((rect.x1 - 1).div_euclid(COV_TILE), (rect.y1 - 1).div_euclid(COV_TILE));
         let want_col = color.is_some() && nc > 0;
+        let mut work = Vec::new();
         for ty in t0y..=t1y {
             for tx in t0x..=t1x {
                 let tr = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&rect);
-                if tr.is_empty() {
-                    continue;
-                }
-                // Skip tiles this dab doesn't touch.
                 let any = (tr.y0..tr.y1).any(|y| {
                     let row = (y - rect.y0) as usize * w;
-                    vals[row + (tr.x0 - rect.x0) as usize..row + (tr.x1 - rect.x0) as usize].iter().any(|&v| v > 0.0)
+                    vals.get(row + (tr.x0 - rect.x0) as usize..row + (tr.x1 - rect.x0) as usize).is_some_and(|v| v.iter().any(|&v| v > 0.0))
                 });
                 if !any {
                     continue;
                 }
-                let tile = self.tiles.entry((tx, ty)).or_insert_with(|| CovTile {
-                    cov: vec![0.0; (COV_TILE * COV_TILE) as usize],
-                    col: if want_col { vec![0.0; (COV_TILE * COV_TILE) as usize * nc] } else { Vec::new() },
-                });
-                if want_col && tile.col.is_empty() {
-                    tile.col = vec![0.0; (COV_TILE * COV_TILE) as usize * nc];
-                }
-                self.dirty.insert((tx, ty));
-                for y in tr.y0..tr.y1 {
-                    let row = (y - rect.y0) as usize * w;
-                    let trow = ((y - ty * COV_TILE) * COV_TILE) as usize;
-                    for x in tr.x0..tr.x1 {
-                        let v = vals[row + (x - rect.x0) as usize];
-                        if v <= 0.0 {
-                            continue;
-                        }
-                        let ti = trow + (x - tx * COV_TILE) as usize;
-                        let c = tile.cov[ti];
-                        let nv = if use_max {
-                            c.max(v * ceil)
-                        } else if ceil > c {
-                            c + v * (ceil - c)
-                        } else {
-                            c
-                        };
-                        if nv <= c {
-                            continue;
-                        }
-                        if let (true, Some(col)) = (want_col, color) {
-                            let k = if c < 1.0 { (nv - c) / (1.0 - c) } else { 0.0 };
-                            let p = &mut tile.col[ti * nc..(ti + 1) * nc];
-                            for i in 0..nc {
-                                p[i] = col[i] * k + p[i] * (1.0 - k);
+                let tile = self.tiles.remove(&(tx, ty)).unwrap_or_else(|| CovTile { cov: vec![0.0; (COV_TILE * COV_TILE) as usize], col: Vec::new() });
+                work.push(((tx, ty), tr, tile));
+            }
+        }
+        // A dab completes before the next one starts; only independent tiles run concurrently.
+        let accumulate = |(key, tr, mut tile): ((i32, i32), Rect, CovTile)| {
+            let (tx, ty) = key;
+            if want_col && tile.col.is_empty() {
+                tile.col = vec![0.0; (COV_TILE * COV_TILE) as usize * nc];
+            }
+            for y in tr.y0..tr.y1 {
+                let row = (y - rect.y0) as usize * w;
+                let trow = ((y - ty * COV_TILE) * COV_TILE) as usize;
+                for x in tr.x0..tr.x1 {
+                    let v = vals.get(row + (x - rect.x0) as usize).copied().unwrap_or(0.0);
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let ti = trow + (x - tx * COV_TILE) as usize;
+                    let Some(c) = tile.cov.get(ti).copied() else { continue };
+                    let nv = if use_max {
+                        c.max(v * ceil)
+                    } else if ceil > c {
+                        c + v * (ceil - c)
+                    } else {
+                        c
+                    };
+                    if nv <= c {
+                        continue;
+                    }
+                    if let (true, Some(col)) = (want_col, color) {
+                        let k = if c < 1.0 { (nv - c) / (1.0 - c) } else { 0.0 };
+                        if let Some(p) = tile.col.get_mut(ti * nc..(ti + 1) * nc) {
+                            for (dst, src) in p.iter_mut().zip(col) {
+                                *dst = *src * k + *dst * (1.0 - k);
                             }
                         }
-                        tile.cov[ti] = nv;
+                    }
+                    if let Some(dst) = tile.cov.get_mut(ti) {
+                        *dst = nv;
                     }
                 }
             }
+            (key, tile)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let completed: Vec<_> =
+            if work.len() >= 16 && parallel_brush() { work.into_par_iter().map(accumulate).collect() } else { work.into_iter().map(accumulate).collect() };
+        #[cfg(target_arch = "wasm32")]
+        let completed: Vec<_> = work.into_iter().map(accumulate).collect();
+        for (key, tile) in completed {
+            self.dirty.insert(key);
+            self.tiles.insert(key, tile);
         }
     }
 
@@ -363,6 +393,7 @@ pub struct StrokeRenderer {
     per_dab_color: bool,
     dabs_done: usize,
     scratch: Vec<f32>,
+    stamp: Option<([u32; 12], Arc<[f32]>)>,
     dab_buf: Vec<Dab>,
     dual_buf: Vec<Dab>,
     all_dabs: Option<Vec<Dab>>,
@@ -382,6 +413,7 @@ impl StrokeRenderer {
             per_dab_color,
             dabs_done: 0,
             scratch: Vec::new(),
+            stamp: None,
             dab_buf: Vec::new(),
             dual_buf: Vec::new(),
             all_dabs: None,
@@ -411,7 +443,42 @@ impl StrokeRenderer {
         let mut native = [0.0f32; 8];
         for d in &dabs {
             let rect = self.ctx.dab_rect(d, false);
-            self.ctx.rasterize(d, false, rect, &mut self.scratch);
+            // Integer-position static tips share an exactly translation-invariant footprint.
+            // Subpixel positions, pressure/shape dynamics, noise and per-tip texture bypass it.
+            let b = &self.ctx.brush;
+            let key = (std::env::var("PHOTOCRAFT_BRUSH_STAMP").as_deref() != Ok("0")
+                && !b.pressure_size
+                && !b.shape_dynamics.enabled
+                && !b.noise
+                && !(b.texture.enabled && b.texture.each_tip)
+                && d.center.x.fract() == 0.0
+                && d.center.y.fract() == 0.0
+                && d.center.x.abs() < 1_000_000.0
+                && d.center.y.abs() < 1_000_000.0)
+                .then(|| {
+                    [
+                        d.radius.to_bits(),
+                        d.alpha.to_bits(),
+                        d.angle.to_bits(),
+                        d.roundness.to_bits(),
+                        d.depth.to_bits(),
+                        d.proj_angle.to_bits(),
+                        d.proj_scale.to_bits(),
+                        u32::from(d.flip_x),
+                        u32::from(d.flip_y),
+                        rect.width(),
+                        rect.height(),
+                        (d.center.x as i32 - rect.x0) as u32,
+                    ]
+                });
+            if let Some((_, stamp)) = self.stamp.as_ref().filter(|(cached, _)| Some(*cached) == key) {
+                self.scratch.clear();
+                self.scratch.extend_from_slice(stamp);
+            } else {
+                self.ctx.rasterize(d, false, rect, &mut self.scratch);
+                // Do not keep a second unbounded copy of unusually large dabs.
+                self.stamp = key.filter(|_| self.scratch.len() <= 4_194_304).map(|key| (key, Arc::from(self.scratch.as_slice())));
+            }
             let col = match (self.per_dab_color, self.fmt) {
                 (true, Some(f)) => {
                     from_rgba_into(&f, d.color, &mut native);
@@ -489,6 +556,7 @@ impl StrokeRenderer {
             per_dab_color: self.per_dab_color,
             dabs_done: self.dabs_done,
             scratch: Vec::new(),
+            stamp: None,
             dab_buf: dabs,
             dual_buf: duals,
             all_dabs: None,
@@ -569,14 +637,14 @@ impl StrokeRenderer {
         if let Some(a) = a_idx {
             src[a] = b.color[3];
         }
-        let mut dmg = Rect::EMPTY;
-        let mut region = Vec::new();
-        for (tx, ty) in keys {
-            let Some(tile) = self.cov.tiles.get(&(tx, ty)) else { continue };
+        let composite_tile = |&(tx, ty): &(i32, i32)| {
+            let tile = self.cov.tiles.get(&(tx, ty))?;
             let tr = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&bounds);
             if tr.is_empty() {
-                continue;
+                return None;
             }
+            let mut src = src;
+            let mut region = Vec::new();
             pre.read_region_into(tr, &mut region);
             let sel = selection.map(|s| (s.channels(), s.read_region(tr)));
             let w = tr.width() as usize;
@@ -631,8 +699,23 @@ impl StrokeRenderer {
                     }
                 }
             }
-            target.write_region(tr, &region);
-            dmg = dmg.union(&tr);
+            Some((tr, region))
+        };
+        // Bound the temporary float buffers: at most sixteen coverage tiles per batch.
+        let mut dmg = Rect::EMPTY;
+        for batch in keys.chunks(16) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let patches: Vec<_> = if batch.len() >= 8 && parallel_brush() {
+                batch.par_iter().filter_map(composite_tile).collect()
+            } else {
+                batch.iter().filter_map(composite_tile).collect()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let patches: Vec<_> = batch.iter().filter_map(composite_tile).collect();
+            for (tr, region) in patches {
+                target.write_region(tr, &region);
+                dmg = dmg.union(&tr);
+            }
         }
         if all { bounds } else { dmg }
     }

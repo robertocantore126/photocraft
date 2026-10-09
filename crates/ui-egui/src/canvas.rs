@@ -561,10 +561,16 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u6
     let k = crate::proxy::factor(&doc);
     let hash = format!("{cmd}{params}").bytes().fold(k as u64 ^ revision.wrapping_mul(0x9e37), |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
     let key = doc_id.0 ^ (1u64 << 61);
-    let fresh = matches!(&app.filter_preview, Some(p) if p.doc == doc_id && p.hash == hash);
+    let fresh = matches!(&app.filter_preview, Some(p) if p.doc == doc_id && p.hash == hash && p.active == active);
     if !fresh {
         let t0 = crate::gpu_canvas::now_ms();
-        let result = crate::filter_dialog::preview_document(&doc, active, &cmd, &params, k).map(std::sync::Arc::new);
+        let proxy = app
+            .filter_preview
+            .as_ref()
+            .filter(|p| std::env::var("PHOTOCRAFT_FILTER_PROXY").as_deref() != Ok("0") && p.doc == doc_id && p.revision == revision && p.k == k)
+            .map(|p| p.proxy.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(crate::proxy::proxy_document(&doc, k)));
+        let result = crate::filter_dialog::preview_from_proxy(&proxy, active, &cmd, &params, k).map(std::sync::Arc::new);
         if let Some(r) = &result {
             let buf = photocraft_compose::flatten(r);
             let t1 = crate::gpu_canvas::now_ms();
@@ -572,7 +578,7 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u6
             app.gpu.as_ref()?.upload_buffer_full(key, &texture_buffer(display.as_deref(), &buf), doc.depth);
             app.perf.record("filter-preview", r.size.area(), t1 - t0, crate::gpu_canvas::now_ms() - t1);
         }
-        app.filter_preview = Some(crate::filter_dialog::FilterPreview { doc: doc_id, revision, hash, k, result });
+        app.filter_preview = Some(crate::filter_dialog::FilterPreview { doc: doc_id, revision, hash, proxy, active, k, result });
     }
     app.filter_preview.as_ref().filter(|p| p.result.is_some()).map(|p| (p.k, key))
 }
