@@ -32,6 +32,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bounds;
+#[cfg(not(target_arch = "wasm32"))]
+mod distance;
 pub mod filters;
 mod fx;
 #[cfg(not(target_arch = "wasm32"))]
@@ -533,6 +535,8 @@ pub struct Compositor {
     #[cfg(not(target_arch = "wasm32"))]
     fx_jobs: Option<fx_jobs::Jobs>,
     async_effects: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    distance: Option<distance::Engine>,
     /// Effect temporaries (R32F, region sized) and the frame they were last used.
     temps: Vec<(Tex, u64)>,
     patterns: HashMap<String, (u64, Tex)>,
@@ -786,6 +790,8 @@ impl Compositor {
             #[cfg(not(target_arch = "wasm32"))]
             fx_jobs: None,
             async_effects: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            distance: distance::Engine::opt_in(device),
             temps: Vec::new(),
             luts: HashMap::new(),
             patterns: HashMap::new(),
@@ -981,6 +987,11 @@ impl Compositor {
 
     /// Enable deferred CPU effect inputs for interactive rendering. Export remains synchronous.
     pub fn set_async_effects(&mut self, enabled: bool) {
+        // A synchronous/export render must not reuse approximate interactive distance maps.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.distance.is_some() && self.async_effects != enabled {
+            self.fx.clear();
+        }
         self.async_effects = enabled;
         #[cfg(not(target_arch = "wasm32"))]
         if !enabled {
@@ -2063,7 +2074,16 @@ impl Compositor {
             async_signature = hash.finish() | 1;
             if self.fx.get(&key).is_none_or(|e| e.doc != doc.id || e.async_signature != async_signature) {
                 if let Some(jobs) = &mut self.fx_jobs {
-                    match jobs.poll(key, async_signature, doc, layer, region, &want) {
+                    // Only opt-in interactive Euclidean fields move to compute. The worker
+                    // still supplies compose's exact shape and every stroke field.
+                    let cpu_want: HashMap<_, _> = want
+                        .iter()
+                        .filter_map(|(&kind, &reach)| {
+                            let gpu = self.distance.as_ref().is_some_and(|engine| engine.supports(device, kind, reach, region));
+                            (!gpu).then_some((kind, reach))
+                        })
+                        .collect();
+                    match jobs.poll(key, async_signature, doc, layer, region, &cpu_want) {
                         fx_jobs::Poll::Waiting => {
                             self.fx.remove(&key);
                             return;
@@ -2180,6 +2200,8 @@ impl Compositor {
         }
 
         e.fields.retain(|k, _| want.contains_key(k));
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut gpu_field_updated = false;
         for (&kind, &reach) in &want {
             let have = e.fields.get(&kind).map(|(r, _)| *r);
             let out = match have {
@@ -2192,6 +2214,20 @@ impl Compositor {
                 _ => region,
             };
             let reach = have.filter(|r| *r >= reach).unwrap_or(reach);
+            if have.is_none_or(|r| r < reach) {
+                e.fields.insert(kind, (reach, Tex::map(device, "pc_fx_field", region, MAP32)));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.async_effects
+                && !self.nested
+                && let Some(engine) = &mut self.distance
+                && let Some((_, target)) = e.fields.get(&kind)
+                && engine.run(device, queue, frame, kind, reach, region, &e.shape, target)
+            {
+                gpu_field_updated = true;
+                stats.fx_pixels += u64::from(region.width()) * u64::from(region.height());
+                continue;
+            }
             #[cfg(not(target_arch = "wasm32"))]
             let v = prepared
                 .as_mut()
@@ -2200,9 +2236,6 @@ impl Compositor {
                 .unwrap_or_else(|| fx::field(kind, reach, &e.shape_cpu, region, out));
             #[cfg(target_arch = "wasm32")]
             let v = fx::field(kind, reach, &e.shape_cpu, region, out);
-            if have.is_none_or(|r| r < reach) {
-                e.fields.insert(kind, (reach, Tex::map(device, "pc_fx_field", region, MAP32)));
-            }
             if let Some((_, t)) = e.fields.get(&kind) {
                 t.write_r32(queue, region, out, &v);
             }
@@ -2210,8 +2243,19 @@ impl Compositor {
             stats.fx_pixels += out.width() as u64 * out.height() as u64;
         }
 
+        // A changed seed can change JFA's approximation beyond exact distance reach. Rebuild
+        // downstream maps across the whole region instead of retaining old approximations.
+        #[cfg(not(target_arch = "wasm32"))]
+        if gpu_field_updated {
+            damage = region;
+            touched = true;
+        }
         if let Some(t) = t_trace.filter(|_| !damage.is_empty()) {
-            eprintln!("effect maps of `{}`: shape + distance fields over {damage:?} in {:.2} ms (CPU)", layer.name, t.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "effect maps of `{}`: shape + distance fields over {damage:?} in {:.2} ms (CPU / optional GPU submission)",
+                layer.name,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
         e.progs.truncate(progs.len());
         while e.progs.len() < progs.len() {
