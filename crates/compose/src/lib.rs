@@ -24,6 +24,7 @@ pub mod masks;
 pub mod mip_view;
 pub mod multichannel;
 pub mod pattern;
+pub mod prefix;
 pub mod proxy;
 pub mod psblend;
 pub mod shape_split;
