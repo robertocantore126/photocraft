@@ -1,6 +1,6 @@
 //! High-quality separable resampling of surfaces (Image Size).
 
-use photocraft_geom::Rect;
+use photocraft_geom::{Rect, TILE_SIZE, TileCoord};
 use photocraft_raster::Surface;
 use serde::{Deserialize, Serialize};
 
@@ -184,14 +184,65 @@ pub fn resize_surface(s: &Surface, sx: f64, sy: f64, filter: Resample) -> Surfac
     out
 }
 
-/// Moves a surface by whole pixels (default pixel kept).
+/// Moves a surface by whole pixels (default pixel kept). The shared-tile path
+/// retains aligned tiles and bounds temporary storage to one tile for other offsets.
 pub fn translate_surface(s: &Surface, dx: i32, dy: i32) -> Surface {
+    if std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() != Ok("0") {
+        if dx == 0 && dy == 0 {
+            return s.clone();
+        }
+        if let Some(translated) = translate_tiles(s, dx, dy) {
+            return translated;
+        }
+    }
+    // Keep the original path available for comparisons and coordinates outside the
+    // checked tile path's representable range; this change does not widen that range.
     let mut out = Surface::with_default(s.format(), &s.default_pixel());
     let r = s.content_bounds();
     if !r.is_empty() {
         out.write_interleaved(r.translate(dx, dy), &s.to_interleaved(r));
     }
     out
+}
+
+fn translate_tiles(s: &Surface, dx: i32, dy: i32) -> Option<Surface> {
+    let target = |coord: &TileCoord| {
+        let x0 = coord.tx.checked_mul(TILE_SIZE)?;
+        let y0 = coord.ty.checked_mul(TILE_SIZE)?;
+        let x1 = x0.checked_add(TILE_SIZE)?;
+        let y1 = y0.checked_add(TILE_SIZE)?;
+        let rect = Rect::new(x0.checked_add(dx)?, y0.checked_add(dy)?, x1.checked_add(dx)?, y1.checked_add(dy)?);
+        // Partial target tiles must also fit Surface's supported integer tile grid.
+        for coord in rect.tiles() {
+            coord.tx.checked_mul(TILE_SIZE)?.checked_add(TILE_SIZE)?;
+            coord.ty.checked_mul(TILE_SIZE)?.checked_add(TILE_SIZE)?;
+        }
+        Some(rect)
+    };
+    // Validate before touching pixels, so a fallback never copies a partially translated image.
+    for (coord, _) in s.tiles() {
+        target(coord)?;
+    }
+    let mut out = Surface::with_default(s.format(), &s.default_pixel());
+    let aligned = dx.rem_euclid(TILE_SIZE) == 0 && dy.rem_euclid(TILE_SIZE) == 0;
+    for (coord, tile) in s.tiles() {
+        let rect = target(coord)?;
+        if aligned {
+            out.insert_tile(TileCoord::containing(rect.x0, rect.y0), tile.clone()).ok()?;
+        } else {
+            // Translated source tile rectangles partition the destination without overlaps.
+            // Holding one source guard preserves the bytes while destination COW tiles allocate.
+            let bytes = tile.bytes();
+            out.write_interleaved(rect, &bytes);
+        }
+    }
+    if let Some(bounds) = s.content_bounds_hint() {
+        let shifted = Rect::new(bounds.x0.checked_add(dx)?, bounds.y0.checked_add(dy)?, bounds.x1.checked_add(dx)?, bounds.y1.checked_add(dy)?);
+        // Bounds are optional acceleration metadata: rejecting an unavailable hint merely
+        // lets the translated surface calculate its exact bounds when next needed.
+        let _ = out.restore_exact_content_bounds(shifted);
+    }
+    Some(out)
 }
 
 /// Keeps only the pixels inside `keep` (others become the default pixel).
