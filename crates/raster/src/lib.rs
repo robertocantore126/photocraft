@@ -150,6 +150,7 @@ pub struct Surface {
     default_pixel: Box<[u8]>,
     tiles: BTreeMap<TileCoord, Arc<Tile>>,
     mips: Arc<MipChain>,
+    content_bounds_hint: Option<Rect>,
 }
 
 impl PartialEq for Surface {
@@ -161,7 +162,13 @@ impl PartialEq for Surface {
 impl Surface {
     /// Transparent/zero surface.
     pub fn new(format: PixelFormat) -> Self {
-        Self { format, default_pixel: vec![0u8; format.bytes_per_pixel()].into_boxed_slice(), tiles: BTreeMap::new(), mips: Arc::new(MipChain::default()) }
+        Self {
+            format,
+            default_pixel: vec![0u8; format.bytes_per_pixel()].into_boxed_slice(),
+            tiles: BTreeMap::new(),
+            mips: Arc::new(MipChain::default()),
+            content_bounds_hint: None,
+        }
     }
 
     /// Surface whose untouched pixels read as `pixel` (normalised channel values).
@@ -189,6 +196,7 @@ impl Surface {
         if tile.len() != expected {
             return Err("tile length does not match surface format".into());
         }
+        self.content_bounds_hint = None;
         self.invalidate_mips(c);
         self.tiles.insert(c, tile);
         Ok(())
@@ -202,6 +210,7 @@ impl Surface {
 
     /// Mutable access to a tile, allocating it (filled with the default pixel) or un-sharing it.
     pub fn tile_mut(&mut self, c: TileCoord) -> &mut Tile {
+        self.content_bounds_hint = None;
         self.invalidate_mips(c);
         let fmt = self.format;
         let dp = self.default_pixel.clone();
@@ -236,8 +245,21 @@ impl Surface {
         self.tiles.keys().fold(Rect::EMPTY, |r, c| r.union(&c.rect()))
     }
 
-    /// Exact bounds of pixels that differ from the default pixel.
+    /// True layer bounds attached to a viewport-only derived surface. Never persisted.
+    pub fn content_bounds_hint(&self) -> Option<Rect> {
+        self.content_bounds_hint
+    }
+    /// Preserve effect/gradient anchors when only viewport pixels have been materialized.
+    /// Call only on display proxies; a pixel mutation clears this metadata.
+    pub fn set_content_bounds_hint(&mut self, bounds: Option<Rect>) {
+        self.content_bounds_hint = bounds;
+    }
+
+    /// Exact bounds of pixels that differ from the default pixel, or display proxy bounds.
     pub fn content_bounds(&self) -> Rect {
+        if let Some(bounds) = self.content_bounds_hint {
+            return bounds;
+        }
         let bpp = self.format.bytes_per_pixel();
         if self.tiles.is_empty() {
             return Rect::EMPTY;
@@ -278,6 +300,7 @@ impl Surface {
 
     /// Drop tiles that are entirely the default pixel.
     pub fn prune(&mut self) {
+        self.content_bounds_hint = None;
         self.mips = Arc::new(MipChain::default());
         let dp = self.default_pixel.clone();
         let bpp = dp.len();
@@ -564,10 +587,12 @@ impl Surface {
                     continue;
                 }
                 if enc.as_slice() == self.default_pixel.as_ref() {
+                    self.content_bounds_hint = None;
                     self.invalidate_mips(tc);
                     self.tiles.remove(&tc);
                 } else if !self.tiles.get(&tc).is_some_and(|tile| tile.solid_pixel.as_deref() == Some(enc.as_slice())) {
                     let tile = solid.get_or_insert_with(|| Arc::new(Tile::solid(&self.format, &enc)));
+                    self.content_bounds_hint = None;
                     self.invalidate_mips(tc);
                     self.tiles.insert(tc, tile.clone());
                 }
