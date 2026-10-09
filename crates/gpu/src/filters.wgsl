@@ -5,7 +5,7 @@ struct Params {
     origin: vec4<i32>,
 };
 @group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> target: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> destination: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> original: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
@@ -26,7 +26,7 @@ fn convolution(@builtin(global_invocation_id) id: vec3<u32>) {
         let offset = select(vec2(0, i), vec2(i, 0), params.size.z == 0u);
         result += load(vec2<i32>(id.xy) + offset) * weights[u32(i + r)];
     }
-    target[id.y * params.size.x + id.x] = result;
+    destination[id.y * params.size.x + id.x] = result;
 }
 
 // One invocation per row/column, matching the CPU running-sum box sequence.
@@ -46,7 +46,7 @@ fn box_line(@builtin(global_invocation_id) id: vec3<u32>) {
     let norm = 1.0 / f32(2 * r + 1);
     for (var x = 0; x < i32(length); x++) {
         let p = select(vec2(i32(id.x), x), vec2(x, i32(id.x)), horizontal);
-        target[u32(p.y) * params.size.x + u32(p.x)] = sum * norm;
+        destination[u32(p.y) * params.size.x + u32(p.x)] = sum * norm;
         let add = select(vec2(0, r + 1), vec2(r + 1, 0), horizontal);
         let sub = select(vec2(0, r), vec2(r, 0), horizontal);
         sum += load(p + add) - load(p - sub);
@@ -63,7 +63,7 @@ fn sample_zero(p: vec2<i32>) -> vec4<f32> {
 @compute @workgroup_size(8, 8)
 fn motion(@builtin(global_invocation_id) id: vec3<u32>) {
     if (any(id.xy >= params.size.xy)) { return; }
-    if (params.mode.w == 0u) { target[id.y * params.size.x + id.x] = load(vec2<i32>(id.xy)); return; }
+    if (params.mode.w == 0u) { destination[id.y * params.size.x + id.x] = load(vec2<i32>(id.xy)); return; }
     var sum = vec4(0.0);
     for (var i = 0u; i <= params.mode.w; i++) {
         let t = f32(i) / f32(params.mode.w) - 0.5;
@@ -78,7 +78,7 @@ fn motion(@builtin(global_invocation_id) id: vec3<u32>) {
         v += sample_zero(q + vec2(1, 1)) * (f.x * f.y);
         sum += v;
     }
-    target[id.y * params.size.x + id.x] = sum / f32(params.mode.w + 1u);
+    destination[id.y * params.size.x + id.x] = sum / f32(params.mode.w + 1u);
 }
 
 @compute @workgroup_size(8, 8)
@@ -89,14 +89,14 @@ fn finish(@builtin(global_invocation_id) id: vec3<u32>) {
     if (params.mode.x != 0u) {
         blurred = vec4(select(vec3(0.0), blurred.rgb / max(blurred.a, 1e-30), blurred.a > 1e-7), blurred.a);
     }
-    if (params.mode.z == 0u) { target[i] = blurred; return; }
+    if (params.mode.z == 0u) { destination[i] = blurred; return; }
     let old = original[i];
-    if (params.mode.x != 0u && old.a <= 0.0) { target[i] = old; return; }
+    if (params.mode.x != 0u && old.a <= 0.0) { destination[i] = old; return; }
     let delta = old - blurred;
     var result = vec4(0.5) + delta;
     if (params.mode.z == 1u) {
         result = select(old, old + params.values.x * delta, abs(delta) + vec4(1e-6) >= vec4(params.values.y));
     }
     if (params.mode.x != 0u) { result.a = old.a; }
-    target[i] = result;
+    destination[i] = result;
 }
