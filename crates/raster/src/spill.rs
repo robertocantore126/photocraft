@@ -335,6 +335,7 @@ struct Config {
     /// Created on the first eviction, so configuring costs nothing until memory runs short.
     file: Option<Arc<ScratchFile>>,
     worker: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     writer: bool,
     pending: bool,
     last_error: Option<String>,
@@ -345,7 +346,15 @@ static M: Manager = Manager {
     live: AtomicUsize::new(0),
     budget: AtomicUsize::new(0),
     registry: Mutex::new(Registry { cells: Vec::new(), hand: 0 }),
-    config: Mutex::new(Config { dir: None, file: None, worker: false, writer: false, pending: false, last_error: None }),
+    config: Mutex::new(Config {
+        dir: None,
+        file: None,
+        worker: false,
+        #[cfg(not(target_arch = "wasm32"))]
+        writer: false,
+        pending: false,
+        last_error: None,
+    }),
     wake: Condvar::new(),
     evictions: AtomicU64::new(0),
     reloads: AtomicU64::new(0),
@@ -487,6 +496,7 @@ fn low_water(budget: usize) -> usize {
     budget / 10 * 9
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_loop() {
     loop {
         {

@@ -15,10 +15,14 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct MipChain {
     tiles: Mutex<BTreeMap<(u32, TileCoord), Entry>>,
+    default_tile: Mutex<Option<Arc<Tile>>>,
 }
 impl Clone for MipChain {
     fn clone(&self) -> Self {
-        Self { tiles: Mutex::new(self.tiles.lock().unwrap_or_else(PoisonError::into_inner).clone()) }
+        Self {
+            tiles: Mutex::new(self.tiles.lock().unwrap_or_else(PoisonError::into_inner).clone()),
+            default_tile: Mutex::new(self.default_tile.lock().unwrap_or_else(PoisonError::into_inner).clone()),
+        }
     }
 }
 impl MipChain {
@@ -36,9 +40,9 @@ impl Surface {
     }
     /// Largest mip whose long side still has at least `target` pixels.
     pub fn mip_level_for_size(bounds: Rect, target: u32) -> u32 {
-        let mut size = bounds.width().max(bounds.height());
+        let mut size = (i64::from(bounds.x1) - i64::from(bounds.x0)).max(i64::from(bounds.y1) - i64::from(bounds.y0)).max(0) as u64;
         let mut level = 0;
-        while level < MAX_LEVEL && size / 2 >= target.max(1) {
+        while level < MAX_LEVEL && size / 2 >= u64::from(target.max(1)) {
             size /= 2;
             level += 1;
         }
@@ -51,13 +55,21 @@ impl Surface {
         let ceil = |v: i32| ((i64::from(v) + scale - 1).div_euclid(scale)) as i32;
         if bounds.is_empty() { Rect::EMPTY } else { Rect::new(floor(bounds.x0), floor(bounds.y0), ceil(bounds.x1), ceil(bounds.y1)) }
     }
+    fn default_mip_tile(&self) -> Arc<Tile> {
+        self.mips
+            .default_tile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| Arc::new(Tile::solid(&self.format, &self.default_pixel)))
+            .clone()
+    }
     /// A lazily computed native-format tile. Level zero reads the original pixels.
     pub fn mip_tile(&self, level: u32, coord: TileCoord) -> Result<Arc<Tile>, String> {
         if level > MAX_LEVEL {
             return Err("CPU mip level exceeds 16".into());
         }
         if level == 0 {
-            return Ok(self.tile(coord).cloned().unwrap_or_else(|| Arc::new(Tile::solid(&self.format, &self.default_pixel))));
+            return Ok(self.tile(coord).cloned().unwrap_or_else(|| self.default_mip_tile()));
         }
         let cache = std::env::var("PHOTOCRAFT_CPU_MIPS").as_deref() != Ok("0");
         if cache && let Some(entry) = self.mips.tiles.lock().unwrap_or_else(PoisonError::into_inner).get(&(level, coord)) {
@@ -77,7 +89,7 @@ impl Surface {
                 .range(TileCoord::new(x0.max(min) as i32, i32::MIN)..=TileCoord::new((x0 + scale - 1).min(max) as i32, i32::MAX))
                 .any(|(c, _)| i64::from(c.ty) >= y0 && i64::from(c.ty) < y0 + scale);
         if !present {
-            let tile = Arc::new(Tile::solid(&self.format, &self.default_pixel));
+            let tile = self.default_mip_tile();
             tile.cell.set_rebuild_cost(level);
             if cache {
                 self.mips
@@ -151,8 +163,19 @@ impl Surface {
         if level > MAX_LEVEL {
             return Err("CPU mip level exceeds 16".into());
         }
+        let region = Self::mip_bounds(bounds, level);
+        if region.is_empty() {
+            return Ok(Surface::with_default(self.format, &self.default_pixel()));
+        }
+        let first = TileCoord::containing(region.x0, region.y0);
+        let last = TileCoord::containing(region.x1.saturating_sub(1), region.y1.saturating_sub(1));
+        let columns = (i64::from(last.tx) - i64::from(first.tx) + 1).max(0) as u64;
+        let rows = (i64::from(last.ty) - i64::from(first.ty) + 1).max(0) as u64;
+        if columns.checked_mul(rows).is_none_or(|tiles| tiles > 65_536) {
+            return Err("CPU mip region exceeds 65536 tiles; request a viewport or a coarser mip".into());
+        }
         let mut surface = Surface::with_default(self.format, &self.default_pixel());
-        for coord in Self::mip_bounds(bounds, level).tiles() {
+        for coord in region.tiles() {
             surface.insert_tile(coord, self.mip_tile(level, coord)?)?;
         }
         Ok(surface)
