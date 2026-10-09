@@ -310,10 +310,22 @@ impl<'a> DocCtx<'a> {
 
 /// Build the pass list for `doc`.
 pub fn plan(doc: &Document) -> Result<Plan<'_>, Unsupported> {
+    plan_with_region(doc, None)
+}
+
+/// Build a plan whose derived mask pixels are needed only over `region`. Effect shapes
+/// use their own expanded render requests, including nested group plans. Global canvas
+/// geometry and fill/gradient frames are never cropped.
+pub fn plan_region(doc: &Document, region: Rect) -> Result<Plan<'_>, Unsupported> {
+    let region = (std::env::var("PHOTOCRAFT_VIEW_COMPOSE").ok().as_deref() != Some("0")).then_some(region);
+    plan_with_region(doc, region)
+}
+
+fn plan_with_region(doc: &Document, region: Option<Rect>) -> Result<Plan<'_>, Unsupported> {
     if doc.mode == photocraft_color::ColorMode::Multichannel {
         return Err(Unsupported("Multichannel inks (printed on the CPU)".into()));
     }
-    let mut p = Planner::new(DocCtx::of(doc));
+    let mut p = Planner::new(DocCtx::of(doc), region);
     let root = p.clear();
     let root = p.stack(&doc.layers, root)?;
     Ok(p.finish(root))
@@ -324,6 +336,7 @@ struct Planner<'a> {
     free: Vec<Slot>,
     refs: Vec<u32>,
     cx: DocCtx<'a>,
+    mask_region: Option<Rect>,
     fx: Vec<FxLayer<'a>>,
 }
 
@@ -374,8 +387,8 @@ pub const INIT_INSIDE: i32 = 2;
 pub const INIT_ALPHA: i32 = 3;
 
 impl<'a> Planner<'a> {
-    fn new(cx: DocCtx<'a>) -> Self {
-        Planner { passes: Vec::new(), free: Vec::new(), refs: Vec::new(), cx, fx: Vec::new() }
+    fn new(cx: DocCtx<'a>, mask_region: Option<Rect>) -> Self {
+        Planner { passes: Vec::new(), free: Vec::new(), refs: Vec::new(), cx, mask_region, fx: Vec::new() }
     }
 
     fn finish(self, root: Slot) -> Plan<'a> {
@@ -446,7 +459,11 @@ impl<'a> Planner<'a> {
     }
 
     fn mask_use(&self, layer: &'a Layer) -> Option<MaskUse<'a>> {
-        if let Some(c) = photocraft_compose::masks::combined_mask(layer, self.cx.canvas) {
+        let combined = match self.mask_region {
+            Some(region) => photocraft_compose::masks::combined_mask_region(layer, self.cx.canvas, region),
+            None => photocraft_compose::masks::combined_mask(layer, self.cx.canvas),
+        };
+        if let Some(c) = combined {
             let default = c.default_pixel().first().copied().unwrap_or(1.0);
             return Some(MaskUse { layer: layer.id, surface: SurfaceRef::Derived(std::sync::Arc::new(c)), density: 1.0, default });
         }

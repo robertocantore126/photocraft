@@ -166,7 +166,7 @@ fn combined_mask_impl(layer: &Layer, canvas: Rect, output: Option<Rect>) -> Opti
     let mut area = area.intersect(&canvas);
     if let Some(output) = output {
         let halo = feather_halo(sv).max(feather_halo(sp));
-        area = area.intersect(&output.inflate(halo));
+        area = if output.is_empty() { Rect::EMPTY } else { area.intersect(&output.inflate(halo)) };
     }
     let mut s = Surface::with_default(FORMAT, &[p_def * v_out]);
     if !area.is_empty() {

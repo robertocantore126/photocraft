@@ -859,7 +859,7 @@ impl Compositor {
     /// Bytes of the layer pages a render of `region` needs resident (each layer and mask
     /// surface's tiles within the region's page cells, in their texture format).
     pub fn working_set(&self, doc: &Document, region: Rect) -> u64 {
-        let Ok(plan) = plan(doc) else { return 0 };
+        let Ok(plan) = plan::plan_region(doc, region) else { return 0 };
         let grid = tile_grid(doc.bounds());
         let cells = grid_rects(region.intersect(&doc.bounds()), self.page)
             .into_iter()
@@ -912,7 +912,8 @@ impl Compositor {
     /// limit are fine: surfaces are stored in page-sized textures and effect maps of regions
     /// larger than the limit are built per page cell.
     pub fn supports(&self, doc: &Document) -> Result<(), Unsupported> {
-        let p = plan(doc)?;
+        // A capability probe needs pass metadata, not any derived mask pixels.
+        let p = plan::plan_region(doc, Rect::EMPTY)?;
         self.check_fx(doc, &p)
     }
 
@@ -1142,7 +1143,10 @@ impl Compositor {
             self.mip_kit = Some(MipKit::new(device));
         }
         let trace = Trace::new();
-        let plan = plan(doc)?;
+        // Level-zero viewport rendering samples only this rectangle. GPU mip sampling
+        // additionally needs the complete footprint of its last reduced pixel.
+        let mask_region = if region.is_empty() { region } else { region.inflate((1i32 << self.render_mip).saturating_sub(1)) };
+        let plan = plan::plan_region(doc, mask_region)?;
         let t_plan = trace.lap();
         self.check_fx(doc, &plan)?;
         let t_check = trace.lap();

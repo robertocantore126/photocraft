@@ -351,7 +351,7 @@ impl GpuCanvas {
         match &res.compositor {
             Some(c) => c.supports(doc).is_ok(),
             // Layers larger than the texture limit are stored in pages, so any size qualifies.
-            None => photocraft_gpu::plan(doc).is_ok(),
+            None => photocraft_gpu::plan::plan_region(doc, photocraft_geom::Rect::EMPTY).is_ok(),
         }
     }
 
