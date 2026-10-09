@@ -85,6 +85,7 @@ pub mod stroke_constraint;
 pub mod stylus;
 mod tab_strip;
 pub mod theme;
+mod thumbs;
 mod timeline_ui;
 pub mod tone;
 pub mod tool_feedback;
@@ -249,6 +250,7 @@ pub struct PhotocraftApp {
     pub fps: f32,
     last_frame_time: f64,
     thumbs: HashMap<(photocraft_doc::LayerId, u8), (u64, egui::TextureHandle)>,
+    thumb_queue: thumbs::ThumbQueue,
     /// Snapshots whose live layer/mask keys were last used to prune thumbnail handles.
     thumb_documents: Vec<(DocId, std::sync::Weak<Document>)>,
     /// Content bounds cached per (key, revision): scanning a 36 MP layer every frame cost ~77 ms.
@@ -351,6 +353,7 @@ impl PhotocraftApp {
             fps: 0.0,
             last_frame_time: 0.0,
             thumbs: HashMap::new(),
+            thumb_queue: thumbs::ThumbQueue::default(),
             thumb_documents: Vec::new(),
             bounds_cache: HashMap::new(),
             proxy: None,
@@ -740,6 +743,7 @@ impl eframe::App for PhotocraftApp {
         }
         self.last_frame_time = now;
         self.sync_views();
+        self.collect_thumbs(ctx);
         #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         if self.live_tokens.poll(ctx, self.ui.theme) {
             self.checker = None;
@@ -910,6 +914,7 @@ impl PhotocraftApp {
             // Native files can restore IDs: retain the union across all open documents, rather
             // than deleting an ID just because one document containing it was closed.
             self.thumbs.retain(|key, _| live.contains(key));
+            self.thumb_queue.retain(&live);
         }
         self.thumb_documents = documents.iter().map(|st| (st.doc.id, std::sync::Arc::downgrade(&st.doc))).collect();
     }
@@ -924,12 +929,17 @@ impl PhotocraftApp {
     pub fn layer_thumb(&mut self, ctx: &egui::Context, doc: &Document, layer: &photocraft_doc::Layer) -> egui::TextureId {
         // Key by content, not document revision: COW tiles change pointer only when their pixels
         // change, so unrelated edits (e.g. painting another layer) don't rebuild this thumbnail.
-        let rev = layer.surface().map_or(0, surface_fingerprint) ^ (doc.size.width as u64) << 40;
+        let rev = layer.surface().map_or(0, surface_fingerprint) ^ (doc.size.width as u64).rotate_left(40) ^ (doc.size.height as u64).rotate_left(20);
         let key = (layer.id, mask_thumbs_ui::THUMB_LAYER);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
             return tex.id();
+        }
+        if std::env::var("PHOTOCRAFT_BACKGROUND_THUMBS").as_deref() != Ok("0") {
+            if let Some(surface) = layer.surface() {
+                return self.queue_thumb(ctx, key, rev, surface, doc.size, false);
+            }
         }
         let mut px = [0.0f32; 8];
         let img = thumb_image(doc, 64, |x, y| {
@@ -942,12 +952,15 @@ impl PhotocraftApp {
     }
 
     pub fn mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: photocraft_doc::LayerId, mask: &photocraft_doc::LayerMask) -> egui::TextureId {
-        let rev = surface_fingerprint(&mask.surface) ^ (doc.size.width as u64) << 40;
+        let rev = surface_fingerprint(&mask.surface) ^ (doc.size.width as u64).rotate_left(40) ^ (doc.size.height as u64).rotate_left(20);
         let key = (id, mask_thumbs_ui::THUMB_MASK);
         if let Some((r, tex)) = self.thumbs.get(&key)
             && *r == rev
         {
             return tex.id();
+        }
+        if std::env::var("PHOTOCRAFT_BACKGROUND_THUMBS").as_deref() != Ok("0") {
+            return self.queue_thumb(ctx, key, rev, &mask.surface, doc.size, true);
         }
         let mut v = [0.0f32; 1];
         let img = thumb_image(doc, 64, |x, y| {
@@ -955,6 +968,38 @@ impl PhotocraftApp {
             [v[0], v[0], v[0], 1.0]
         });
         self.store_thumb(ctx, key, rev, img)
+    }
+
+    fn queue_thumb(
+        &mut self,
+        ctx: &egui::Context,
+        key: thumbs::Key,
+        revision: u64,
+        surface: &photocraft_raster::Surface,
+        size: photocraft_geom::Size,
+        mask: bool,
+    ) -> egui::TextureId {
+        if self.thumb_queue.needs(key, revision) {
+            self.thumb_queue.request(key, revision, surface.clone(), size, mask, ctx);
+        }
+        if let Some((_, texture)) = self.thumbs.get(&key) {
+            return texture.id();
+        }
+        // The sentinel never equals a content revision, so the placeholder cannot suppress work.
+        self.store_thumb(ctx, key, !revision, egui::ColorImage::new([64, 64], vec![egui::Color32::TRANSPARENT; 64 * 64]))
+    }
+    fn collect_thumbs(&mut self, ctx: &egui::Context) {
+        for finished in self.thumb_queue.collect() {
+            match finished.image {
+                Ok(image) => {
+                    self.store_thumb(ctx, finished.key, finished.revision, image);
+                }
+                Err(error) => {
+                    self.ui.status = error;
+                    self.ui.status_error = true;
+                }
+            }
+        }
     }
 
     fn store_thumb(&mut self, ctx: &egui::Context, key: (photocraft_doc::LayerId, u8), rev: u64, img: egui::ColorImage) -> egui::TextureId {
@@ -977,6 +1022,9 @@ impl PhotocraftApp {
 /// Cheap identity of a surface's pixels: tile coordinates and `Arc` pointers.
 pub fn surface_fingerprint(s: &photocraft_raster::Surface) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ s.tile_count() as u64;
+    for value in s.default_pixel() {
+        h = (h ^ u64::from(value.to_bits())).wrapping_mul(0x100_0000_01b3);
+    }
     for (c, t) in s.tiles() {
         let p = std::sync::Arc::as_ptr(t) as usize as u64;
         h = (h ^ p ^ ((c.tx as u64) << 32 | c.ty as u32 as u64)).wrapping_mul(0x100_0000_01b3);
