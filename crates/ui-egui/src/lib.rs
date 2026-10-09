@@ -787,7 +787,10 @@ impl eframe::App for PhotocraftApp {
             self.fonts_ready = true;
         }
         self.frame += 1;
-        self.poll_jobs(ctx);
+        // The job windows use the theme's named fonts, which exist only from the second frame.
+        if self.fonts_ready {
+            self.poll_jobs(ctx);
+        }
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame_time) as f32;
         if dt > 0.0 {
