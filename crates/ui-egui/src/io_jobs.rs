@@ -21,6 +21,7 @@ struct Running {
     progress: Progress,
     receiver: Receiver<Message>,
     operation: Operation,
+    initial_active: Option<DocId>,
 }
 #[derive(Default)]
 pub(crate) struct IoJobs {
@@ -36,7 +37,7 @@ impl Drop for IoJobs {
 
 impl IoJobs {
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open(&mut self, path: String, import: BackgroundImportFn) -> Result<(), String> {
+    pub fn open(&mut self, path: String, import: BackgroundImportFn, initial_active: Option<DocId>) -> Result<(), String> {
         let (sender, receiver) = mpsc::channel();
         let progress = Progress::default();
         let task_progress = progress.clone();
@@ -52,7 +53,7 @@ impl IoJobs {
                 let _ = sender.send(Message::Opened(result));
             })
             .map_err(|e| format!("could not start import: {e}"))?;
-        self.running.push(Running { path, progress, receiver, operation: Operation::Open { preview: None } });
+        self.running.push(Running { path, progress, receiver, operation: Operation::Open { preview: None }, initial_active });
         Ok(())
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -70,7 +71,7 @@ impl IoJobs {
                 let _ = sender.send(Message::Saved(result));
             })
             .map_err(|e| format!("could not start save: {e}"))?;
-        self.running.push(Running { path, progress, receiver, operation: Operation::Save { before, revision } });
+        self.running.push(Running { path, progress, receiver, operation: Operation::Save { before, revision }, initial_active: None });
         Ok(())
     }
     pub fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
@@ -92,10 +93,16 @@ impl IoJobs {
                                 continue;
                             }
                             document.name = file_open::display_name(&running.path);
+                            let previous = app.session.active().map(|st| st.doc.id);
                             app.session.add_document(document, None);
                             if let Some(st) = app.session.active_mut() {
                                 st.busy = true;
                                 *preview = Some(st.doc.id);
+                            }
+                            if previous != running.initial_active
+                                && let Some(index) = app.session.documents().iter().position(|st| Some(st.doc.id) == previous)
+                            {
+                                app.session.set_active(index);
                             }
                             app.sync_views();
                         }
@@ -128,10 +135,14 @@ impl IoJobs {
                                 app.ui.status = "Opening cancelled".into();
                                 app.ui.status_error = false;
                             }
-                            Err(_) if running.progress.is_cancelled() => { app.ui.status = "Opening cancelled".into(); app.ui.status_error = false; }
+                            Err(_) if running.progress.is_cancelled() => {
+                                app.ui.status = "Opening cancelled".into();
+                                app.ui.status_error = false;
+                            }
                             Err(error) => app.open_failed(&file_open::display_name(&running.path), &error),
                         }
                         if active != preview_id
+                            && active != running.initial_active
                             && let Some(index) = app.session.documents().iter().position(|st| Some(st.doc.id) == active)
                         {
                             app.session.set_active(index);
@@ -180,7 +191,10 @@ impl IoJobs {
                             Operation::Save { before, .. } => app.session.release_job(before),
                             Operation::Open { preview: Some(id) } => {
                                 if let Some(index) = app.session.documents().iter().position(|st| st.doc.id == *id) {
-                                    if let Some(st) = app.session.documents().get(index) { let before = st.doc.clone(); app.session.release_job(&before); }
+                                    if let Some(st) = app.session.documents().get(index) {
+                                        let before = st.doc.clone();
+                                        app.session.release_job(&before);
+                                    }
                                     app.session.close(index);
                                     app.sync_views();
                                 }

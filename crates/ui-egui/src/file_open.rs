@@ -50,7 +50,7 @@ impl PhotocraftApp {
         if !crate::preset_files_ui::is_preset_file(path) && photocraft_engine::jobs::enabled()
             && !self.automation_input && !self.jobs.force_sync
             && let Some(import) = self.services.background_import.clone() {
-            self.jobs.io.open(path.into(), import)?;
+            self.jobs.io.open(path.into(), import, self.session.active().map(|st| st.doc.id))?;
             self.ui.status = format!("Opening {path}");
             self.ui.status_error = false;
             return Ok(Vec::new());
