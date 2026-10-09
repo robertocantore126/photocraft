@@ -233,11 +233,31 @@ fn canvas_size(s: &mut Session, p: &Value) -> Result<Value> {
         {
             let fmt = surf.format();
             let px = photocraft_raster::from_rgba(&fmt, ext);
-            let keep = surf.content_bounds().intersect(&old);
-            let saved = surf.to_interleaved(keep);
-            surf.fill_rect(canvas, &px);
-            if !keep.is_empty() {
-                surf.write_interleaved(keep, &saved);
+            if std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() == Ok("0") {
+                let keep = surf.content_bounds().intersect(&old);
+                let saved = surf.to_interleaved(keep);
+                surf.fill_rect(canvas, &px);
+                if !keep.is_empty() {
+                    surf.write_interleaved(keep, &saved);
+                }
+            } else {
+                // Keep the existing canvas pixels and COW tiles untouched. Extending the
+                // Background needs only the newly exposed bands, never a full-image buffer.
+                let keep = canvas.intersect(&old);
+                if keep.is_empty() {
+                    surf.fill_rect(canvas, &px);
+                } else {
+                    for band in [
+                        Rect::new(canvas.x0, canvas.y0, canvas.x1, keep.y0),
+                        Rect::new(canvas.x0, keep.y1, canvas.x1, canvas.y1),
+                        Rect::new(canvas.x0, keep.y0, keep.x0, keep.y1),
+                        Rect::new(keep.x1, keep.y0, canvas.x1, keep.y1),
+                    ] {
+                        if !band.is_empty() {
+                            surf.fill_rect(band, &px);
+                        }
+                    }
+                }
             }
         }
         Ok(())
