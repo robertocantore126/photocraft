@@ -17,11 +17,17 @@ struct Running {
     progress: Progress,
     receiver: Receiver<(PreparedJob, Result<Value>)>,
 }
-#[derive(Default)]
 pub(crate) struct Jobs {
     running: Vec<Running>,
     pub force_sync: bool,
     pub io: crate::io_jobs::IoJobs,
+}
+impl Default for Jobs {
+    fn default() -> Self {
+        // This crate's unit tests drive commands and read their results in the same call:
+        // they run synchronously there. The app (and integration tests) use background jobs.
+        Self { running: Vec::new(), force_sync: cfg!(test), io: Default::default() }
+    }
 }
 impl Jobs {
     pub fn start(&mut self, mut prepared: PreparedJob) -> std::result::Result<Value, String> {

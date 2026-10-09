@@ -236,6 +236,11 @@ fn translate_tiles(s: &Surface, dx: i32, dy: i32) -> Option<Surface> {
             out.write_interleaved(rect, &bytes);
         }
     }
+    if !aligned {
+        // A shifted tile spills into up to four destination tiles; drop those left holding
+        // only the default pixel, as the pixel-by-pixel path never creates them.
+        out.prune();
+    }
     if let Some(bounds) = s.content_bounds_hint() {
         let shifted = Rect::new(bounds.x0.checked_add(dx)?, bounds.y0.checked_add(dy)?, bounds.x1.checked_add(dx)?, bounds.y1.checked_add(dy)?);
         // Bounds are optional acceleration metadata: rejecting an unavailable hint merely
