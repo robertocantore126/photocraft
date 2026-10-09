@@ -293,7 +293,7 @@ const NAVIGATOR_SETTLE_MS: f64 = 200.0;
 /// itself; with the GPU canvas a thumbnail cached per revision, so an edit to a huge document
 /// doesn't also pay a full-resolution CPU composite for the navigator.
 pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<egui::TextureId> {
-    if app.gpu.is_none() {
+    if app.gpu.is_none() && std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
         return ensure_texture(app, ctx, idx).map(|(t, _)| t);
     }
     let (revision, id) = app.session.documents().get(idx).map(|st| (st.revision, st.doc.id))?;
@@ -317,7 +317,17 @@ pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         return Some(t.id());
     }
     let t0 = crate::gpu_canvas::now_ms();
-    let image = display_image(display.as_deref(), &photocraft_compose::thumbnail_buffer(&doc, NAVIGATOR_SIDE));
+    let buffer = if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() != Ok("0") {
+        // A viewport filter proxy intentionally omits pixels away from the view; the navigator
+        // keeps the complete committed image until the filter is applied in that case.
+        let source = if filter_display_factor(app, idx) > 1 { app.session.documents().get(idx)?.doc.clone() } else { doc.clone() };
+        let level = photocraft_raster::Surface::mip_level_for_size(source.bounds(), NAVIGATOR_SIDE);
+        let proxy = photocraft_compose::mip_view::document_region(&source, level, source.bounds()).ok()?;
+        photocraft_compose::thumbnail_buffer(&proxy, NAVIGATOR_SIDE)
+    } else {
+        photocraft_compose::thumbnail_buffer(&doc, NAVIGATOR_SIDE)
+    };
+    let image = display_image(display.as_deref(), &buffer);
     let tex = match cached {
         Some((_, _, mut t)) => {
             t.set(image, TextureOptions::LINEAR);
@@ -430,7 +440,7 @@ pub(crate) struct ViewTexture {
     texture: egui::TextureHandle,
 }
 
-fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform) -> Option<(egui::TextureId, DRect)> {
+fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform, view_id: egui::Id) -> Option<(egui::TextureId, DRect)> {
     if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
         return None;
     }
@@ -455,7 +465,7 @@ fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize,
     if reduced.width() > MAX_TEXTURE || reduced.height() > MAX_TEXTURE {
         return None;
     }
-    let key = egui::Id::new(("viewport-cpu", ctx.viewport_id(), idx, doc.id.0));
+    let key = egui::Id::new(("viewport-cpu", view_id, doc.id.0));
     let cache_id = (doc.id, key.value());
     let cached = app.view_textures.get(&cache_id).cloned();
     if let Some(cached) = &cached
@@ -467,7 +477,8 @@ fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize,
         return Some((cached.texture.id(), cached.area));
     }
     let proxy = photocraft_compose::mip_view::document_region(&doc, level, area).ok()?;
-    let buffer = photocraft_compose::render(&proxy, reduced);
+    let active = app.session.documents().get(idx)?.active_layer;
+    let buffer = app.cpu_prefix.entry(doc.id).or_default().render(&proxy, reduced, active).unwrap_or_else(|_| photocraft_compose::render(&proxy, reduced));
     let image = display_image(display.as_deref(), &buffer);
     let texture = match cached {
         Some(mut cached) => {
@@ -875,6 +886,7 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     let documents = app.session.documents();
     app.view_textures.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
     app.view_mips.retain(|(id, _), _| documents.iter().any(|st| st.doc.id == *id));
+    app.cpu_prefix.retain(|id, _| documents.iter().any(|st| st.doc.id == *id));
     if app.filter_preview.as_ref().is_some_and(|preview| !documents.iter().any(|st| st.doc.id == preview.doc)) {
         app.filter_preview = None;
     }
@@ -1225,6 +1237,9 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         crate::gpu_canvas::GpuCanvas::paint(&painter, rect, params);
     } else if !flip && let Some(frame) = ensure_gpu_view(app, &ctx, idx, &xf, ui.id().with(ctx.viewport_id())) {
         on_gpu = true;
+        if !crate::theme::Tokens::get(&ctx).bevel && drop_shadow {
+            painter.add(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(img_rect, 0));
+        }
         let k = frame.factor as f32;
         let params = crate::gpu_canvas::ViewParams {
             doc: frame.key,
@@ -1277,7 +1292,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                 painter.rect_filled(img_rect, 0.0, Color32::WHITE);
             }
         }
-        if let Some((tex, area)) = ensure_view_texture(app, &ctx, idx, &xf) {
+        if let Some((tex, area)) = ensure_view_texture(app, &ctx, idx, &xf, ui.id().with(ctx.viewport_id())) {
             let uv = if flip { Rect::from_min_max(pos2(1.0, 0.0), pos2(0.0, 1.0)) } else { Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)) };
             painter.image(tex, xf.doc_rect(area), uv, Color32::WHITE);
         } else if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0")

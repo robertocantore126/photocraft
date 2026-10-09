@@ -8,4 +8,4 @@ W10: native large dabs rasterize independent rows using Rayon above 65,536 pixel
 
 Files: crates/ui-egui/src/{canvas,filter_dialog}.rs; crates/paint/{Cargo.toml,src/render.rs}.
 
-No tests, benchmarks, timing measurements or visual comparisons were added or run, as requested. Build verification pending. W9 viewport/latest-wins previews, W5 viewport composition, W9 GPU filter kernels and optional W11 remain open in this initial commit.
+No tests, benchmarks, timing measurements or visual comparisons were added or run, as requested. Native cargo check -p photocraft-ui-egui passed, including photocraft-paint. W9 viewport/latest-wins and W5 work followed in W5-W9-viewport-2026-10-09.md; optional W11 remains deferred. Full build/wasm/layers are checked on the integration branch.

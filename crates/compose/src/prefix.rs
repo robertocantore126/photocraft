@@ -6,7 +6,7 @@ use std::sync::Arc;
 use photocraft_doc::{DocId, Document, Layer, LayerContent, LayerId, Pattern};
 use photocraft_geom::{Rect, Size};
 
-use crate::{Buffer, Ctx, RENDER_TILE, composite_stack};
+use crate::{Buffer, Ctx, composite_stack};
 
 const BUDGET: usize = 64 << 20;
 const MAX_PIXELS: u64 = 16 << 20;

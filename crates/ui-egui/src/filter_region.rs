@@ -43,7 +43,8 @@ impl Request {
             photocraft_algo::Halo::Radius(r) => r,
             _ => return None,
         };
-        let proxy_area = self.visible.inflate(halo.saturating_add((1i32 << self.level).saturating_mul(32)));
+        let output_visible = self.visible.inflate(photocraft_compose::mip_view::source_margin(&self.doc));
+        let proxy_area = output_visible.inflate(halo.saturating_add((1i32 << self.level).saturating_mul(32)));
         let proxy = match &self.proxy {
             Some((level, area, proxy)) if *level == self.level && area.contains_rect(&proxy_area) => proxy.clone(),
             _ => Arc::new(photocraft_compose::mip_view::document_region(&self.doc, self.level, proxy_area).ok()?),
@@ -63,13 +64,16 @@ impl Request {
         let fp = photocraft_engine::filters::params_for(&self.command, &params)?;
         let source = proxy.layer(self.active)?.surface()?;
         let canvas = proxy.bounds();
-        let selection =
-            if self.level == 0 { self.doc.selection.clone() } else { self.doc.selection.as_ref().and_then(|s| s.mip_surface(self.level, proxy_area).ok()) };
+        let selection = if self.level == 0 {
+            self.doc.selection.clone()
+        } else {
+            self.doc.selection.as_ref().map(|s| s.mip_surface(self.level, proxy_area)).transpose().ok()?
+        };
         let selection_bounds = self.doc.selection.as_ref().map(|s| photocraft_raster::Surface::mip_bounds(s.content_bounds(), self.level));
         let bounds = selection_bounds.filter(|r| !r.is_empty()).unwrap_or(canvas);
         let content = photocraft_compose::bounds::content_bounds(source);
         let area =
-            photocraft_algo::output_area(&fp, content, bounds, selection_bounds).intersect(&photocraft_raster::Surface::mip_bounds(self.visible, self.level));
+            photocraft_algo::output_area(&fp, content, bounds, selection_bounds).intersect(&photocraft_raster::Surface::mip_bounds(output_visible, self.level));
         // apply_in reads the exact kernel halo and original canvas extent; cropping the source
         // to the output rectangle alone would introduce artificial edges around the viewport.
         if progress.is_cancelled() {
@@ -83,7 +87,7 @@ impl Request {
             photocraft_algo::FilterParams::HighPass { radius } => photocraft_gpu::filters::Filter::HighPass { radius },
             _ => return None,
         };
-        let filtered =
+        let mut filtered =
             self.gpu.as_ref().and_then(|gpu| gpu.filter_surface(source, gpu_filter, area, canvas.union(&content), selection.as_ref()).ok()).unwrap_or_else(
                 || {
                     photocraft_algo::progress::with_progress(progress, || {
@@ -91,6 +95,11 @@ impl Request {
                     })
                 },
             );
+        if self.level > 0 {
+            // The display proxy contains only a viewport. Keep its true layer anchor while
+            // including any newly visible nonzero filtered pixels outside the original bounds.
+            filtered.set_content_bounds_hint(Some(content.union(&filtered.exact_content_bounds())));
+        }
         let result = if progress.is_cancelled() {
             None
         } else {
@@ -156,7 +165,7 @@ impl RegionPreview {
             return;
         }
         let Some(mut request) = self.next.take() else { return };
-        request.proxy = self.proxy.clone();
+        request.proxy = if std::env::var("PHOTOCRAFT_FILTER_PROXY").as_deref() != Ok("0") { self.proxy.clone() } else { None };
         let progress = Progress::default();
         #[cfg(target_arch = "wasm32")]
         {

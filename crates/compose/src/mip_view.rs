@@ -121,6 +121,29 @@ fn layer(layer: &mut Layer, level: u32, depth: u32, visible: Rect) -> Result<(),
     Ok(())
 }
 
+fn reach(layers: &[Layer], depth: u32) -> i32 {
+    if depth >= 256 {
+        return 0;
+    }
+    layers
+        .iter()
+        .map(|l| {
+            let own = if crate::effects::has_effects(l) { crate::effects::margin(l) } else { 0 };
+            let children = if let LayerContent::Group(g) = &l.content { reach(&g.children, depth + 1) } else { 0 };
+            let mask_feather =
+                l.mask.as_ref().filter(|m| m.enabled).map_or(0.0, |m| m.feather).max(l.vector_mask.as_ref().filter(|m| m.enabled).map_or(0.0, |m| m.feather));
+            let mask_halo = (mask_feather.max(0.0).min(1_000_000.0) * 4.0).ceil() as i32;
+            own.saturating_add(mask_halo).saturating_add(children)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Source pixels required around a display viewport by nested effects and mask feathering.
+pub fn source_margin(doc: &Document) -> i32 {
+    reach(&doc.layers, 0)
+}
+
 pub fn document(doc: &Document, level: u32) -> Result<Document, String> {
     document_region(doc, level, doc.bounds())
 }
@@ -136,28 +159,7 @@ pub fn document_region(doc: &Document, level: u32, visible: Rect) -> Result<Docu
     }
     let factor = 1u32 << level;
     result.size = Size::new(doc.size.width.div_ceil(factor), doc.size.height.div_ceil(factor));
-    fn reach(layers: &[Layer], depth: u32) -> i32 {
-        if depth >= 256 {
-            return 0;
-        }
-        layers
-            .iter()
-            .map(|l| {
-                let own = if crate::effects::has_effects(l) { crate::effects::margin(l) } else { 0 };
-                let children = if let LayerContent::Group(g) = &l.content { reach(&g.children, depth + 1) } else { 0 };
-                let mask_feather = l
-                    .mask
-                    .as_ref()
-                    .filter(|m| m.enabled)
-                    .map_or(0.0, |m| m.feather)
-                    .max(l.vector_mask.as_ref().filter(|m| m.enabled).map_or(0.0, |m| m.feather));
-                let mask_halo = (mask_feather.max(0.0).min(1_000_000.0) * 4.0).ceil() as i32;
-                own.saturating_add(mask_halo).saturating_add(children)
-            })
-            .max()
-            .unwrap_or(0)
-    }
-    let visible = visible.inflate(reach(&doc.layers, 0).saturating_add((factor as i32).saturating_mul(2)));
+    let visible = visible.inflate(source_margin(doc).saturating_add((factor as i32).saturating_mul(2)));
     for l in &mut result.layers {
         layer(l, level, 0, visible)?;
     }
