@@ -88,7 +88,7 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{"layer":id?,"expanded":bool?,"all":bool?} (no expanded: toggle; all: every group; not an undo step)"##,
         enabled: has_group,
         run: set_expanded,
-        journal: false,
+        journal: false, job: None,
     }]
 }
 

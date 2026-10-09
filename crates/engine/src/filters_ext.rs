@@ -446,7 +446,7 @@ macro_rules! cmd {
             params: $params,
             enabled: crate::filters::has_filterable_layer,
             run: |s, p| crate::filters::run_filter(s, $id, p),
-            journal: true,
+            journal: true, job: None,
         }
     };
 }

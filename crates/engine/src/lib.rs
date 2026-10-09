@@ -37,6 +37,7 @@ pub mod gallery_cmds;
 pub mod group_view_cmds;
 pub mod image_cmds;
 pub mod inspect;
+pub mod jobs;
 pub mod layer_menu_cmds;
 pub mod layer_multi_cmds;
 pub mod layer_style;
@@ -126,6 +127,8 @@ pub(crate) fn active_layer_of(s: &Session) -> std::result::Result<&photocraft_do
 #[derive(Clone, Debug)]
 pub struct DocState {
     pub doc: Arc<Document>,
+    /// A background edit owns this document until its result is collected.
+    pub busy: bool,
     pub history: History,
     /// The primary ("key") layer: what single-layer commands act on. Always a member of
     /// `selected_layers` when set.
@@ -164,6 +167,7 @@ impl DocState {
         let active_layer = doc.top_layer();
         Self {
             doc: Arc::new(doc),
+            busy: false,
             history: History::default(),
             active_layer,
             selected_layers: active_layer.into_iter().collect(),
@@ -356,7 +360,7 @@ impl Session {
     }
 
     pub fn close(&mut self, index: usize) -> Option<DocState> {
-        if index >= self.docs.len() {
+        if index >= self.docs.len() || self.docs.get(index).is_some_and(|st| st.busy) {
             return None;
         }
         smart_cmds::on_close(self, index);
@@ -372,6 +376,9 @@ impl Session {
     /// single "Edit Type Layer" step for a whole typing session or one step per slider drag.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if spec.journal && self.active().is_some_and(|st| st.busy) {
+            return Err(EngineError::Disabled(id.into(), "document is busy".into()));
+        }
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
@@ -427,26 +434,41 @@ impl Session {
 
     /// Is the command currently runnable? (drives menu enablement)
     pub fn is_enabled(&self, id: &str) -> bool {
-        commands::find(id).is_some_and(|s| (s.enabled)(self).is_ok())
+        commands::find(id).is_some_and(|s| (!s.journal || !self.active().is_some_and(|st| st.busy)) && (s.enabled)(self).is_ok())
     }
 
     /// Apply an undoable edit to the active document.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
-        let restrict = self.color_restrict;
-        let st = self.active_mut().ok_or(EngineError::NoDocument)?;
-        let before = st.doc.clone();
-        let mut doc = (*before).clone();
-        let mut active = st.active_layer;
+        let (before, mut doc, mut active) = self.begin_edit()?;
         let r = f(&mut doc, &mut active)?;
-        if let (Some(k), Some(id)) = (restrict, active) {
-            channel_cmds::restrict_to_color(&before, &mut doc, id, k);
+        self.commit_edit(before, doc, active, label)?;
+        Ok(r)
+    }
+
+    /// Snapshot an edit without holding a mutable session borrow during the work.
+    pub fn begin_edit(&self) -> Result<(Arc<Document>, Document, Option<LayerId>)> {
+        let st = self.active().ok_or(EngineError::NoDocument)?;
+        if st.busy {
+            return Err(EngineError::Other("document is busy".into()));
         }
-        st.doc = Arc::new(doc);
+        Ok((st.doc.clone(), (*st.doc).clone(), st.active_layer))
+    }
+
+    /// Commit only to the document that supplied the snapshot, even after switching tabs.
+    pub fn commit_edit(&mut self, before: Arc<Document>, mut after: Document, active: Option<LayerId>, label: &str) -> Result<()> {
+        let restrict = self.color_restrict;
+        let key = self.coalesce_request.clone();
+        let st = self.docs.iter_mut().find(|st| st.doc.id == before.id).ok_or(EngineError::NoDocument)?;
+        if !Arc::ptr_eq(&before, &st.doc) {
+            return Err(EngineError::Other("background result discarded: the document changed while work was running".into()));
+        }
+        if let (Some(k), Some(id)) = (restrict, active) {
+            channel_cmds::restrict_to_color(&before, &mut after, id, k);
+        }
+        st.doc = Arc::new(after);
         st.active_layer = active;
         fix_selection(st);
         channel_cmds::fix_view(st);
-        let key = self.coalesce_request.clone();
-        let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         st.last_damage = damage::between(&before, &st.doc);
         st.pixel_damage = false;
         if key.is_none() || st.coalesce != key || !st.history.can_undo() {
@@ -454,13 +476,14 @@ impl Session {
             st.history.trim(&st.doc);
         }
         st.coalesce = key;
-        st.revision += 1;
-        Ok(r)
+        st.revision = st.revision.saturating_add(1);
+        Ok(())
     }
 
     /// Replace the active document's active layer without creating a history step.
     pub fn select_layer(&mut self, id: LayerId) -> Result<()> {
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
+        if st.busy { return Err(EngineError::Other("document is busy".into())); }
         if st.doc.layer(id).is_none() {
             return Err(EngineError::NoLayer(id));
         }
@@ -479,6 +502,7 @@ impl Session {
 
     pub fn undo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
+        if st.busy { return false; }
         st.coalesce = None;
         match st.history.undo(st.doc.clone()) {
             Some(d) => {
@@ -494,6 +518,7 @@ impl Session {
 
     pub fn redo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
+        if st.busy { return false; }
         st.coalesce = None;
         match st.history.redo(st.doc.clone()) {
             Some(d) => {

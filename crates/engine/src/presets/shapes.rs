@@ -436,7 +436,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → {groups:[{name,shapes:[{name,subpaths}]}]}",
             enabled: always,
             run: list,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "shape.presets.place",
@@ -446,7 +446,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"preset":name,"group":name?,"rect":[x,y,w,h]? (default: centred, half the canvas),"keepAspect":bool=true,"fill":…?=foreground,"stroke":…?,"name":str?,"addTo":layerId?,"op":"combine|subtract|intersect|exclude"?} → shape.info (Custom Shape tool / Shapes panel; fill and stroke as in shape.create)"##,
             enabled: has_doc,
             run: place,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "shape.presets.new",
@@ -456,7 +456,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"name":str="Shape","group":name?,"path":{…path}|"M x y L …" (preset path language)|"work"|saved path name? (default: work path, active shape layer or vector mask)}"##,
             enabled: always,
             run: new_preset,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "shape.presets.edit",
@@ -466,7 +466,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: super::GROUP_EDIT_PARAMS,
             enabled: always,
             run: edit,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "shape.presets.reset",
@@ -476,7 +476,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"append":bool=false}"##,
             enabled: always,
             run: reset,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

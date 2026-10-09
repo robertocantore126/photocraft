@@ -198,7 +198,7 @@ fn delete_group(s: &mut Session, p: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, $params:literal, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[], shortcut: None, params: $params, enabled: always, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[], shortcut: None, params: $params, enabled: always, run: $run, journal: true, job: None }
     };
 }
 

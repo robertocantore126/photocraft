@@ -377,7 +377,7 @@ fn list(s: &mut Session) -> Result<Value> {
 
 macro_rules! spec {
     ($id:expr, $label:expr, $menu:expr, $params:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: $params, enabled: has_doc, journal: true, run: $run }
+        CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: $params, enabled: has_doc, journal: true, job: None, run: $run }
     };
 }
 
@@ -423,7 +423,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "List Variables",
             menu: &[],
             shortcut: None,
-            journal: false,
+            journal: false, job: None,
             params: "{} → {defs,dataSets,active}",
             enabled: has_doc,
             run: |s, _| list(s),

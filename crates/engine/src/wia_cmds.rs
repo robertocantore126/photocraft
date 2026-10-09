@@ -29,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
         shortcut: None,
         params: r#"{} → {available, devices, note}: acquire from a scanner/camera (Windows only)"#,
         enabled: |_s| Ok(()),
-        journal: false,
+        journal: false, job: None,
         run: |s, p| wia(s, p),
     }]
 }

@@ -60,7 +60,7 @@ pub fn specs() -> Vec<CommandSpec> {
         shortcut: None,
         params: r#"{"name":str?} → {layer, frame:[x,y,w,h]}: groups the selected layers and clips them to a frame rect"#,
         enabled: has_layer,
-        journal: true,
+        journal: true, job: None,
         run: |s, p| frame_from_layers(s, p),
     }]
 }

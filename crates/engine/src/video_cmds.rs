@@ -349,7 +349,7 @@ fn render_video(s: &mut Session, p: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:expr, $label:expr, $menu:expr, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: "{} → {}", enabled: $en, journal: true, run: $run }
+        CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: "{} → {}", enabled: $en, journal: true, job: None, run: $run }
     };
 }
 

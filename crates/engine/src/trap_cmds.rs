@@ -50,7 +50,7 @@ pub fn specs() -> Vec<CommandSpec> {
         shortcut: None,
         params: r#"{width:px>=1=1} → {trapped,width}: spread inks at colour edges (CMYK only)"#,
         enabled,
-        journal: true,
+        journal: true, job: None,
         run: |s, p| trap(s, p),
     }]
 }

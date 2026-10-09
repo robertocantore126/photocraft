@@ -1428,7 +1428,7 @@ fn list(s: &Session) -> Value {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 
@@ -1539,7 +1539,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: has_doc,
             run: |s, _| Ok(list(s)),
-            journal: false,
+            journal: false, job: None,
         },
         spec!("channel.target.composite", "Target Composite Channel", [], Some("Cmd+2"), "{}", has_doc, |s, _| target_slot(s, 2)),
         spec!("channel.target.slot3", "Target Channel 3", [], Some("Cmd+3"), "{}", slot_ok::<3>, |s, _| target_slot(s, 3)),

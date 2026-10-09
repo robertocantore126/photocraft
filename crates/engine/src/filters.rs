@@ -176,6 +176,13 @@ pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), Strin
 }
 
 pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
+    let job = prepare_job(s, id, p)?;
+    let label = job.label.clone();
+    let progress = crate::jobs::Progress::default();
+    s.edit(&label, move |doc, active| job.run(doc, active, &progress))
+}
+
+pub(crate) fn prepare_job(s: &Session, id: &str, p: &Value) -> Result<crate::jobs::Job> {
     // Session state some filters read (colours) becomes explicit params; external inputs resolve here.
     let prepared = crate::filters_ext::prepare(s, id, p);
     let p = &prepared;
@@ -190,7 +197,11 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
     if let Value::Object(m) = &mut params {
         m.remove("__kind");
     }
-    s.edit(&label, |doc, _| {
+    let p = prepared;
+    let id = id.to_string();
+    Ok(crate::jobs::Job::new(label, move |doc, _, progress| {
+        let p = &p;
+
         let selection = doc.selection.clone();
         let sel_bounds = selection.as_ref().map(photocraft_raster::Surface::content_bounds);
         // Distortions centre on the selection when there is one, else the canvas.
@@ -202,7 +213,7 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
             let content = surf.content_bounds();
             let area = algo::output_area(&fp, content, bounds, sel_bounds);
             *surf = algo::apply_in(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content));
-            return Ok(());
+            return Ok(json!({ "layer": layer.0 }));
         }
         let l = doc.layer_mut(layer).ok_or(EngineError::NoLayer(layer))?;
         crate::filters_ext::resolve_in_layer(&mut fp, l, bounds);
@@ -212,16 +223,17 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
                 // Non-destructive: record the filter and re-render the smart object from its source.
                 let sf =
                     SmartFilter { command: id.to_string(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
-                return crate::smart_cmds::add_smart_filter(doc, layer, sf, selection.as_ref());
+                crate::smart_cmds::add_smart_filter(doc, layer, sf, selection.as_ref())?;
+                return Ok(json!({ "layer": layer.0 }));
             }
             _ => return Err(EngineError::Other("not a pixel layer".into())),
         };
         let content = surf.content_bounds();
         let area = algo::output_area(&fp, content, bounds, sel_bounds);
         *surf = algo::apply_in(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content));
-        Ok(())
-    })?;
-    Ok(json!({ "layer": layer.0, "filter": serde_json::to_value(&fp).unwrap_or(Value::Null) }))
+        crate::jobs::check(progress)?;
+        Ok(json!({ "layer": layer.0, "filter": serde_json::to_value(&fp).unwrap_or(Value::Null) }))
+    }))
 }
 
 macro_rules! filter_cmd {
@@ -234,7 +246,7 @@ macro_rules! filter_cmd {
             params: $params,
             enabled: has_filterable_layer,
             run: |s, p| run_filter(s, $id, p),
-            journal: true,
+            journal: true, job: None,
         }
     };
 }
@@ -316,7 +328,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let (id, params) = last_filter(s).ok_or_else(|| EngineError::Other("no filter applied yet".into()))?;
                 run_filter(s, &id, &params)
             },
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

@@ -449,7 +449,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"x":px,"y":px (baseline anchor of point text),"text":str,"box":[x,y,w,h]? (paragraph text),"name":str?,"align":"left|center|right|justify…"?, …character keys: "font","size":pt=12,"color",…}"##,
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| {
                 let text = norm_text(p.get("text").and_then(Value::as_str).unwrap_or(""));
                 // Type › Save Default Type Styles sets the starting styles; the colour is always
@@ -496,7 +496,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"layer":id?,"text":str? (replace all, styles kept),"replace":{"start":char,"end":char,"text":str}?,"runs":[{"start":char,"end":char,…character keys}]?,"box":[x,y,w,h]? (to paragraph text),"point":[x,y]? (to point text),"move":[dx,dy]?,"transform":[a,b,c,d,e,f]?,"antialias":"none|sharp|crisp|strong|smooth"?,"name":str?}"##,
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| {
                 let id = layer_id(s, p)?;
                 let name = p.get("name").and_then(Value::as_str).map(str::to_string);
@@ -569,7 +569,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     .into_boxed_str(),
             ),
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| {
                 let id = layer_id(s, p)?;
                 with_text_layer(s, p, "Set Type Style", |t, _| {
@@ -598,7 +598,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"layer":id?}"##,
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| {
                 let id = layer_id(s, p)?;
                 s.edit("Rasterize Type", |doc, _| {
@@ -626,7 +626,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"layer":id?} → text, runs/paragraphs (char offsets + styles), shape, transform, laid-out lines (text space px), bounds"##,
             enabled: has_doc,
-            journal: false,
+            journal: false, job: None,
             run: |s, p| info(s, p),
         },
         CommandSpec {
@@ -636,7 +636,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"family":str? (faces of one family)}"##,
             enabled: |_| Ok(()),
-            journal: false,
+            journal: false, job: None,
             run: |_, p| {
                 let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
                 match p.get("family").and_then(Value::as_str) {

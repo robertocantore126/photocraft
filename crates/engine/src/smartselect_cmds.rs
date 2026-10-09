@@ -215,7 +215,7 @@ fn refine_edge(s: &mut Session, p: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $params:literal, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 

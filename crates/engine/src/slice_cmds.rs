@@ -444,7 +444,7 @@ fn clear(s: &mut Session) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     macro_rules! spec {
         ($id:expr, $label:expr, $menu:expr, $params:expr, $enabled:expr, $run:expr) => {
-            CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: $params, enabled: $enabled, journal: true, run: $run }
+            CommandSpec { id: $id, label: $label, menu: $menu, shortcut: None, params: $params, enabled: $enabled, journal: true, job: None, run: $run }
         };
     }
     vec![
@@ -484,7 +484,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: "{} → {slices:[{number,id,origin:auto|layer|user,name,rect:[x,y,w,h],kind,layer,url,alt,…}], locked}",
             enabled: has_doc,
-            journal: false,
+            journal: false, job: None,
             run: |s, _| list(s),
         },
         spec!(

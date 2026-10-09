@@ -96,7 +96,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":".abr file"?,"data":base64 bytes?,"group":string?=file name,"replace":bool=true (replace a group of the same name),"select":bool=false (make the first imported preset current)}"##,
             enabled: always,
             run: import_abr,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "gradient.presets.importGrd",
@@ -106,7 +106,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":".grd file"?,"data":base64 bytes?,"group":string?=file name,"replace":bool=true (replace a group of the same name)}"##,
             enabled: always,
             run: import_grd,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

@@ -233,7 +233,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let folder = FOLDER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, r)| r.clone());
                 Ok(json!({"plugins": registry::list().iter().map(|p| describe(p)).collect::<Vec<_>>(), "folder": folder}))
             },
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "plugin.install",
@@ -243,7 +243,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":text,"data":json,"replace":bool=true} (path: a .wasm file, native only; data: the module as base64)"##,
             enabled: always,
             run: install,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "plugin.remove",
@@ -256,7 +256,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let id = p.get("id").and_then(Value::as_str).ok_or_else(|| bad("plugin.remove", "missing `id`"))?;
                 if registry::remove(id) { Ok(json!({"removed": id})) } else { Err(err(photocraft_plugins::Error::NotFound(id.into()))) }
             },
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "plugin.reload",
@@ -266,7 +266,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":text} (a folder of .wasm plug-ins; default: the Plug-ins preference folder)"##,
             enabled: always,
             run: reload,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: RUN,
@@ -276,7 +276,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"id":text,"params":json} (plug-in parameters under "params" or at the top level; see plugin.list)"##,
             enabled: crate::filters::has_filterable_layer,
             run,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

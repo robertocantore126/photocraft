@@ -147,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"tool":name? (Current Tool Only)} → {presets:[{name,tool}]}"##,
             enabled: always,
             run: list,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "tool.presets.new",
@@ -157,7 +157,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"name":str?=tool,"tool":name,"options":{…}? (opaque; "brush" defaults to the current brush for painting tools),"includeColor":bool=false}"##,
             enabled: always,
             run: new_preset,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "tool.presets.select",
@@ -167,7 +167,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"preset":name} → {name,tool,options} (applies "brush" and "foreground"; the shell switches tool and options)"##,
             enabled: always,
             run: select,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "tool.presets.edit",
@@ -177,7 +177,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"action":"rename|delete","preset":name|[names],"name":str (rename)}"##,
             enabled: always,
             run: edit,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "tool.presets.reset",
@@ -187,7 +187,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: always,
             run: reset,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

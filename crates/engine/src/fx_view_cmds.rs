@@ -68,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{"layer":id?,"expanded":bool?,"all":bool?} (no expanded: toggle; all: every layer with effects; view state, not an undo step)"##,
         enabled: has_effects,
         run: set_expanded,
-        journal: false,
+        journal: false, job: None,
     }]
 }
 

@@ -350,7 +350,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → {active,sources:[{index,source,anchor,offset,layer,width,height,rotation,flipH,flipV}],overlay}",
             enabled: always,
             run: list,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "cloneSource.select",
@@ -360,7 +360,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"index":0..4}"##,
             enabled: always,
             run: select,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "cloneSource.set",
@@ -370,7 +370,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"index":0..4?=active,"source":[x,y]? (⌥-click; re-pairs with the next stroke),"offset":[dx,dy]?,"width":%?,"height":%?|"scale":[w%,h%]?,"rotation":deg?,"flipH":bool?,"flipV":bool?,"layer":id?,"clear":bool?,"select":bool=true}"##,
             enabled: always,
             run: set,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "cloneSource.resetTransform",
@@ -380,7 +380,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"index":0..4?=active}"##,
             enabled: always,
             run: reset_transform,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "cloneSource.overlay",
@@ -390,7 +390,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"show":bool?,"opacity":0..100?,"clipped":bool?,"autoHide":bool?,"invert":bool?,"blend":"normal|darken|lighten|difference"?}"##,
             enabled: always,
             run: overlay,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

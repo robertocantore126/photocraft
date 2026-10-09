@@ -22,6 +22,7 @@ mod artistic;
 mod artistic_fx;
 mod blur;
 mod blur2;
+pub mod progress;
 pub mod camera_raw;
 pub mod content_aware;
 mod denoise;
@@ -879,6 +880,7 @@ pub fn apply_tiled(
     tile: i32,
     extent: Option<Rect>,
 ) -> Surface {
+    let progress = progress::current();
     let mut out = surface.clone();
     if area.is_empty() {
         return out;
@@ -897,7 +899,10 @@ pub fn apply_tiled(
         }
         y += tile;
     }
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let total = tiles.len().max(1);
     let run = |t: &Rect| -> (Rect, Vec<f32>) {
+        if progress.as_ref().is_some_and(|p| p.is_cancelled()) { return (*t, Vec::new()); }
         let owned;
         let src = match (&shared, halo) {
             (Some(s), _) => s,
@@ -930,6 +935,10 @@ pub fn apply_tiled(
                 }
             }
         }
+        if let Some(p) = &progress {
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            p.set_fraction(n as f32 / total as f32);
+        }
         (*t, data)
     };
     // Tiles are filtered in groups of about RESULT_BUDGET bytes (at least one per core) and each
@@ -942,6 +951,7 @@ pub fn apply_tiled(
     let per_tile = (tile.max(1) as usize).pow(2) * fmt.channels() * std::mem::size_of::<f32>();
     let group = (RESULT_BUDGET / per_tile.max(1)).max(threads).max(1);
     for chunk in tiles.chunks(group) {
+        if progress.as_ref().is_some_and(|p| p.is_cancelled()) { return surface.clone(); }
         #[cfg(not(target_arch = "wasm32"))]
         let results: Vec<(Rect, Vec<f32>)> = {
             use rayon::prelude::*;
@@ -950,7 +960,7 @@ pub fn apply_tiled(
         #[cfg(target_arch = "wasm32")]
         let results: Vec<(Rect, Vec<f32>)> = chunk.iter().map(run).collect();
         for (t, data) in results {
-            out.write_region(t, &data);
+            if !data.is_empty() { out.write_region(t, &data); }
         }
     }
     out.prune();

@@ -25,6 +25,8 @@ pub struct CommandSpec {
     pub run: Run,
     /// Record in the session journal (false for queries).
     pub journal: bool,
+    /// Prepare background document work; the UI supplies the internal command id.
+    pub job: Option<fn(&Session, &Value) -> Result<crate::jobs::Job>>,
 }
 
 fn always(_: &Session) -> std::result::Result<(), String> {
@@ -98,7 +100,7 @@ fn turn(s: &mut Session, label: &str, t: crate::canvas_geom::Turn) -> Result<Val
 
 macro_rules! cmd {
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 
@@ -763,7 +765,7 @@ fn build() -> Vec<CommandSpec> {
             params: "{}",
             enabled: always,
             run: |s, _| Ok(inspect::session(s)),
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "document.inspect",
@@ -777,7 +779,7 @@ fn build() -> Vec<CommandSpec> {
                 let d = s.documents().get(i).ok_or(EngineError::NoDocument)?;
                 Ok(inspect::document(d))
             },
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "document.activate",
@@ -790,7 +792,7 @@ fn build() -> Vec<CommandSpec> {
                 let i = p.get("document").and_then(Value::as_u64).ok_or_else(|| bad("document.activate", "missing `document`"))?;
                 if s.set_active(i as usize) { Ok(Value::Null) } else { Err(EngineError::NoDocument) }
             },
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "command.list",
@@ -811,7 +813,7 @@ fn build() -> Vec<CommandSpec> {
                         .collect(),
                 ))
             },
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "document.pixel",
@@ -827,7 +829,7 @@ fn build() -> Vec<CommandSpec> {
                 let px = photocraft_compose::render(&d.doc, Rect::from_xywh(x, y, 1, 1)).px[0];
                 Ok(json!(px))
             },
-            journal: false,
+            journal: false, job: None,
         },
     ];
 
@@ -903,7 +905,7 @@ fn build() -> Vec<CommandSpec> {
                 let adj = crate::adjust_params::from_params(&kind, p, None, doc_mode(s))?;
                 new_adjustment(s, adj)
             },
-            journal: true,
+            journal: true, job: None,
         });
         v.push(CommandSpec {
             id: image_id,
@@ -926,7 +928,7 @@ fn build() -> Vec<CommandSpec> {
                 let label = adj.label().to_string();
                 destructive_adjust(s, &label, adj, p)
             },
-            journal: true,
+            journal: true, job: None,
         });
     }
     v.extend(crate::layer_style::specs());
@@ -991,6 +993,11 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::plugin_cmds::specs());
     v.extend(crate::group_view_cmds::specs());
     v.extend(crate::fx_view_cmds::specs());
+    for spec in &mut v {
+        if crate::jobs::supports(spec.id) {
+            spec.job = Some(crate::jobs::prepare_command);
+        }
+    }
     v
 }
 

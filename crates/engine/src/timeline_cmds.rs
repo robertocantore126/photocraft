@@ -95,7 +95,7 @@ fn info(s: &mut Session) -> Result<Value> {
 
 macro_rules! spec {
     ($id:expr, $label:expr, $params:expr, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[], shortcut: None, params: $params, enabled: $en, journal: false, run: $run }
+        CommandSpec { id: $id, label: $label, menu: &[], shortcut: None, params: $params, enabled: $en, journal: false, job: None, run: $run }
     };
 }
 

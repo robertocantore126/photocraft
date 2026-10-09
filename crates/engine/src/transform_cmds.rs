@@ -280,7 +280,7 @@ pub fn specs() -> Vec<CommandSpec> {
         shortcut: None,
         params: r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (source frame; default = layer content ∩ selection),"quad":[[x,y]×4]? (where the frame's corners go, clockwise from top-left),"matrix":[a,b,c,d,e,f]? (affine alternative),"interpolation":"bicubic|bilinear|nearest"="bicubic"}"##,
         enabled: has_layer,
-        journal: true,
+        journal: true, job: None,
         run: transform,
     }]
 }

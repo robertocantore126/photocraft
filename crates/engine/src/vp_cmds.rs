@@ -203,7 +203,7 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{"planes":[{"corners":[[x,y]×4]} | {"from":plane,"edge":"top|right|bottom|left","angle":deg=90,"depth":1}],"focalLength":px=0,"paste":[{"plane":0,"layer":id? (else the clipboard),"at":[u,v]=[0.25,0.25],"width":0..1=0.5}],"clone":[{"source":[x,y],"points":[[x,y]],"size":px=40,"hardness":0..100=50,"opacity":0..100=100}],"newLayer":bool=false}"##,
         enabled: has_layer,
         run: vanishing_point,
-        journal: true,
+        journal: true, job: None,
     }]
 }
 

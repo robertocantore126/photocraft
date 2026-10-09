@@ -1064,7 +1064,7 @@ const PATH_FORM: &str = r##"path: {"subpaths":[{"closed":bool=true,"op":"combine
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $params:expr, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 
@@ -1107,7 +1107,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let id = layer_id(s, p)?;
                 shape_info(s, id)
             },
-            journal: false,
+            journal: false, job: None,
         },
         spec!("shape.rasterize", "Rasterize Shape", ["Layer", "Rasterize"], r##"{"layer":id?}"##, has_layer, shape_rasterize),
         CommandSpec {
@@ -1118,7 +1118,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{} → {paths:[{name,knots,subpaths}],workPath,clippingPath,layerPath (active layer's shape path / vector mask)}"##,
             enabled: has_doc,
             run: |s, _| paths_list(s),
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: "path.info",
@@ -1132,7 +1132,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let path = resolve_path(s, name)?;
                 Ok(json!({ "name": name.unwrap_or("work"), "path": path_json(&path) }))
             },
-            journal: false,
+            journal: false, job: None,
         },
         spec!(
             "path.set",
@@ -1271,7 +1271,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let id = layer_id(s, p)?;
                 vector_mask_info(s, id)
             },
-            journal: false,
+            journal: false, job: None,
         },
     ]
 }

@@ -442,7 +442,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → {groups:[{name,presets:[{name,stops,transparency}]}],current}",
             enabled: always,
             run: list,
-            journal: false,
+            journal: false, job: None,
         },
         CommandSpec {
             id: CMD_SELECT,
@@ -454,7 +454,7 @@ pub fn specs() -> Vec<CommandSpec> {
             )),
             enabled: always,
             run: select,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "gradient.presets.apply",
@@ -466,7 +466,7 @@ pub fn specs() -> Vec<CommandSpec> {
             )),
             enabled: super::has_doc,
             run: apply,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "gradient.presets.new",
@@ -476,7 +476,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: leak(format!(r##"{{"name":str="Custom","group":name?=first,{stops} (default: the current gradient)}}"##)),
             enabled: always,
             run: new_preset,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "gradient.presets.edit",
@@ -486,7 +486,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: super::GROUP_EDIT_PARAMS,
             enabled: always,
             run: edit,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "gradient.presets.reset",
@@ -496,7 +496,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"append":bool=false}"##,
             enabled: always,
             run: reset,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

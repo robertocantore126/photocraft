@@ -771,7 +771,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"paths":[str]|folder,"useOpenDocuments":bool=false,"layout":"auto|perspective|cylindrical|spherical|collage|reposition","blend":bool=true,"vignetteRemoval":bool=false,"geometricCorrection":bool=false,"contentAwareFill":bool=false,"focalLength":mm=0 (35 mm equivalent; 0 = EXIF or estimated)} → new document, one masked layer per image"##,
             enabled: always,
             run: photomerge,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "file.automate.mergeToHdrPro",
@@ -781,7 +781,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"paths":[str]|folder,"useOpenDocuments":bool=false,"exposures":[ev]? (default EXIF, else estimated),"align":bool=true,"removeGhosts":bool=false,"ghostBase":int?,"mode":"32|16|8","method":"localAdaptation|exposureGamma|highlightCompression|equalizeHistogram","radius":1..500=7,"strength":0.1..4=0.52,"gamma":0.1..2=1,"exposure":-5..5=0,"detail":-100..300=30,"shadow":-100..100=0,"highlight":-100..100=0,"vibrance":-100..100=0,"saturation":-100..100=20} → new document (32-bit linear, or tone-mapped 16/8-bit)"##,
             enabled: always,
             run: merge_to_hdr,
-            journal: true,
+            journal: true, job: None,
         },
         CommandSpec {
             id: "file.automate.cropAndStraightenPhotos",
@@ -791,7 +791,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → one new document per photo found on the scan",
             enabled: has_doc,
             run: crop_and_straighten,
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

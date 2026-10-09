@@ -293,7 +293,7 @@ macro_rules! kind_spec {
             params: "{} (sets the proof and turns Proof Colors on)",
             enabled: has_doc,
             run: |s, _| run_kind(s, $id),
-            journal: false,
+            journal: false, job: None,
         }
     };
 }
@@ -316,7 +316,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"method":"exposureGamma|highlightCompression"="exposureGamma","exposure":-20..20=0,"gamma":0.1..9.99=1}"##,
             enabled: is_32,
             run: preview_32,
-            journal: false,
+            journal: false, job: None,
         },
     ]
 }

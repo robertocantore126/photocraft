@@ -211,7 +211,7 @@ macro_rules! style_cmd {
             params: $params,
             enabled: has_layer,
             run: |s, p| set_effect(s, p, $kind),
-            journal: true,
+            journal: true, job: None,
         }
     };
 }
@@ -280,7 +280,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 })?;
                 Ok(Value::Null)
             },
-            journal: true,
+            journal: true, job: None,
         },
     ]
 }

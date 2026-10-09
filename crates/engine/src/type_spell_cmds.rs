@@ -240,7 +240,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r#"{"action":"list|change|changeAll|addToDictionary|removeFromDictionary|suggest"="list","allLayers":bool=true,"layer":id? (check one layer),"ignore":[word]? (Ignore All for this check),"suggestions":n=5; change: "layer","start","end" (chars),"word"? (verified),"replace"; changeAll: "word","replace"; addToDictionary/removeFromDictionary/suggest: "word"} → list: {"misspellings":[{"layer","start","end","word","suggestions"}],"count"}"#,
             enabled: has_type,
-            journal: true,
+            journal: true, job: None,
             run: check_spelling,
         },
         CommandSpec {
@@ -250,7 +250,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r#"{"layer":id?,"text":str,"at":char? (default: end of text),"range":[startChar,endChar]? (replaced),"label":str?} → {"layer","caret"}"#,
             enabled: has_text_layer,
-            journal: true,
+            journal: true, job: None,
             run: insert_text,
         },
     ]

@@ -399,7 +399,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"name":str?,"rect":[x0,y0,x1,y1]? (default: selection bounds, else the canvas)} → {"pattern":id} (added to the library; samples the visible composite)"##,
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: define,
         },
         CommandSpec {
@@ -409,7 +409,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: "{} → [{id,name,width,height,mode,depth,inDocument,inLibrary}]",
             enabled: always,
-            journal: false,
+            journal: false, job: None,
             run: list,
         },
         CommandSpec {
@@ -419,7 +419,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"pattern":id|name,"name":str}"##,
             enabled: has_pattern,
-            journal: true,
+            journal: true, job: None,
             run: rename,
         },
         CommandSpec {
@@ -429,7 +429,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"pattern":id|name} (library only; documents keep their copy)"##,
             enabled: has_pattern,
-            journal: true,
+            journal: true, job: None,
             run: delete,
         },
         CommandSpec {
@@ -439,7 +439,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"path":".pat file"}"##,
             enabled: always,
-            journal: true,
+            journal: true, job: None,
             run: import,
         },
         CommandSpec {
@@ -449,7 +449,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"path":".pat file","patterns":[id|name]? (default: the whole library)}"##,
             enabled: has_pattern,
-            journal: true,
+            journal: true, job: None,
             run: export,
         },
         CommandSpec {
@@ -459,7 +459,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"pattern":id|name?=first library pattern,"scale":1..1000=100,"angle":deg=0,"link":bool=true,"phase":[x,y]?}"##,
             enabled: has_doc,
-            journal: true,
+            journal: true, job: None,
             run: new_fill_layer,
         },
         CommandSpec {
@@ -469,7 +469,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: r##"{"pattern":id|name,"scale":1..1000?,"enabled":bool=true} (sets the session brush's Texture to that pattern)"##,
             enabled: has_pattern,
-            journal: true,
+            journal: true, job: None,
             run: brush_texture,
         },
     ]

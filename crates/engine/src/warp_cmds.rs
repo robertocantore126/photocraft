@@ -321,7 +321,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: P,
             enabled: has_layer,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| apply(s, p, "edit.transform.warp"),
         },
         CommandSpec {
@@ -331,7 +331,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: P,
             enabled: active_smart,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| apply(s, p, "layer.smartObjects.warp"),
         },
         CommandSpec {
@@ -341,7 +341,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: S,
             enabled: has_layer,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| split(s, p, "edit.transform.splitWarpCrosswise", Split::Crosswise),
         },
         CommandSpec {
@@ -351,7 +351,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: S,
             enabled: has_layer,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| split(s, p, "edit.transform.splitWarpHorizontally", Split::Horizontal),
         },
         CommandSpec {
@@ -361,7 +361,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: S,
             enabled: has_layer,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| split(s, p, "edit.transform.splitWarpVertically", Split::Vertical),
         },
         CommandSpec {
@@ -371,7 +371,7 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: S,
             enabled: has_layer,
-            journal: true,
+            journal: true, job: None,
             run: |s, p| split(s, p, "edit.transform.removeWarpSplit", Split::Remove),
         },
     ]

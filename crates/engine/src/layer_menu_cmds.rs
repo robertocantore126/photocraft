@@ -334,7 +334,7 @@ macro_rules! stack_spec {
             params: r##"{"layer":id?}"##,
             enabled: has_smart,
             run: |s, p| stack_mode(s, p, $mode),
-            journal: true,
+            journal: true, job: None,
         }
     };
 }
@@ -719,7 +719,7 @@ fn write_file(_: &str, _: &[u8]) -> Result<()> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $params:literal, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 
@@ -786,7 +786,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: has_content_options,
             run: content_options,
-            journal: false,
+            journal: false, job: None,
         },
         spec!("layer.quickExportAsPng", "Quick Export as PNG", ["Layer"], r##"{"layer":id?,"path":text}"##, has_layer, |s, p| export_layer(
             s,

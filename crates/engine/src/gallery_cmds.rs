@@ -126,7 +126,7 @@ macro_rules! gallery_specs {
                 params: GalleryFilter::$v.params_doc(),
                 enabled: crate::filters::has_filterable_layer,
                 run: |s, p| crate::filters::run_filter(s, GalleryFilter::$v.command_id(), p),
-                journal: true,
+                journal: true, job: None,
             }
         ),*]
     };
@@ -142,7 +142,7 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{"effects":json,"foreground":json,"background":json,"list":bool}"##,
         enabled: crate::filters::has_filterable_layer,
         run: run_gallery,
-        journal: true,
+        journal: true, job: None,
     }];
     v.extend(gallery_specs![
         ColoredPencil,
