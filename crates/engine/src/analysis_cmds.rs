@@ -1096,7 +1096,7 @@ fn analysis_info(s: &mut Session, _p: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $params:literal, $en:expr, $run:expr, $journal:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: $journal }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: $journal, job: None }
     };
 }
 

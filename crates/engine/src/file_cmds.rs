@@ -209,6 +209,7 @@ pub(crate) fn flattened(doc: &Document, fmt: PixelFormat) -> Surface {
 // ---------- close / revert / save a copy / open as ----------
 
 fn close_all(s: &mut Session) -> Result<Value> {
+    if s.documents().iter().any(|st| st.busy) { return Err(EngineError::Other("a document is busy".into())); }
     let n = s.documents().len();
     while !s.documents().is_empty() {
         s.close(s.documents().len() - 1);
@@ -221,6 +222,7 @@ fn close_others(s: &mut Session, p: &Value) -> Result<Value> {
     if keep >= s.documents().len() {
         return Err(EngineError::BadParams { cmd: "file.closeOthers".into(), msg: format!("no document {keep}") });
     }
+    if s.documents().iter().enumerate().any(|(i, st)| i != keep && st.busy) { return Err(EngineError::Other("a document is busy".into())); }
     let n = s.documents().len() - 1;
     for i in (0..s.documents().len()).rev() {
         if i != keep {

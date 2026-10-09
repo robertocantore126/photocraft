@@ -1391,7 +1391,7 @@ fn toolbar(s: &mut Session, p: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $run:expr, $journal:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: always, run: $run, journal: $journal }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: always, run: $run, journal: $journal, job: None }
     };
 }
 

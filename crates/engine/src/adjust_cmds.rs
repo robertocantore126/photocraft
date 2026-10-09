@@ -323,7 +323,7 @@ fn list_looks(_: &mut Session, _: &Value) -> Result<Value> {
 
 macro_rules! spec {
     ($id:literal, $label:literal, [$($m:literal),*], $params:literal, $en:expr, $run:expr) => {
-        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true, job: None, job: None }
+        CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: None, params: $params, enabled: $en, run: $run, journal: true, job: None }
     };
 }
 
@@ -369,7 +369,7 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: |_| Ok(()),
             run: list_looks,
-            journal: false, job: None, job: None,
+            journal: false, job: None,
         },
     ]
 }

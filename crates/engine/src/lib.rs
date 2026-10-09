@@ -376,7 +376,7 @@ impl Session {
     /// single "Edit Type Layer" step for a whole typing session or one step per slider drag.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        if spec.journal && self.active().is_some_and(|st| st.busy) {
+        if spec.journal && id != "file.new" && self.active().is_some_and(|st| st.busy) {
             return Err(EngineError::Disabled(id.into(), "document is busy".into()));
         }
         if let Err(why) = (spec.enabled)(self) {
@@ -434,7 +434,7 @@ impl Session {
 
     /// Is the command currently runnable? (drives menu enablement)
     pub fn is_enabled(&self, id: &str) -> bool {
-        commands::find(id).is_some_and(|s| (!s.journal || !self.active().is_some_and(|st| st.busy)) && (s.enabled)(self).is_ok())
+        commands::find(id).is_some_and(|s| (!s.journal || id == "file.new" || !self.active().is_some_and(|st| st.busy)) && (s.enabled)(self).is_ok())
     }
 
     /// Apply an undoable edit to the active document.
@@ -459,6 +459,7 @@ impl Session {
         let restrict = self.color_restrict;
         let key = self.coalesce_request.clone();
         let st = self.docs.iter_mut().find(|st| st.doc.id == before.id).ok_or(EngineError::NoDocument)?;
+        if st.busy { return Err(EngineError::Other("document is busy".into())); }
         if !Arc::ptr_eq(&before, &st.doc) {
             return Err(EngineError::Other("background result discarded: the document changed while work was running".into()));
         }
