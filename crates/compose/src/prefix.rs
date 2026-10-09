@@ -20,6 +20,7 @@ struct Snapshot {
     profile: Option<Arc<Vec<u8>>>,
     patterns: Vec<Pattern>,
     layers: Vec<Layer>,
+    bounds: Vec<Option<Rect>>,
 }
 
 impl Snapshot {
@@ -32,6 +33,7 @@ impl Snapshot {
             && self.profile == doc.icc_profile
             && self.patterns == doc.patterns
             && self.layers == prefix
+            && self.bounds == surface_bounds(prefix)
     }
     fn new(doc: &Document, prefix: &[Layer]) -> Self {
         Self {
@@ -43,8 +45,33 @@ impl Snapshot {
             profile: doc.icc_profile.clone(),
             patterns: doc.patterns.clone(),
             layers: prefix.to_vec(),
+            bounds: surface_bounds(prefix),
         }
     }
+}
+
+// Surface equality deliberately excludes derived display metadata. Cropped mip proxies
+// also carry global anchors: changing one must invalidate cached effects and gradients.
+fn surface_bounds(layers: &[Layer]) -> Vec<Option<Rect>> {
+    let mut result = Vec::new();
+    let mut pending: Vec<_> = layers.iter().collect();
+    while let Some(layer) = pending.pop() {
+        if let Some(mask) = &layer.mask {
+            result.push(mask.surface.content_bounds_hint());
+        }
+        if let Some(cache) = &layer.fill_cache {
+            result.push(cache.surface.content_bounds_hint());
+        }
+        match &layer.content {
+            LayerContent::Raster(surface) => result.push(surface.content_bounds_hint()),
+            LayerContent::Group(group) => pending.extend(group.children.iter()),
+            LayerContent::Text(text) => result.push(text.cache.as_ref().and_then(|s| s.content_bounds_hint())),
+            LayerContent::Shape(shape) => result.push(shape.cache.as_ref().and_then(|s| s.content_bounds_hint())),
+            LayerContent::Smart(smart) => result.push(smart.cache.as_ref().and_then(|s| s.content_bounds_hint())),
+            _ => {}
+        }
+    }
+    result
 }
 
 #[derive(Default)]

@@ -129,6 +129,11 @@ impl Jobs {
         }
         // Bound snapshots as well as queued and completed allocations. Retry next frame
         // when the queue is full rather than doing the expensive work on the UI thread.
+        // Completed offscreen requests must not permanently reserve every slot. They
+        // can be rebuilt if their layer becomes visible again; in-flight work stays tracked.
+        if self.pending.len() >= 12 {
+            self.pending.retain(|_, pending| pending.reply.is_none());
+        }
         if self.pending.len() >= 12 && !self.pending.contains_key(&key) {
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
@@ -140,7 +145,11 @@ impl Jobs {
         let Some(bytes) = bytes.filter(|bytes| *bytes <= 256 << 20) else {
             return Poll::Failed("effect input window exceeds the worker memory limit".into());
         };
-        let held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
+        let mut held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
+        if held.saturating_add(bytes) > 256 << 20 {
+            self.pending.retain(|_, pending| pending.reply.is_none());
+            held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
+        }
         if held.saturating_add(bytes) > 256 << 20 {
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
