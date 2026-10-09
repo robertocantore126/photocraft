@@ -2201,7 +2201,7 @@ impl Compositor {
 
         e.fields.retain(|k, _| want.contains_key(k));
         #[cfg(not(target_arch = "wasm32"))]
-        let mut gpu_field_updated = false;
+        let mut distance_region_updated = false;
         for (&kind, &reach) in &want {
             let have = e.fields.get(&kind).map(|(r, _)| *r);
             let out = match have {
@@ -2214,6 +2214,15 @@ impl Compositor {
                 _ => region,
             };
             let reach = have.filter(|r| *r >= reach).unwrap_or(reach);
+            #[cfg(not(target_arch = "wasm32"))]
+            let out = if self.async_effects && !self.nested && self.distance.as_ref().is_some_and(|engine| engine.supports(device, kind, reach, region)) {
+                // A previously approximate field must be replaced completely even if this
+                // dispatch is rejected or exceeds the GPU frame allowance.
+                distance_region_updated = true;
+                region
+            } else {
+                out
+            };
             if have.is_none_or(|r| r < reach) {
                 e.fields.insert(kind, (reach, Tex::map(device, "pc_fx_field", region, MAP32)));
             }
@@ -2224,7 +2233,6 @@ impl Compositor {
                 && let Some((_, target)) = e.fields.get(&kind)
                 && engine.run(device, queue, frame, kind, reach, region, &e.shape, target)
             {
-                gpu_field_updated = true;
                 stats.fx_pixels += u64::from(region.width()) * u64::from(region.height());
                 continue;
             }
@@ -2244,9 +2252,10 @@ impl Compositor {
         }
 
         // A changed seed can change JFA's approximation beyond exact distance reach. Rebuild
-        // downstream maps across the whole region instead of retaining old approximations.
+        // downstream maps across the whole region, including an exact CPU replacement after
+        // GPU rejection, instead of retaining old approximations.
         #[cfg(not(target_arch = "wasm32"))]
-        if gpu_field_updated {
+        if distance_region_updated {
             damage = region;
             touched = true;
         }

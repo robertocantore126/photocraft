@@ -249,13 +249,12 @@ impl Engine {
                 wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 wgpu::Extent3d { width: s.width, height: s.height, depth_or_array_layers: 1 },
             );
-            encoder.finish()
+            // Submission validation belongs to the same error scopes as encoding. If it
+            // fails after enqueueing, the CPU fallback upload is ordered after this work.
+            queue.submit([encoder.finish()]);
         });
         match result {
-            Ok(commands) => {
-                queue.submit([commands]);
-                true
-            }
+            Ok(()) => true,
             Err(error) => {
                 log::warn!("GPU distance rejected; using exact CPU field: {error}");
                 false
