@@ -23,6 +23,11 @@ fn paint(paint: &mut FxPaint, k: f32) {
     }
 }
 fn layer(layer: &mut Layer, level: u32, depth: u32, visible: Rect) -> Result<(), String> {
+    // Hidden clipping bases and hidden groups have no rendered shape. Keep their metadata
+    // in the tree, but do not fault any of their pixels in just to construct a display view.
+    if !layer.visible {
+        return Ok(());
+    }
     if depth >= 256 {
         return Err("display mip layer nesting exceeds 256".into());
     }
@@ -127,6 +132,7 @@ fn reach(layers: &[Layer], depth: u32) -> i32 {
     }
     layers
         .iter()
+        .filter(|layer| layer.visible)
         .map(|l| {
             let own = if crate::effects::has_effects(l) { crate::effects::margin(l) } else { 0 };
             let children = if let LayerContent::Group(g) = &l.content { reach(&g.children, depth + 1) } else { 0 };

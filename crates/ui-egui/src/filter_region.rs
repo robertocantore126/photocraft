@@ -7,7 +7,21 @@ use serde_json::Value;
 use std::sync::{Arc, mpsc};
 
 pub fn supported(doc: &Document, active: Option<LayerId>, command: &str) -> bool {
-    active.and_then(|id| doc.layer(id)).is_some_and(|l| matches!(l.content, LayerContent::Raster(_)))
+    fn visible_raster(layers: &[photocraft_doc::Layer], target: LayerId, depth: u32) -> bool {
+        if depth >= 256 {
+            return false;
+        }
+        layers.iter().filter(|layer| layer.visible).any(|layer| {
+            if layer.id == target {
+                return matches!(layer.content, LayerContent::Raster(_));
+            }
+            if let LayerContent::Group(group) = &layer.content {
+                return visible_raster(&group.children, target, depth + 1);
+            }
+            false
+        })
+    }
+    active.is_some_and(|id| visible_raster(&doc.layers, id, 0))
         && matches!(
             command,
             "filter.blur.gaussianBlur" | "filter.blur.boxBlur" | "filter.blur.motionBlur" | "filter.sharpen.unsharpMask" | "filter.other.highPass"
