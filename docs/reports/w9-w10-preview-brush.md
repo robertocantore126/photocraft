@@ -9,3 +9,5 @@ W10: native large dabs rasterize independent rows using Rayon above 65,536 pixel
 Files: crates/ui-egui/src/{canvas,filter_dialog}.rs; crates/paint/{Cargo.toml,src/render.rs}.
 
 No tests, benchmarks, timing measurements or visual comparisons were added or run, as requested. Native cargo check -p photocraft-ui-egui passed, including photocraft-paint. W9 viewport/latest-wins and W5 work followed in W5-W9-viewport-2026-10-09.md; optional W11 remains deferred. Full build/wasm/layers are checked on the integration branch.
+
+Final unified integration (2026-10-09): native workspace build passed; layering passed for26 crates; wasm checks passed for20/20 crates with warnings. Both new WGSL shaders passed Naga30 static validation. Tests, runtime/UI validation, pixel comparisons and performance measurements were not run. See [integration report](2026-10-09-ps-integration.md) for the final tree, switches and remaining limits; earlier lane-local pending notes above describe their original commit checkpoints.

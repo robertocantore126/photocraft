@@ -29,3 +29,5 @@ Switch: `PHOTOCRAFT_WRITE_BEHIND=0` disables the writer. Thread creation failure
 ## Validation
 
 `cargo check -p photocraft-raster -p photocraft-format -p photocraft-ui-egui` passed on this lane. Full build, layers and wasm remain pending unified integration validation. Static review additionally checked ancestor invalidation, negative-coordinate rounding, duplicate persisted mip rejection and pack load accounting; this is source inspection, not runtime verification. No runtime performance or pixel correctness claims are made.
+
+Final unified integration (2026-10-09): native workspace build passed; layering passed for26 crates; wasm checks passed for20/20 crates with warnings. Both new WGSL shaders passed Naga30 static validation. Tests, runtime/UI validation, pixel comparisons and performance measurements were not run. See [integration report](2026-10-09-ps-integration.md) for the final tree, switches and remaining limits; earlier lane-local pending notes above describe their original commit checkpoints.

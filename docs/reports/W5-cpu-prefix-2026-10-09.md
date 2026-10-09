@@ -9,3 +9,5 @@ Unsupported boundaries (an active clipped layer, an active layer nested inside a
 Switch: `PHOTOCRAFT_CPU_PREFIX_CACHE=0` restores ordinary CPU rendering. Files: new `crates/compose/src/prefix.rs`, module registration in `crates/compose/src/lib.rs`, UI routing/pruning by lane C.
 
 Validation: compilation pending. Tests, pixel comparisons, benchmarks and measurements deliberately skipped at the user's explicit request. No speedup or runtime parity is claimed.
+
+Final unified integration (2026-10-09): native workspace build passed; layering passed for26 crates; wasm checks passed for20/20 crates with warnings. Both new WGSL shaders passed Naga30 static validation. Tests, runtime/UI validation, pixel comparisons and performance measurements were not run. See [integration report](2026-10-09-ps-integration.md) for the final tree, switches and remaining limits; earlier lane-local pending notes above describe their original commit checkpoints.

@@ -14,3 +14,5 @@ Switches:
 - `PHOTOCRAFT_CPU_MIPS=0`: also disables thumbnail mip use.
 
 `cargo check -p photocraft-raster -p photocraft-format -p photocraft-ui-egui` passed. Full build/layers/wasm pending unified integration validation. No tests, benchmarks, measurements or screenshots were executed, per the implementation document and user request. Vector mask/channel thumbnails retain their existing separate code paths; W3 specifically replaces layer surface/mask thumbnails.
+
+Final unified integration (2026-10-09): native workspace build passed; layering passed for26 crates; wasm checks passed for20/20 crates with warnings. Both new WGSL shaders passed Naga30 static validation. Tests, runtime/UI validation, pixel comparisons and performance measurements were not run. See [integration report](2026-10-09-ps-integration.md) for the final tree, switches and remaining limits; earlier lane-local pending notes above describe their original commit checkpoints.

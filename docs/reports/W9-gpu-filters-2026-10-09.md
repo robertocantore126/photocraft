@@ -11,3 +11,5 @@ Set `PHOTOCRAFT_GPU_FILTERS=0` to select CPU filtering. The caller must route `U
 Changed files: `crates/gpu/src/filters.rs`, `crates/gpu/src/filters.wgsl`, module registration in `crates/gpu/src/lib.rs`. Preview routing is implemented by lane C.
 
 Validation: compilation pending. Tests, shader execution tests, benchmarks, measurements and visual comparisons deliberately skipped at the user's explicit request. The requested <=1/255 GPU/CPU agreement has not been measured or established.
+
+Final unified integration (2026-10-09): native workspace build passed; layering passed for26 crates; wasm checks passed for20/20 crates with warnings. Both new WGSL shaders passed Naga30 static validation. Tests, runtime/UI validation, pixel comparisons and performance measurements were not run. See [integration report](2026-10-09-ps-integration.md) for the final tree, switches and remaining limits; earlier lane-local pending notes above describe their original commit checkpoints.
