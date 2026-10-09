@@ -361,8 +361,14 @@ struct Collect {
     tiles: HashMap<usize, (Arc<Tile>, PixelFormat)>,
     blobs: HashMap<usize, Arc<Vec<u8>>>,
     refs: HashMap<usize, String>,
+    mips: HashMap<usize, Vec<(u32, photocraft_geom::TileCoord, Arc<Tile>)>>,
 }
 impl Sink for Collect {
+    fn mip_tiles(&mut self, surface: &photocraft_raster::Surface) -> Vec<(u32, photocraft_geom::TileCoord, Arc<Tile>)> {
+        // Collection and final manifest conversion must see exactly the same cache snapshot,
+        // even while the UI is producing additional derived tiles in the background.
+        self.mips.entry(std::ptr::from_ref(surface) as usize).or_insert_with(|| surface.cached_mips()).clone()
+    }
     fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> String {
         let key = Arc::as_ptr(tile) as usize;
         self.tiles.entry(key).or_insert_with(|| (tile.clone(), format));

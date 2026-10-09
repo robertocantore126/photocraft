@@ -35,6 +35,14 @@ pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surf
 pub fn fill_surface(s: &mut Surface, area: Rect, color: [f32; 4], selection: Option<&Surface>, lock_transparency: bool) {
     let fmt = s.format();
     let n = fmt.channels();
+    if std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() != Ok("0")
+        && color[3] == 1.0
+        && (!lock_transparency || !fmt.alpha)
+        && selection.is_none_or(|mask| mask.is_uniform_rect(area, &[1.0]))
+    {
+        s.fill_rect(area, &from_rgba(&fmt, color));
+        return;
+    }
     let mut region = s.read_region(area);
     let w = area.width() as usize;
     for (i, px) in region.chunks_exact_mut(n).enumerate() {
@@ -66,6 +74,10 @@ pub fn clear_surface(s: &mut Surface, area: Rect, selection: Option<&Surface>) {
     let fmt = s.format();
     let n = fmt.channels();
     if !fmt.alpha {
+        return;
+    }
+    if std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() != Ok("0") && selection.is_none_or(|mask| mask.is_uniform_rect(area, &[1.0])) {
+        s.fill_rect(area, &vec![0.0; n]);
         return;
     }
     let mut region = s.read_region(area);

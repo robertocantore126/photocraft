@@ -165,6 +165,16 @@ pub struct SurfaceM {
     pub default: String,
     /// 256×256 tiles, interleaved little-endian samples.
     pub tiles: Vec<TileRef>,
+    /// Optional, valid CPU pyramid tiles. Old documents simply have no pyramid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mips: Vec<MipRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MipRef {
+    pub level: u32,
+    #[serde(flatten)]
+    pub tile: TileRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

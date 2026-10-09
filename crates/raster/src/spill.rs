@@ -78,6 +78,8 @@ pub(crate) struct Cell {
     packs: Mutex<Vec<(Arc<dyn TileBacking>, PackedExtent)>>,
     /// Touched since the clock hand last passed.
     referenced: AtomicBool,
+    rebuild_cost: AtomicUsize,
+    chances: AtomicUsize,
 }
 
 impl Cell {
@@ -90,6 +92,8 @@ impl Cell {
             slot: Mutex::new(None),
             packs: Mutex::new(Vec::new()),
             referenced: AtomicBool::new(true),
+            rebuild_cost: AtomicUsize::new(0),
+            chances: AtomicUsize::new(0),
         });
         M.live.fetch_add(1, Ordering::Relaxed);
         M.resident.fetch_add(len, Ordering::Relaxed);
@@ -106,10 +110,18 @@ impl Cell {
             slot: Mutex::new(Some(Slot::Pack(backing, extent))),
             packs: Mutex::new(Vec::new()),
             referenced: AtomicBool::new(false),
+            rebuild_cost: AtomicUsize::new(0),
+            chances: AtomicUsize::new(0),
         });
         M.live.fetch_add(1, Ordering::Relaxed);
         M.register(&cell);
         cell
+    }
+
+    pub(crate) fn set_rebuild_cost(&self, level: u32) {
+        let cost = 1usize << level.saturating_mul(2).min(8);
+        self.rebuild_cost.fetch_max(cost, Ordering::Relaxed);
+        self.chances.store(cost, Ordering::Relaxed);
     }
 
     pub(crate) fn is_resident(&self) -> bool {
@@ -217,6 +229,7 @@ impl Cell {
             return;
         }
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let _reading = ActiveRead::new();
         let bytes = match slot {
             Some(slot) => match slot.read().and_then(|packed| unpack(&packed, self.len)) {
                 Ok(b) => b,
@@ -235,6 +248,29 @@ impl Cell {
         *w = Some(bytes);
         M.resident.fetch_add(self.len, Ordering::Relaxed);
         M.reloads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Prepare a durable copy without evicting the resident pixels. Mutation holds
+    /// the exclusive pixel lock, so it cannot invalidate a slot while this is written.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prewrite(&self, file: &Arc<ScratchFile>) -> Result<(), String> {
+        if M.reading.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        let Ok(data) = self.data.try_read() else { return Ok(()) };
+        let Some(bytes) = data.as_ref() else { return Ok(()) };
+        let Ok(mut slot) = self.slot.try_lock() else { return Ok(()) };
+        if slot.is_some() || self.read_error().is_some() {
+            return Ok(());
+        }
+        let packed = lz4_flex::block::compress(bytes);
+        if M.reading.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        let extent = file.write(&packed).map_err(|e| format!("scratch write-behind failed: {e}"))?;
+        M.written.fetch_add(packed.len() as u64, Ordering::Relaxed);
+        *slot = Some(Slot::Scratch(file.clone(), extent));
+        Ok(())
     }
 
     /// Move this tile to disk if nobody is using it. Returns the bytes freed.
@@ -286,6 +322,7 @@ struct Manager {
     evictions: AtomicU64,
     reloads: AtomicU64,
     written: AtomicU64,
+    reading: AtomicUsize,
 }
 
 struct Registry {
@@ -298,6 +335,7 @@ struct Config {
     /// Created on the first eviction, so configuring costs nothing until memory runs short.
     file: Option<Arc<ScratchFile>>,
     worker: bool,
+    writer: bool,
     pending: bool,
     last_error: Option<String>,
 }
@@ -307,11 +345,12 @@ static M: Manager = Manager {
     live: AtomicUsize::new(0),
     budget: AtomicUsize::new(0),
     registry: Mutex::new(Registry { cells: Vec::new(), hand: 0 }),
-    config: Mutex::new(Config { dir: None, file: None, worker: false, pending: false, last_error: None }),
+    config: Mutex::new(Config { dir: None, file: None, worker: false, writer: false, pending: false, last_error: None }),
     wake: Condvar::new(),
     evictions: AtomicU64::new(0),
     reloads: AtomicU64::new(0),
     written: AtomicU64::new(0),
+    reading: AtomicUsize::new(0),
 };
 
 impl Manager {
@@ -384,6 +423,12 @@ impl Manager {
                         Some(cell) => {
                             r.hand += 1;
                             if cell.referenced.swap(false, Ordering::Relaxed) {
+                                cell.chances.store(cell.rebuild_cost.load(Ordering::Relaxed), Ordering::Relaxed);
+                                continue;
+                            }
+                            if std::env::var("PHOTOCRAFT_MIP_PRIORITY").as_deref() != Ok("0")
+                                && cell.chances.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1)).is_ok()
+                            {
                                 continue;
                             }
                             if cell.data.try_read().is_ok_and(|d| d.is_some()) {
@@ -420,6 +465,9 @@ fn maybe_evict() {
         return;
     }
     let resident = M.resident.load(Ordering::Relaxed);
+    if resident > budget / 5 * 4 {
+        M.wake.notify_all();
+    }
     if resident <= budget {
         return;
     }
@@ -482,8 +530,13 @@ pub fn configure(dir: Option<&Path>, budget_bytes: usize) -> Result<(), String> 
     }
     c.dir = dir.clone();
     c.last_error = None;
+    #[cfg(not(target_arch = "wasm32"))]
     if dir.is_some() && !c.worker {
         c.worker = std::thread::Builder::new().name("photocraft-spill".into()).spawn(worker_loop).is_ok();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if dir.is_some() && !c.writer && std::env::var("PHOTOCRAFT_WRITE_BEHIND").as_deref() != Ok("0") {
+        c.writer = std::thread::Builder::new().name("photocraft-write-behind".into()).spawn(write_behind_loop).is_ok();
     }
     M.budget.store(if dir.is_some() { budget_bytes } else { 0 }, Ordering::Relaxed);
     drop(c);
@@ -546,4 +599,65 @@ fn log_error(msg: &str) {
     eprintln!("photocraft: {msg}");
     #[cfg(target_arch = "wasm32")]
     let _ = msg;
+}
+
+// Reads always take precedence over speculative scratch writes.
+struct ActiveRead;
+impl ActiveRead {
+    fn new() -> Self {
+        M.reading.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for ActiveRead {
+    fn drop(&mut self) {
+        M.reading.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_behind_loop() {
+    let mut hand = 0usize;
+    loop {
+        let config = M.config();
+        let (config, _) = M.wake.wait_timeout(config, std::time::Duration::from_millis(100)).unwrap_or_else(PoisonError::into_inner);
+        drop(config);
+        let budget = M.budget.load(Ordering::Relaxed);
+        if budget == 0
+            || M.resident.load(Ordering::Relaxed) < budget / 5 * 4
+            || M.reading.load(Ordering::Acquire) != 0
+            || std::env::var("PHOTOCRAFT_WRITE_BEHIND").as_deref() == Ok("0")
+        {
+            continue;
+        }
+        let Some(file) = M.file() else { continue };
+        let cells = {
+            let registry = M.registry.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut cells = Vec::new();
+            for _ in 0..64.min(registry.cells.len()) {
+                if hand >= registry.cells.len() {
+                    hand = 0;
+                }
+                if let Some(cell) = registry.cells.get(hand).and_then(Weak::upgrade) {
+                    cells.push(cell);
+                }
+                hand = hand.saturating_add(1);
+            }
+            cells
+        };
+        // Cold tiles first; warm dirty tiles are prepared on a later pass too.
+        let mut cells = cells;
+        cells.sort_by_key(|cell| cell.referenced.load(Ordering::Relaxed));
+        for cell in cells {
+            if M.reading.load(Ordering::Acquire) != 0 || M.budget.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            if let Err(error) = cell.prewrite(&file) {
+                M.error(error);
+                M.budget.store(0, Ordering::Relaxed);
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
 }

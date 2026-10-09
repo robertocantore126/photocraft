@@ -15,6 +15,9 @@ use crate::manifest::*;
 use crate::{FormatError, Result};
 
 pub(crate) trait Sink {
+    fn mip_tiles(&mut self, surface: &Surface) -> Vec<(u32, TileCoord, Arc<Tile>)> {
+        surface.cached_mips()
+    }
     /// Register a tile, returning its hash.
     fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> Hash;
     fn blob(&mut self, data: &Arc<Vec<u8>>) -> Hash;
@@ -84,7 +87,16 @@ fn surface_m(s: &Surface, sink: &mut dyn Sink) -> SurfaceM {
     let mut dp = vec![0u8; f.bytes_per_pixel()];
     encode_pixel(&f, &s.default_pixel(), &mut dp);
     swap_to_le(&mut dp, f.sample);
-    SurfaceM { format: f, default: hex(&dp), tiles: s.tiles().map(|(c, t)| TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t) }).collect() }
+    SurfaceM {
+        format: f,
+        default: hex(&dp),
+        tiles: s.tiles().map(|(c, t)| TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t) }).collect(),
+        mips: if std::env::var("PHOTOCRAFT_PACK_MIPS").as_deref() == Ok("0") {
+            Vec::new()
+        } else {
+            sink.mip_tiles(s).into_iter().map(|(level, c, tile)| MipRef { level, tile: TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, &tile) } }).collect()
+        },
+    }
 }
 
 fn opt_blob(b: &Option<Arc<Vec<u8>>>, sink: &mut dyn Sink) -> Option<Hash> {
@@ -301,6 +313,10 @@ impl Loader<'_> {
             }
             let tile = self.fetch.tile_object(&t.hash, f)?;
             s.insert_tile(c, tile).map_err(FormatError::corrupt)?;
+        }
+        for mip in &m.mips {
+            let tile = self.fetch.tile_object(&mip.tile.hash, f)?;
+            s.install_mip(mip.level, TileCoord::new(mip.tile.tx, mip.tile.ty), tile).map_err(FormatError::corrupt)?;
         }
         Ok(s)
     }

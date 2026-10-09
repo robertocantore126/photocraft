@@ -14,8 +14,10 @@ use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use photocraft_color::{ColorMode, PixelFormat, SampleType, read_sample, write_sample};
 use photocraft_geom::{Rect, TILE_SIZE, TileCoord};
 
+mod mips;
 mod scratch_file;
 pub mod spill;
+pub use mips::MipChain;
 
 /// Pixel storage for one tile: `TILE_SIZE² × bytes_per_pixel`, row-major, interleaved channels.
 ///
@@ -24,10 +26,16 @@ pub mod spill;
 /// tile, not per pixel, in hot loops.
 pub struct Tile {
     cell: Arc<spill::Cell>,
+    solid_pixel: Option<Box<[u8]>>,
 }
 
 impl Tile {
-    fn filled(format: &PixelFormat, pixel: &[u8]) -> Self {
+    pub fn solid(format: &PixelFormat, pixel: &[u8]) -> Self {
+        let mut encoded = vec![0; format.bytes_per_pixel()];
+        for (out, value) in encoded.iter_mut().zip(pixel) {
+            *out = *value;
+        }
+        let pixel = encoded.as_slice();
         let n = (TILE_SIZE * TILE_SIZE) as usize;
         let mut data = vec![0u8; n * format.bytes_per_pixel()];
         if pixel.iter().any(|&b| b != 0) {
@@ -35,14 +43,16 @@ impl Tile {
                 px.copy_from_slice(pixel);
             }
         }
-        Tile::from_vec(data)
+        let mut tile = Tile::from_vec(data);
+        tile.solid_pixel = Some(encoded.into_boxed_slice());
+        tile
     }
     pub fn from_vec(data: Vec<u8>) -> Self {
-        Tile { cell: spill::Cell::new(data) }
+        Tile { cell: spill::Cell::new(data), solid_pixel: None }
     }
     /// Construct a tile without reading its compressed document extent.
     pub fn lazy(len: usize, backing: Arc<dyn spill::TileBacking>, extent: spill::PackedExtent) -> Self {
-        Tile { cell: spill::Cell::lazy(len, backing, extent) }
+        Tile { cell: spill::Cell::lazy(len, backing, extent), solid_pixel: None }
     }
     /// Whether pixel bytes are resident; inspecting this never reads the backing.
     pub fn is_resident(&self) -> bool {
@@ -74,6 +84,7 @@ impl Tile {
         Ok(bytes)
     }
     pub fn bytes_mut(&mut self) -> TileBytesMut<'_> {
+        self.solid_pixel = None;
         TileBytesMut(self.cell.write())
     }
     /// Byte length, without touching the pixels (they may be on disk).
@@ -138,6 +149,7 @@ pub struct Surface {
     format: PixelFormat,
     default_pixel: Box<[u8]>,
     tiles: BTreeMap<TileCoord, Arc<Tile>>,
+    mips: Arc<MipChain>,
 }
 
 impl PartialEq for Surface {
@@ -149,7 +161,7 @@ impl PartialEq for Surface {
 impl Surface {
     /// Transparent/zero surface.
     pub fn new(format: PixelFormat) -> Self {
-        Self { format, default_pixel: vec![0u8; format.bytes_per_pixel()].into_boxed_slice(), tiles: BTreeMap::new() }
+        Self { format, default_pixel: vec![0u8; format.bytes_per_pixel()].into_boxed_slice(), tiles: BTreeMap::new(), mips: Arc::new(MipChain::default()) }
     }
 
     /// Surface whose untouched pixels read as `pixel` (normalised channel values).
@@ -177,6 +189,7 @@ impl Surface {
         if tile.len() != expected {
             return Err("tile length does not match surface format".into());
         }
+        self.invalidate_mips(c);
         self.tiles.insert(c, tile);
         Ok(())
     }
@@ -189,9 +202,10 @@ impl Surface {
 
     /// Mutable access to a tile, allocating it (filled with the default pixel) or un-sharing it.
     pub fn tile_mut(&mut self, c: TileCoord) -> &mut Tile {
+        self.invalidate_mips(c);
         let fmt = self.format;
         let dp = self.default_pixel.clone();
-        let arc = self.tiles.entry(c).or_insert_with(|| Arc::new(Tile::filled(&fmt, &dp)));
+        let arc = self.tiles.entry(c).or_insert_with(|| Arc::new(Tile::solid(&fmt, &dp)));
         Arc::make_mut(arc)
     }
 
@@ -264,6 +278,7 @@ impl Surface {
 
     /// Drop tiles that are entirely the default pixel.
     pub fn prune(&mut self) {
+        self.mips = Arc::new(MipChain::default());
         let dp = self.default_pixel.clone();
         let bpp = dp.len();
         self.tiles.retain(|_, t| t.bytes().chunks_exact(bpp).any(|px| px != &*dp));
@@ -530,23 +545,106 @@ impl Surface {
 
     /// Fill a rectangle with one pixel value.
     pub fn fill_rect(&mut self, r: Rect, px: &[f32]) {
-        let n = self.channels();
         let mut enc = vec![0u8; self.format.bytes_per_pixel()];
-        encode_pixel(&self.format, &px[..n], &mut enc);
+        encode_pixel(&self.format, px, &mut enc);
         let bpp = enc.len();
+        let shared = std::env::var("PHOTOCRAFT_SOLID_TILES").as_deref() != Ok("0");
+        let mut solid = None;
         for tc in r.tiles() {
             let tr = tc.rect().intersect(&r);
+            if shared && tr == tc.rect() {
+                let unchanged = match self.tiles.get(&tc) {
+                    Some(tile) => tile.solid_pixel.as_deref().map_or_else(
+                        || tile.try_bytes().is_ok_and(|bytes| bytes.chunks_exact(bpp).all(|pixel| pixel == enc.as_slice())),
+                        |pixel| pixel == enc.as_slice(),
+                    ),
+                    None => enc.as_slice() == self.default_pixel.as_ref(),
+                };
+                if unchanged {
+                    continue;
+                }
+                if enc.as_slice() == self.default_pixel.as_ref() {
+                    self.invalidate_mips(tc);
+                    self.tiles.remove(&tc);
+                } else if !self.tiles.get(&tc).is_some_and(|tile| tile.solid_pixel.as_deref() == Some(enc.as_slice())) {
+                    let tile = solid.get_or_insert_with(|| Arc::new(Tile::solid(&self.format, &enc)));
+                    self.invalidate_mips(tc);
+                    self.tiles.insert(tc, tile.clone());
+                }
+                continue;
+            }
+            if !self.tiles.contains_key(&tc) && enc.as_slice() == self.default_pixel.as_ref() {
+                continue;
+            }
+            // Preserve tile identity when all affected pixels already have the requested value.
+            if shared
+                && self.tiles.get(&tc).is_some_and(|tile| {
+                    let bytes = tile.bytes();
+                    (tr.y0..tr.y1).all(|y| {
+                        (tr.x0..tr.x1).all(|x| {
+                            let offset = ((y.rem_euclid(TILE_SIZE) * TILE_SIZE + x.rem_euclid(TILE_SIZE)) as usize) * bpp;
+                            bytes.get(offset..offset + bpp) == Some(enc.as_slice())
+                        })
+                    })
+                })
+            {
+                continue;
+            }
             let mut t = self.tile_mut(tc).bytes_mut();
             for y in tr.y0..tr.y1 {
-                let ly = (y - tc.ty * TILE_SIZE) as usize;
+                let ly = y.rem_euclid(TILE_SIZE) as usize;
                 let lx0 = (tr.x0 - tc.tx * TILE_SIZE) as usize;
                 let lx1 = (tr.x1 - tc.tx * TILE_SIZE) as usize;
-                let row = &mut t[(ly * TILE_SIZE as usize + lx0) * bpp..(ly * TILE_SIZE as usize + lx1) * bpp];
-                for p in row.chunks_exact_mut(bpp) {
-                    p.copy_from_slice(&enc);
+                if let Some(row) = t.get_mut((ly * TILE_SIZE as usize + lx0) * bpp..(ly * TILE_SIZE as usize + lx1) * bpp) {
+                    for p in row.chunks_exact_mut(bpp) {
+                        p.copy_from_slice(&enc);
+                    }
                 }
             }
         }
+    }
+
+    /// Whether every pixel in a rectangle has this encoded value. Shared solid tiles
+    /// are classified once without touching their scratch backing.
+    pub fn is_uniform_rect(&self, rect: Rect, pixel: &[f32]) -> bool {
+        let mut encoded = vec![0; self.format.bytes_per_pixel()];
+        encode_pixel(&self.format, pixel, &mut encoded);
+        let bpp = encoded.len();
+        let mut classified = std::collections::HashMap::new();
+        for coord in rect.tiles() {
+            let Some(tile) = self.tiles.get(&coord) else {
+                if self.default_pixel.as_ref() != encoded.as_slice() {
+                    return false;
+                }
+                continue;
+            };
+            if let Some(solid) = tile.solid_pixel.as_deref() {
+                if solid != encoded.as_slice() {
+                    return false;
+                }
+                continue;
+            }
+            let covered = coord.rect().intersect(&rect);
+            let key = Arc::as_ptr(tile) as usize;
+            if covered == coord.rect() && classified.get(&key) == Some(&true) {
+                continue;
+            }
+            let Ok(bytes) = tile.try_bytes() else {
+                return false;
+            };
+            for y in covered.y0..covered.y1 {
+                for x in covered.x0..covered.x1 {
+                    let index = ((y.rem_euclid(TILE_SIZE) * TILE_SIZE + x.rem_euclid(TILE_SIZE)) as usize) * bpp;
+                    if bytes.get(index..index + bpp) != Some(encoded.as_slice()) {
+                        return false;
+                    }
+                }
+            }
+            if covered == coord.rect() {
+                classified.insert(key, true);
+            }
+        }
+        true
     }
 
     /// Build from interleaved *encoded* bytes of `format` covering `r`.
