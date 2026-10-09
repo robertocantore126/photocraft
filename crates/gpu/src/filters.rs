@@ -13,6 +13,7 @@ pub enum Filter {
     HighPass { radius: f32 },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct FilterEngine {
     layout: wgpu::BindGroupLayout,
@@ -22,7 +23,17 @@ pub struct FilterEngine {
     finish: wgpu::ComputePipeline,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct FilterEngine;
+
 impl FilterEngine {
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(_device: &wgpu::Device) -> Result<Self, Unsupported> {
+        Err(Unsupported("GPU filter readback is native-only; use the CPU filter".into()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(device: &wgpu::Device) -> Result<Self, Unsupported> {
         let (engine, error) = crate::first_error(device, || {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -328,6 +339,7 @@ impl FilterEngine {
 
 impl Filter {
     // (radius, halo, final kind, amount factor, threshold, motion vector, samples)
+    #[cfg(not(target_arch = "wasm32"))]
     fn config(self) -> Result<(f32, i32, u32, f32, f32, [f32; 2], u32), Unsupported> {
         let (radius, kind, amount, threshold) = match self {
             Self::Gaussian { radius } | Self::Box { radius } => (radius, 0, 0.0, 0.0),
@@ -358,6 +370,7 @@ impl Filter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn checked_inflate(rect: Rect, halo: i32) -> Result<Rect, Unsupported> {
     let invalid = || Unsupported("GPU filter coordinate overflow".into());
     Ok(Rect::new(
@@ -368,6 +381,7 @@ fn checked_inflate(rect: Rect, halo: i32) -> Result<Rect, Unsupported> {
     ))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn gaussian_kernel(sigma: f32) -> Vec<f32> {
     if sigma < 0.05 {
         return vec![1.0];
@@ -381,6 +395,7 @@ fn gaussian_kernel(sigma: f32) -> Vec<f32> {
     weights
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn gaussian_boxes(sigma: f32) -> [u32; 3] {
     let ideal = (4.0 * sigma * sigma + 1.0).sqrt();
     let mut low = ideal.floor() as i32;

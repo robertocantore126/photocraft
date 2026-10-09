@@ -13,8 +13,9 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parallel_brush() -> bool {
-    !cfg!(target_arch = "wasm32") && std::env::var("PHOTOCRAFT_PARALLEL_BRUSH").as_deref() != Ok("0")
+    std::env::var("PHOTOCRAFT_PARALLEL_BRUSH").as_deref() != Ok("0")
 }
 
 use photocraft_color::{BlendMode, PixelFormat};

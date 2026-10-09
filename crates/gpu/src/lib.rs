@@ -287,6 +287,7 @@ struct FxEntry {
     doc: DocId,
     region: Rect,
     shape_key: u64,
+    #[cfg(not(target_arch = "wasm32"))]
     async_signature: u64,
     /// Tiles the shape was rendered from (content, mask): damage is their difference.
     tiles: [Option<fx::Tiles>; 2],
@@ -2056,7 +2057,7 @@ impl Compositor {
         let want = field_reaches(&progs);
         #[cfg(not(target_arch = "wasm32"))]
         let mut prepared: Option<fx_jobs::Inputs> = None;
-        #[allow(unused_mut)]
+        #[cfg(not(target_arch = "wasm32"))]
         let mut async_signature = 0;
         #[cfg(not(target_arch = "wasm32"))]
         if self.async_effects && !self.nested && !region.is_empty() && progs.iter().any(|p| p.maps > 0) {
@@ -2151,6 +2152,7 @@ impl Compositor {
                     doc: doc.id,
                     region,
                     shape_key,
+                    #[cfg(not(target_arch = "wasm32"))]
                     async_signature,
                     tiles: [None, None],
                     parts: Vec::new(),
