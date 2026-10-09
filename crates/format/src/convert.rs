@@ -90,6 +90,7 @@ fn surface_m(s: &Surface, sink: &mut dyn Sink) -> SurfaceM {
     SurfaceM {
         format: f,
         default: hex(&dp),
+        content_bounds: if std::env::var("PHOTOCRAFT_PACK_BOUNDS").as_deref() == Ok("0") { None } else { Some(s.exact_content_bounds()) },
         tiles: s.tiles().map(|(c, t)| TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t) }).collect(),
         mips: if std::env::var("PHOTOCRAFT_PACK_MIPS").as_deref() == Ok("0") {
             Vec::new()
@@ -313,6 +314,11 @@ impl Loader<'_> {
             }
             let tile = self.fetch.tile_object(&t.hash, f)?;
             s.insert_tile(c, tile).map_err(FormatError::corrupt)?;
+        }
+        if let Some(bounds) = m.content_bounds
+            && std::env::var("PHOTOCRAFT_PACK_BOUNDS").as_deref() != Ok("0")
+        {
+            s.restore_exact_content_bounds(bounds).map_err(FormatError::corrupt)?;
         }
         for mip in &m.mips {
             let tile = self.fetch.tile_object(&mip.tile.hash, f)?;

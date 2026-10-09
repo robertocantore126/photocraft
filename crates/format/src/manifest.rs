@@ -168,6 +168,9 @@ pub struct SurfaceM {
     /// Optional, valid CPU pyramid tiles. Old documents simply have no pyramid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mips: Vec<MipRef>,
+    /// Exact non-default pixel bounds, computed when saving (never a viewport hint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bounds: Option<photocraft_geom::Rect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -151,6 +151,7 @@ pub struct Surface {
     tiles: BTreeMap<TileCoord, Arc<Tile>>,
     mips: Arc<MipChain>,
     content_bounds_hint: Option<Rect>,
+    exact_bounds: Option<Rect>,
 }
 
 impl PartialEq for Surface {
@@ -168,6 +169,7 @@ impl Surface {
             tiles: BTreeMap::new(),
             mips: Arc::new(MipChain::default()),
             content_bounds_hint: None,
+            exact_bounds: None,
         }
     }
 
@@ -192,11 +194,17 @@ impl Surface {
     }
     /// Install an already allocated tile, validating its format-dependent size.
     pub fn insert_tile(&mut self, c: TileCoord, tile: Arc<Tile>) -> Result<(), String> {
+        if c.tx.checked_mul(TILE_SIZE).and_then(|x| x.checked_add(TILE_SIZE)).is_none()
+            || c.ty.checked_mul(TILE_SIZE).and_then(|y| y.checked_add(TILE_SIZE)).is_none()
+        {
+            return Err("tile coordinate exceeds supported pixel range".into());
+        }
         let expected = (TILE_SIZE * TILE_SIZE) as usize * self.format.bytes_per_pixel();
         if tile.len() != expected {
             return Err("tile length does not match surface format".into());
         }
         self.content_bounds_hint = None;
+        self.exact_bounds = None;
         self.invalidate_mips(c);
         self.tiles.insert(c, tile);
         Ok(())
@@ -211,6 +219,7 @@ impl Surface {
     /// Mutable access to a tile, allocating it (filled with the default pixel) or un-sharing it.
     pub fn tile_mut(&mut self, c: TileCoord) -> &mut Tile {
         self.content_bounds_hint = None;
+        self.exact_bounds = None;
         self.invalidate_mips(c);
         let fmt = self.format;
         let dp = self.default_pixel.clone();
@@ -245,9 +254,31 @@ impl Surface {
         self.tiles.keys().fold(Rect::EMPTY, |r, c| r.union(&c.rect()))
     }
 
-    /// True layer bounds attached to a viewport-only derived surface. Never persisted.
+    /// Bounds supplied by a display proxy or restored from validated native metadata.
     pub fn content_bounds_hint(&self) -> Option<Rect> {
-        self.content_bounds_hint
+        self.content_bounds_hint.or(self.exact_bounds)
+    }
+    /// Restore exact native bounds without reading lazy pixels. Metadata must be canonical
+    /// and contained in the allocated tile footprint. Display hints are never restored here.
+    pub fn restore_exact_content_bounds(&mut self, bounds: Rect) -> Result<(), String> {
+        if bounds.is_empty() {
+            if bounds != Rect::EMPTY {
+                return Err("noncanonical empty content bounds".into());
+            }
+        } else {
+            if i64::from(bounds.x1) - i64::from(bounds.x0) > i64::from(i32::MAX) || i64::from(bounds.y1) - i64::from(bounds.y0) > i64::from(i32::MAX) {
+                return Err("content bounds exceed supported dimensions".into());
+            }
+            let footprint = self.tile_bounds();
+            if !footprint.contains_rect(&bounds) {
+                return Err("content bounds extend beyond allocated tiles".into());
+            }
+            if !self.tiles.keys().any(|coord| !coord.rect().intersect(&bounds).is_empty()) {
+                return Err("content bounds do not intersect any allocated tile".into());
+            }
+        }
+        self.exact_bounds = Some(bounds);
+        Ok(())
     }
     /// Preserve effect/gradient anchors when only viewport pixels have been materialized.
     /// Call only on display proxies; a pixel mutation clears this metadata.
@@ -257,7 +288,15 @@ impl Surface {
 
     /// Exact bounds of pixels that differ from the default pixel, or display proxy bounds.
     pub fn content_bounds(&self) -> Rect {
-        if let Some(bounds) = self.content_bounds_hint {
+        if let Some(bounds) = self.content_bounds_hint() {
+            return bounds;
+        }
+        self.exact_content_bounds()
+    }
+
+    /// Real pixel bounds, independent of viewport-only anchors. Used for native saves.
+    pub fn exact_content_bounds(&self) -> Rect {
+        if let Some(bounds) = self.exact_bounds {
             return bounds;
         }
         let bpp = self.format.bytes_per_pixel();
@@ -272,7 +311,9 @@ impl Surface {
             (gx0, gy0, gx1, gy1) = (gx0.min(c.tx), gy0.min(c.ty), gx1.max(c.tx), gy1.max(c.ty));
         }
         let mut order: Vec<(&TileCoord, &Arc<Tile>)> = self.tiles.iter().collect();
-        order.sort_by_key(|(c, _)| (c.tx - gx0).min(gx1 - c.tx).min(c.ty - gy0).min(gy1 - c.ty));
+        order.sort_by_key(|(c, _)| {
+            (i64::from(c.tx) - i64::from(gx0)).min(i64::from(gx1) - i64::from(c.tx)).min(i64::from(c.ty) - i64::from(gy0)).min(i64::from(gy1) - i64::from(c.ty))
+        });
         let dp = &*self.default_pixel;
         let ts = TILE_SIZE as usize;
         let mut out = Rect::EMPTY;
@@ -301,6 +342,7 @@ impl Surface {
     /// Drop tiles that are entirely the default pixel.
     pub fn prune(&mut self) {
         self.content_bounds_hint = None;
+        self.exact_bounds = None;
         self.mips = Arc::new(MipChain::default());
         let dp = self.default_pixel.clone();
         let bpp = dp.len();
@@ -595,11 +637,13 @@ impl Surface {
                 }
                 if enc.as_slice() == self.default_pixel.as_ref() {
                     self.content_bounds_hint = None;
+                    self.exact_bounds = None;
                     self.invalidate_mips(tc);
                     self.tiles.remove(&tc);
                 } else {
                     let tile = solid.get_or_insert_with(|| Arc::new(Tile::solid(&self.format, &enc)));
                     self.content_bounds_hint = None;
+                    self.exact_bounds = None;
                     self.invalidate_mips(tc);
                     self.tiles.insert(tc, tile.clone());
                 }

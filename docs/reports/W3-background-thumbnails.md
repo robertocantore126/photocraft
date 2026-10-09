@@ -13,4 +13,4 @@ Switches:
 - `PHOTOCRAFT_THUMB_MIPS=0`: box thumbnails read original pixels instead of CPU mips.
 - `PHOTOCRAFT_CPU_MIPS=0`: also disables thumbnail mip use.
 
-Compilation/layers/wasm pending serialized build slot. No tests, benchmarks, measurements or screenshots were executed, per the implementation document and user request. Vector mask/channel thumbnails retain their existing separate code paths; W3 specifically replaces layer surface/mask thumbnails.
+`cargo check -p photocraft-raster -p photocraft-format -p photocraft-ui-egui` passed. Full build/layers/wasm pending unified integration validation. No tests, benchmarks, measurements or screenshots were executed, per the implementation document and user request. Vector mask/channel thumbnails retain their existing separate code paths; W3 specifically replaces layer surface/mask thumbnails.
