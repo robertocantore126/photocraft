@@ -294,7 +294,16 @@ impl Surface {
         self.exact_content_bounds()
     }
 
-    /// Real pixel bounds, independent of viewport-only anchors. Used for native saves.
+    /// Exact bounds when they cost no backing reads: already known, or every tile is resident.
+    /// Saves store them only then, so a save never pulls spilled or lazy tiles back in.
+    pub fn exact_content_bounds_if_resident(&self) -> Option<Rect> {
+        if let Some(bounds) = self.exact_bounds {
+            return Some(bounds);
+        }
+        self.tiles.values().all(|tile| tile.is_resident()).then(|| self.exact_content_bounds())
+    }
+
+    /// Real pixel bounds, independent of viewport-only anchors.
     pub fn exact_content_bounds(&self) -> Rect {
         if let Some(bounds) = self.exact_bounds {
             return bounds;

@@ -369,7 +369,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: |_| Ok(()),
             run: list_looks,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
     ]
 }

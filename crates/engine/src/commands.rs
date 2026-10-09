@@ -765,7 +765,8 @@ fn build() -> Vec<CommandSpec> {
             params: "{}",
             enabled: always,
             run: |s, _| Ok(inspect::session(s)),
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "document.inspect",
@@ -779,7 +780,8 @@ fn build() -> Vec<CommandSpec> {
                 let d = s.documents().get(i).ok_or(EngineError::NoDocument)?;
                 Ok(inspect::document(d))
             },
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "document.activate",
@@ -792,7 +794,8 @@ fn build() -> Vec<CommandSpec> {
                 let i = p.get("document").and_then(Value::as_u64).ok_or_else(|| bad("document.activate", "missing `document`"))?;
                 if s.set_active(i as usize) { Ok(Value::Null) } else { Err(EngineError::NoDocument) }
             },
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "command.list",
@@ -813,7 +816,8 @@ fn build() -> Vec<CommandSpec> {
                         .collect(),
                 ))
             },
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "document.pixel",
@@ -829,7 +833,8 @@ fn build() -> Vec<CommandSpec> {
                 let px = photocraft_compose::render(&d.doc, Rect::from_xywh(x, y, 1, 1)).px[0];
                 Ok(json!(px))
             },
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
     ];
 
@@ -905,7 +910,8 @@ fn build() -> Vec<CommandSpec> {
                 let adj = crate::adjust_params::from_params(&kind, p, None, doc_mode(s))?;
                 new_adjustment(s, adj)
             },
-            journal: true, job: None,
+            journal: true,
+            job: None,
         });
         v.push(CommandSpec {
             id: image_id,
@@ -928,7 +934,8 @@ fn build() -> Vec<CommandSpec> {
                 let label = adj.label().to_string();
                 destructive_adjust(s, &label, adj, p)
             },
-            journal: true, job: None,
+            journal: true,
+            job: None,
         });
     }
     v.extend(crate::layer_style::specs());

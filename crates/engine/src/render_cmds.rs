@@ -192,7 +192,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"flameType":"oneFlameAlongPath|multipleFlamesAlongPath|multipleFlamesPathDirections|multipleFlamesVariousLength|candleLight|multipleFlamesOneDirection","length":1..1000=150,"randomizeLength":bool,"width":1..1000=40,"angle":-180..180=0,"interval":1..1000=60,"adjustIntervalForLoops":bool=true,"useCustomColor":bool,"color":color,"turbulent":0..100=25,"jag":0..100=25,"opacity":0..100=75,"flameLines":1..100=20,"flameBottomAlignment":0..100=20,"flameStyle":"normal|violent|flat","flameShape":"parallel|toCenter|spread|oval|pointed","randomizeShapes":bool,"seed":u32=0,"quality":"draft|low|medium|high|fine","path":text,"newLayer":bool} → {layer,newLayer,bounds,primitives,usedPath}"##,
             enabled: has_doc,
             run: run_flame,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "filter.render.pictureFrame",
@@ -202,7 +203,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"frame":"vineWithFlowers|vineWithLeaves|ivy|roses|daisies|berries|bamboo|waves|zigzag|dots|rope|scallops|doubleLine|snowflakes|stars|hearts","margin":0..30=4,"size":1..100=50,"arrangement":1..100=50,"lines":1..5=1,"thickness":1..100=30,"fade":0..100=0,"vineColor":color,"flowerColor":color,"leafColor":color,"seed":u32=0,"newLayer":bool} → {layer,newLayer,bounds,primitives,frame}"##,
             enabled: has_doc,
             run: run_frame,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "filter.render.tree",
@@ -212,7 +214,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"baseTreeType":1..34=1,"lightDirection":1..5=3,"leavesAmount":0..100=50,"leavesSize":0..200=100,"branchesHeight":50..300=100,"branchesThickness":50..200=100,"defaultLeaves":bool=true,"leavesColor":color,"customBranchColor":bool,"branchesColor":color,"flatShading":bool,"seed":u32=0,"x":0..1=0.5,"y":0..1=0.95,"size":0.05..2=0.8,"newLayer":bool} → {layer,newLayer,bounds,primitives,treeType}"##,
             enabled: has_doc,
             run: run_tree,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

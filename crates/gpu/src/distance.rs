@@ -48,7 +48,7 @@ fn size(device: &wgpu::Device, region: Rect, reach: i32) -> Option<Size> {
     let stride = width.checked_add(63)? / 64 * 64;
     let seed_bytes = pixels.checked_mul(8)?;
     let output_bytes = u64::from(stride).checked_mul(u64::from(height))?.checked_mul(4)?;
-    if seed_bytes.max(output_bytes) > u64::from(limits.max_storage_buffer_binding_size) || seed_bytes.max(output_bytes) > limits.max_buffer_size {
+    if seed_bytes.max(output_bytes) > limits.max_storage_buffer_binding_size || seed_bytes.max(output_bytes) > limits.max_buffer_size {
         return None;
     }
     let mut steps = Vec::new();

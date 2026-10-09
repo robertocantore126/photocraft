@@ -26,6 +26,10 @@ struct Running {
 #[derive(Default)]
 pub(crate) struct IoJobs {
     running: Vec<Running>,
+    /// Opens waiting their turn: one import at a time, so dropping several large files
+    /// doesn't decode them all at once.
+    #[cfg(not(target_arch = "wasm32"))]
+    queued: std::collections::VecDeque<(String, BackgroundImportFn, Option<DocId>)>,
 }
 impl Drop for IoJobs {
     fn drop(&mut self) {
@@ -36,8 +40,15 @@ impl Drop for IoJobs {
 }
 
 impl IoJobs {
+    pub fn is_running(&self) -> bool {
+        !self.running.is_empty()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(&mut self, path: String, import: BackgroundImportFn, initial_active: Option<DocId>) -> Result<(), String> {
+        if self.running.iter().any(|r| matches!(r.operation, Operation::Open { .. })) {
+            self.queued.push_back((path, import, initial_active));
+            return Ok(());
+        }
         let (sender, receiver) = mpsc::channel();
         let progress = Progress::default();
         let task_progress = progress.clone();
@@ -74,8 +85,12 @@ impl IoJobs {
         self.running.push(Running { path, progress, receiver, operation: Operation::Save { before, revision }, initial_active: None });
         Ok(())
     }
-    pub fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
-        let cancel = !self.running.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    /// `cancel`: Esc was pressed this frame (read once by the caller for every kind of job).
+    pub fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context, cancel: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if cancel {
+            self.queued.clear();
+        }
         let mut pending = Vec::new();
         for mut running in std::mem::take(&mut self.running) {
             if cancel {
@@ -113,14 +128,14 @@ impl IoJobs {
                             Operation::Open { preview } => preview,
                             _ => None,
                         };
-                        if let Some(id) = preview_id {
-                            if let Some(index) = app.session.documents().iter().position(|st| st.doc.id == id) {
-                                if let Some(st) = app.session.documents().get(index) {
-                                    let before = st.doc.clone();
-                                    app.session.release_job(&before);
-                                }
-                                app.session.close(index);
+                        if let Some(id) = preview_id
+                            && let Some(index) = app.session.documents().iter().position(|st| st.doc.id == id)
+                        {
+                            if let Some(st) = app.session.documents().get(index) {
+                                let before = st.doc.clone();
+                                app.session.release_job(&before);
                             }
+                            app.session.close(index);
                         }
                         match result {
                             Ok((document, warnings)) if !running.progress.is_cancelled() => {
@@ -213,8 +228,15 @@ impl IoJobs {
             }
         }
         self.running = pending;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.running.iter().any(|r| matches!(r.operation, Operation::Open { .. }))
+            && let Some((path, import, initial_active)) = self.queued.pop_front()
+            && let Err(error) = self.open(path.clone(), import, initial_active)
+        {
+            app.open_failed(&file_open::display_name(&path), &error);
+        }
         if let Some(running) = self.running.first() {
-            egui::Window::new("File operation").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -36.0]).show(ctx, |ui| {
+            egui::Window::new("File operation").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -120.0]).show(ctx, |ui| {
                 ui.label(file_open::display_name(&running.path));
                 ui.add(egui::ProgressBar::new(running.progress.fraction()).animate(true));
                 if ui.button("Cancel (Esc)").clicked() {

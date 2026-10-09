@@ -459,7 +459,9 @@ impl Session {
         let restrict = self.color_restrict;
         let key = self.coalesce_request.clone();
         let st = self.docs.iter_mut().find(|st| st.doc.id == before.id).ok_or(EngineError::NoDocument)?;
-        if st.busy { return Err(EngineError::Other("document is busy".into())); }
+        if st.busy {
+            return Err(EngineError::Other("document is busy".into()));
+        }
         if !Arc::ptr_eq(&before, &st.doc) {
             return Err(EngineError::Other("background result discarded: the document changed while work was running".into()));
         }
@@ -484,7 +486,9 @@ impl Session {
     /// Replace the active document's active layer without creating a history step.
     pub fn select_layer(&mut self, id: LayerId) -> Result<()> {
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
-        if st.busy { return Err(EngineError::Other("document is busy".into())); }
+        if st.busy {
+            return Err(EngineError::Other("document is busy".into()));
+        }
         if st.doc.layer(id).is_none() {
             return Err(EngineError::NoLayer(id));
         }
@@ -503,7 +507,9 @@ impl Session {
 
     pub fn undo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
-        if st.busy { return false; }
+        if st.busy {
+            return false;
+        }
         st.coalesce = None;
         match st.history.undo(st.doc.clone()) {
             Some(d) => {
@@ -519,7 +525,9 @@ impl Session {
 
     pub fn redo(&mut self) -> bool {
         let Some(st) = self.active_mut() else { return false };
-        if st.busy { return false; }
+        if st.busy {
+            return false;
+        }
         st.coalesce = None;
         match st.history.redo(st.doc.clone()) {
             Some(d) => {

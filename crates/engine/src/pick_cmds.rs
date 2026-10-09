@@ -80,7 +80,8 @@ pub fn specs() -> Vec<CommandSpec> {
         shortcut: None,
         params: r##"{"x":px,"y":px,"target":"layer|group"="layer","select":bool=true,"mode":"replace|toggle|add"="replace","list":bool=false (return every layer with pixels there, topmost first)} → {layer} | {layers}"##,
         enabled: has_doc,
-        journal: false, job: None,
+        journal: false,
+        job: None,
         run: pick,
     }]
 }

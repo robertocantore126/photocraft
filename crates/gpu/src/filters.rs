@@ -171,7 +171,7 @@ impl FilterEngine {
 
         // Three working buffers plus one readback. Source expansion and readback decoding
         // also stay below this per-window cap; a wide halo uses the existing tiled CPU path.
-        if bytes > 32 << 20 || bytes > u64::from(device.limits().max_storage_buffer_binding_size) || bytes > device.limits().max_buffer_size {
+        if bytes > 32 << 20 || bytes > device.limits().max_storage_buffer_binding_size || bytes > device.limits().max_buffer_size {
             return Err(Unsupported("GPU filter window exceeds the bounded buffer budget".into()));
         }
         let (width, height) = (window.width(), window.height());

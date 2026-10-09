@@ -521,10 +521,13 @@ fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
     }
     let gpu = app.gpu.clone()?;
     gpu.begin_frame(app.frame);
-    let revision = app.session.documents().get(idx)?.revision;
-    let (doc, preview) = display_doc(app, idx);
+    let (revision, last_damage) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage))?;
+    let (doc, raw_key) = display_doc(app, idx);
     let (display, display_key) = canvas_display(app, &doc);
-    let preview = preview ^ display_key ^ if preview == 0 { std::sync::Arc::as_ptr(&doc) as usize as u64 } else { 0 };
+    // `damage_key` follows the full-document canvas cache's convention, so `damage_since` can
+    // tell which rectangle changed since the texture was last composited.
+    let damage_key = raw_key ^ display_key;
+    let preview = damage_key ^ if raw_key == 0 { std::sync::Arc::as_ptr(&doc) as usize as u64 } else { 0 };
     let original_visible = visible_doc_rect(xf).intersect(&app.session.documents().get(idx)?.doc.bounds());
     let input_level = filter_display_factor(app, idx).trailing_zeros();
     let total_level = viewport_level(original_visible, xf.zoom * ctx.pixels_per_point(), input_level);
@@ -565,22 +568,39 @@ fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
     }
     let output_key = view_id.with(("viewport-output", doc.id.0)).value();
     let uploaded_key = egui::Id::new(("viewport-gpu-upload", view_id, doc.id.0));
-    let uploaded: Option<(u64, u64, u32, DRect)> = ctx.data(|d| d.get_temp(uploaded_key));
-    let existing =
-        uploaded.filter(|(r, p, l, a)| (*r, *p, *l) == (revision, preview, level) && a.contains_rect(&visible) && gpu.has(output_key, [a.width(), a.height()]));
-    let area = existing.map_or(wanted, |(_, _, _, a)| a);
-    if existing.is_none() || gpu.pending(output_key) {
-        match gpu.composite_view(&proxy, area, display.as_ref().is_some_and(|d| d.encode_srgb), output_key, app.session.documents().get(idx)?.doc.id.0) {
-            Ok(stats) => {
-                app.perf.gpu_uploads = stats.tiles_uploaded as u64;
-                app.perf.gpu = true;
-                ctx.data_mut(|d| d.insert_temp(uploaded_key, (revision, preview, level, area)));
-            }
-            Err(error) => {
-                app.perf.gpu_fallback = Some(error.0);
-                return None;
+    let uploaded: Option<(u64, u64, u32, DRect, u64)> = ctx.data(|d| d.get_temp(uploaded_key));
+    // A texture at this level that still covers the view can be updated in place.
+    let reusable = uploaded.filter(|(_, _, l, a, _)| *l == level && a.contains_rect(&visible) && gpu.has(output_key, [a.width(), a.height()]));
+    let existing = reusable.filter(|(r, p, ..)| (*r, *p) == (revision, preview));
+    let area = reusable.map_or(wanted, |(_, _, _, a, _)| a);
+    let pending = gpu.pending(output_key);
+    // Only the changed rectangle (an edit's damage, the live stroke's dabs) is recomposited.
+    // Through a filter preview's reduced input the damage is not in these coordinates.
+    let region = match reusable {
+        Some((r, _, _, _, k)) if existing.is_none() && !pending && input_level == 0 => {
+            damage_since(app, idx, (r, k), (revision, raw_key), display_key, last_damage).map(|d| {
+                let d = photocraft_raster::Surface::mip_bounds(d, level);
+                if d.is_empty() { d } else { d.inflate(1).intersect(&area) }
+            })
+        }
+        _ => None,
+    }
+    .unwrap_or(area);
+    if existing.is_none() || pending {
+        if !region.is_empty() {
+            let owner = app.session.documents().get(idx)?.doc.id.0;
+            match gpu.composite_view(&proxy, region, area, display.as_ref().is_some_and(|d| d.encode_srgb), output_key, owner) {
+                Ok(stats) => {
+                    app.perf.gpu_uploads = stats.tiles_uploaded as u64;
+                    app.perf.gpu = true;
+                }
+                Err(error) => {
+                    app.perf.gpu_fallback = Some(error.0);
+                    return None;
+                }
             }
         }
+        ctx.data_mut(|d| d.insert_temp(uploaded_key, (revision, preview, level, area, damage_key)));
     }
     if gpu.pending(output_key) {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));

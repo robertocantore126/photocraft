@@ -452,16 +452,18 @@ impl GpuCanvas {
         self.composite_output(doc, region, encode_srgb, level, None, doc.id.0)
     }
 
-    /// Composite a bounded viewport texture while retaining source document coordinates.
+    /// Composite a bounded viewport texture covering `output` while retaining source document
+    /// coordinates. Only `region` is recomposited when the texture already exists with that size.
     pub fn composite_view(
         &self,
         doc: &photocraft_doc::Document,
         region: photocraft_geom::Rect,
+        output: photocraft_geom::Rect,
         encode_srgb: bool,
         key: u64,
         owner: u64,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
-        let result = self.composite_output(doc, region, encode_srgb, 0, Some(region), key);
+        let result = self.composite_output(doc, region, encode_srgb, 0, Some(output), key);
         let mut renderer = self.rs.renderer.write();
         if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
             let frame = res.slice_frame.map_or(0, |(frame, _)| frame);
@@ -471,11 +473,11 @@ impl GpuCanvas {
             }
         }
         drop(renderer);
-        if result.is_ok() {
-            if let Some(res) = self.rs.renderer.write().callback_resources.get_mut::<Resources>() {
-                res.dirty.remove(&key);
-                res.coarse.remove(&key);
-            }
+        if result.is_ok()
+            && let Some(res) = self.rs.renderer.write().callback_resources.get_mut::<Resources>()
+        {
+            res.dirty.remove(&key);
+            res.coarse.remove(&key);
         }
         result
     }

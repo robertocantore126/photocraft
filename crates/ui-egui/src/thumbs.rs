@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
 pub type Key = (DocId, LayerId, u8);
+const RETRIES: u32 = 3;
 pub struct Finished {
     pub key: Key,
     pub revision: u64,
@@ -22,6 +23,9 @@ struct Request {
 struct Pending {
     requests: VecDeque<Request>,
     latest: HashMap<Key, u64>,
+    /// Failed renders per key: a failure is retried (up to `RETRIES` times) when the row is
+    /// painted again instead of leaving the placeholder until the pixels change.
+    failed: HashMap<Key, u32>,
     stop: bool,
 }
 struct Shared {
@@ -89,9 +93,21 @@ impl ThumbQueue {
         }
         let mut finished = Vec::new();
         while let Ok(result) = self.receiver.try_recv() {
-            if self.shared.pending.lock().unwrap_or_else(PoisonError::into_inner).latest.get(&result.key) == Some(&result.revision) {
-                finished.push(result);
+            let mut pending = self.shared.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if pending.latest.get(&result.key) != Some(&result.revision) {
+                continue;
             }
+            if result.image.is_ok() {
+                pending.failed.remove(&result.key);
+            } else {
+                let tries = pending.failed.entry(result.key).or_insert(0);
+                *tries += 1;
+                if *tries < RETRIES {
+                    pending.latest.remove(&result.key);
+                }
+            }
+            drop(pending);
+            finished.push(result);
         }
         if self.workers == 0
             && !self.shared.pending.lock().unwrap_or_else(PoisonError::into_inner).requests.is_empty()
@@ -104,6 +120,7 @@ impl ThumbQueue {
     pub fn retain(&self, live: &std::collections::HashSet<Key>) {
         let mut pending = self.shared.pending.lock().unwrap_or_else(PoisonError::into_inner);
         pending.latest.retain(|key, _| live.contains(key));
+        pending.failed.retain(|key, _| live.contains(key));
         pending.requests.retain(|request| live.contains(&request.key));
     }
 }

@@ -251,27 +251,27 @@ impl Cell {
         M.reloads.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Prepare a durable copy without evicting the resident pixels. Mutation holds
-    /// the exclusive pixel lock, so it cannot invalidate a slot while this is written.
+    /// Prepare a durable copy without evicting the resident pixels (true when one was written).
+    /// Mutation holds the exclusive pixel lock, so it cannot invalidate a slot while this is written.
     #[cfg(not(target_arch = "wasm32"))]
-    fn prewrite(&self, file: &Arc<ScratchFile>) -> Result<(), String> {
+    fn prewrite(&self, file: &Arc<ScratchFile>) -> Result<bool, String> {
         if M.reading.load(Ordering::Acquire) != 0 {
-            return Ok(());
+            return Ok(false);
         }
-        let Ok(data) = self.data.try_read() else { return Ok(()) };
-        let Some(bytes) = data.as_ref() else { return Ok(()) };
-        let Ok(mut slot) = self.slot.try_lock() else { return Ok(()) };
+        let Ok(data) = self.data.try_read() else { return Ok(false) };
+        let Some(bytes) = data.as_ref() else { return Ok(false) };
+        let Ok(mut slot) = self.slot.try_lock() else { return Ok(false) };
         if slot.is_some() || self.read_error().is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let packed = lz4_flex::block::compress(bytes);
         if M.reading.load(Ordering::Acquire) != 0 {
-            return Ok(());
+            return Ok(false);
         }
         let extent = file.write(&packed).map_err(|e| format!("scratch write-behind failed: {e}"))?;
         M.written.fetch_add(packed.len() as u64, Ordering::Relaxed);
         *slot = Some(Slot::Scratch(file.clone(), extent));
-        Ok(())
+        Ok(true)
     }
 
     /// Move this tile to disk if nobody is using it. Returns the bytes freed.
@@ -629,10 +629,15 @@ impl Drop for ActiveRead {
 #[cfg(not(target_arch = "wasm32"))]
 fn write_behind_loop() {
     let mut hand = 0usize;
+    // After a pass that found nothing to write, sleep longer: the eviction path wakes this
+    // thread when memory rises, so an idle session doesn't poll the shared locks 10×/s.
+    let mut idle = false;
     loop {
         let config = M.config();
-        let (config, _) = M.wake.wait_timeout(config, std::time::Duration::from_millis(100)).unwrap_or_else(PoisonError::into_inner);
+        let nap = std::time::Duration::from_millis(if idle { 1000 } else { 100 });
+        let (config, _) = M.wake.wait_timeout(config, nap).unwrap_or_else(PoisonError::into_inner);
         drop(config);
+        idle = true;
         let budget = M.budget.load(Ordering::Relaxed);
         if budget == 0
             || M.resident.load(Ordering::Relaxed) < budget / 5 * 4
@@ -663,10 +668,15 @@ fn write_behind_loop() {
             if M.reading.load(Ordering::Acquire) != 0 || M.budget.load(Ordering::Relaxed) == 0 {
                 break;
             }
-            if let Err(error) = cell.prewrite(&file) {
-                M.error(error);
-                M.budget.store(0, Ordering::Relaxed);
-                break;
+            match cell.prewrite(&file) {
+                Ok(wrote) => idle &= !wrote,
+                Err(error) => {
+                    // Write-behind is only speculative: stop it, but keep spilling on. Eviction
+                    // still writes (and reports) on its own if the disk really is unusable.
+                    M.error(error);
+                    M.config().writer = false;
+                    return;
+                }
             }
             std::thread::yield_now();
         }

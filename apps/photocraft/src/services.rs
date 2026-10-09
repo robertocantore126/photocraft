@@ -108,16 +108,28 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
     });
     Services {
         background_import: Some(Arc::new(|path, progress, preview| {
-            if progress.is_cancelled() { return Err("cancelled".into()); }
+            if progress.is_cancelled() {
+                return Err("cancelled".into());
+            }
             progress.set_fraction(0.05);
-            let result = photocraft_io::import_path_with_events(Path::new(path), &|document| {
-                progress.set_fraction(0.25);
-                if !progress.is_cancelled() { preview(document); }
-            }, &|done, total| {
-                progress.set_fraction(0.25 + 0.7 * done as f32 / total.max(1) as f32);
-                !progress.is_cancelled()
-            }).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string());
-            if progress.is_cancelled() { return Err("cancelled".into()); }
+            let result = photocraft_io::import_path_with_events(
+                Path::new(path),
+                &|document| {
+                    progress.set_fraction(0.25);
+                    if !progress.is_cancelled() {
+                        preview(document);
+                    }
+                },
+                &|done, total| {
+                    progress.set_fraction(0.25 + 0.7 * done as f32 / total.max(1) as f32);
+                    !progress.is_cancelled()
+                },
+            )
+            .map(|r| (r.document, r.warnings))
+            .map_err(|e| e.to_string());
+            if progress.is_cancelled() {
+                return Err("cancelled".into());
+            }
             progress.set_fraction(1.0);
             result
         })),
@@ -302,9 +314,20 @@ pub fn export_flat(doc: &Document, path: &str) -> Result<Vec<u8>, String> {
 
 /// Stage every background save next to its destination, then commit by the same rename
 /// primitive as the pack writer. A failed/cancelled job never removes the original file.
-fn save_background(doc: &Document, path: &str, _compact: bool, progress: &photocraft_engine::jobs::Progress) -> Result<Vec<String>, String> {
-    if progress.is_cancelled() { return Err("cancelled".into()); }
+fn save_background(doc: &Document, path: &str, compact: bool, progress: &photocraft_engine::jobs::Progress) -> Result<Vec<String>, String> {
+    if progress.is_cancelled() {
+        return Err("cancelled".into());
+    }
     let destination = Path::new(path);
+    // Saving a native pack in place appends only what changed (the pack writer is
+    // crash-safe on its own); staging a full copy would rewrite every tile.
+    if !compact && destination.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
+        progress.set_fraction(0.1);
+        let warnings =
+            photocraft_engine::jobs::with_progress(progress, || photocraft_io::export_path(doc, destination, &Default::default()).map_err(|e| e.to_string()))?;
+        progress.set_fraction(1.0);
+        return Ok(warnings);
+    }
     if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -316,16 +339,24 @@ fn save_background(doc: &Document, path: &str, _compact: bool, progress: &photoc
     let reserved = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
     drop(reserved);
     struct Cleanup(PathBuf);
-    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
     let _cleanup = Cleanup(temporary.clone());
     progress.set_fraction(0.1);
     let warnings = photocraft_engine::jobs::with_progress(progress, || {
         if extension.eq_ignore_ascii_case("pcraft") {
             photocraft_format::pack::save_compact_path(doc, &temporary, &Default::default()).map(|_| Vec::new()).map_err(|e| e.to_string())
-        } else { photocraft_io::export_path(doc, &temporary, &Default::default()).map_err(|e| e.to_string()) }
+        } else {
+            photocraft_io::export_path(doc, &temporary, &Default::default()).map_err(|e| e.to_string())
+        }
     })?;
     progress.set_fraction(0.95);
-    if progress.is_cancelled() { return Err("cancelled; destination preserved".into()); }
+    if progress.is_cancelled() {
+        return Err("cancelled; destination preserved".into());
+    }
     std::fs::rename(&temporary, destination).map_err(|e| format!("could not replace destination; original preserved: {e}"))?;
     progress.set_fraction(1.0);
     Ok(warnings)

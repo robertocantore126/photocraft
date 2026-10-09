@@ -142,7 +142,8 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{"effects":json,"foreground":json,"background":json,"list":bool}"##,
         enabled: crate::filters::has_filterable_layer,
         run: run_gallery,
-        journal: true, job: None,
+        journal: true,
+        job: None,
     }];
     v.extend(gallery_specs![
         ColoredPencil,

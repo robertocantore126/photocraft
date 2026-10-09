@@ -14,10 +14,9 @@ impl<R: Read + Seek> Input<'_, R> {
         if next > self.end {
             return Err(PsdError::invalid("stream section truncated"));
         }
+        // The section is bounded by the file's real length (checked above) and the allocation
+        // is fallible, so a large PSB's merged image or channel (over 2 GiB) still reads.
         let size = usize::try_from(length).map_err(|_| PsdError::LimitExceeded("stream length exceeds address space"))?;
-        if length > 1 << 31 {
-            return Err(PsdError::LimitExceeded("stream allocation exceeds 2 GiB"));
-        }
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(size).map_err(|_| PsdError::LimitExceeded("stream allocation failed"))?;
         bytes.resize(size, 0);

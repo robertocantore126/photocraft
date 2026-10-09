@@ -47,9 +47,12 @@ impl PhotocraftApp {
     /// Read and open the file at `path` (see [`open_file`](Self::open_file)).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &str) -> Result<Vec<String>, String> {
-        if !crate::preset_files_ui::is_preset_file(path) && photocraft_engine::jobs::enabled()
-            && !self.automation_input && !self.jobs.force_sync
-            && let Some(import) = self.services.background_import.clone() {
+        if !crate::preset_files_ui::is_preset_file(path)
+            && photocraft_engine::jobs::enabled()
+            && !self.automation_input
+            && !self.jobs.force_sync
+            && let Some(import) = self.services.background_import.clone()
+        {
             self.jobs.io.open(path.into(), import, self.session.active().map(|st| st.doc.id))?;
             self.ui.status = format!("Opening {path}");
             self.ui.status_error = false;
@@ -77,7 +80,8 @@ impl PhotocraftApp {
 
     /// Open several files, reporting each failure to the user instead of stopping. Relative paths
     /// are resolved against the working directory so the remembered path stays valid. Returns how
-    /// many opened.
+    /// many opened, or were accepted for opening when imports run in the background (they open
+    /// one at a time; a later failure is reported as it happens).
     pub fn open_paths(&mut self, paths: &[String]) -> usize {
         let mut opened = 0;
         for p in paths {

@@ -90,7 +90,7 @@ fn surface_m(s: &Surface, sink: &mut dyn Sink) -> SurfaceM {
     SurfaceM {
         format: f,
         default: hex(&dp),
-        content_bounds: if std::env::var("PHOTOCRAFT_PACK_BOUNDS").as_deref() == Ok("0") { None } else { Some(s.exact_content_bounds()) },
+        content_bounds: if std::env::var("PHOTOCRAFT_PACK_BOUNDS").as_deref() == Ok("0") { None } else { s.exact_content_bounds_if_resident() },
         tiles: s.tiles().map(|(c, t)| TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t) }).collect(),
         mips: if std::env::var("PHOTOCRAFT_PACK_MIPS").as_deref() == Ok("0") {
             Vec::new()

@@ -317,7 +317,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → {groups:[{name,presets:[{name,effects,blend,fillOpacity}]}]}",
             enabled: always,
             run: list,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "style.presets.apply",
@@ -327,7 +328,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"preset":name,"group":name?,"layers":[ids]?|"layer":id? (default: the selected layers),"add":bool=false (⇧-click: add to the existing effects)} → {layers,style}"##,
             enabled: has_layer,
             run: apply,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "style.presets.new",
@@ -337,7 +339,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"name":str="Style","group":name?,"layer":id?,"includeEffects":bool=true,"includeBlending":bool=true} (from the layer's effects)"##,
             enabled: has_layer,
             run: new_preset,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "style.presets.edit",
@@ -347,7 +350,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: super::GROUP_EDIT_PARAMS,
             enabled: always,
             run: edit,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "style.presets.reset",
@@ -357,7 +361,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"append":bool=false}"##,
             enabled: always,
             run: reset,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

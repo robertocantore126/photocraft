@@ -219,7 +219,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=true,"threshold":0..100=50 (higher = stricter),"softness":0..100=50 (edge softness)} → {selected, changed, coverage (0–1 of the canvas), bounds [x,y,w,h]}"##,
             enabled: has_doc,
             run: select_sky,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "select.isolateLayers",
@@ -229,7 +230,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"on":bool? (default: toggle)} — Layers panel lists only the selected layers → {isolated, layers}"##,
             enabled: has_layer,
             run: isolate_layers,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "select.transformSelection",
@@ -239,7 +241,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"rect":[x0,y0,x1,y1]? (frame; default = selection bounds),"quad"|"corners":[[x,y]×4]? (where the frame's corners go: distort/perspective),"matrix":[a,b,c,d,e,f]?,"scaleX":%=100,"scaleY":%=100,"rotate":deg=0,"skewX":deg=0,"skewY":deg=0,"dx":px=0,"dy":px=0,"reference":"center|topLeft|top|topRight|left|right|bottomLeft|bottom|bottomRight"|[x,y]="center","style"|"mesh"|"grid"|"warp":… (warp, as edit.transform.warp),"interpolation":"bilinear|bicubic|nearest"="bilinear"}"##,
             enabled: has_selection,
             run: transform_selection,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

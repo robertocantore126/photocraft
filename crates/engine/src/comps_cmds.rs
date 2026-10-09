@@ -418,7 +418,8 @@ pub fn specs() -> Vec<CommandSpec> {
             update_warnings
         ),
         CommandSpec {
-            journal: false, job: None,
+            journal: false,
+            job: None,
             ..spec!(
                 "layerComp.list",
                 "List Layer Comps",

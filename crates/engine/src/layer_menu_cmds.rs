@@ -334,7 +334,8 @@ macro_rules! stack_spec {
             params: r##"{"layer":id?}"##,
             enabled: has_smart,
             run: |s, p| stack_mode(s, p, $mode),
-            journal: true, job: None,
+            journal: true,
+            job: None,
         }
     };
 }
@@ -786,7 +787,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: has_content_options,
             run: content_options,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         spec!("layer.quickExportAsPng", "Quick Export as PNG", ["Layer"], r##"{"layer":id?,"path":text}"##, has_layer, |s, p| export_layer(
             s,

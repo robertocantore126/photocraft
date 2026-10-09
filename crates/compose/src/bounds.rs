@@ -49,7 +49,9 @@ pub fn content_bounds(s: &Surface) -> Rect {
     photocraft_raster::encode_pixel(&fmt, &s.default_pixel(), &mut dp);
     {
         let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if cache.len() > 1 << 16 { cache.retain(|_, entry| entry.tile.strong_count() > 0); }
+        if cache.len() > 1 << 16 {
+            cache.retain(|_, entry| entry.tile.strong_count() > 0);
+        }
     }
     let mut out = Rect::EMPTY;
     for (coord, t) in s.tiles() {
@@ -63,7 +65,10 @@ pub fn content_bounds(s: &Surface) -> Rect {
             None => {
                 // Never hold the shared cache lock over a pixel scan or a scratch read.
                 let bounds = scan(t, &dp);
-                cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, Entry { tile: Arc::downgrade(t), default: dp.clone().into_boxed_slice(), bounds });
+                cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, Entry { tile: Arc::downgrade(t), default: dp.clone().into_boxed_slice(), bounds });
                 bounds
             }
         };

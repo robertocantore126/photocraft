@@ -59,14 +59,18 @@ impl Drop for Jobs {
 
 impl PhotocraftApp {
     pub(crate) fn poll_jobs(&mut self, ctx: &egui::Context) {
+        // Esc is read once and cancels what the progress windows show: every file operation and
+        // the command job on display (the active document's, else the first).
+        let busy = !self.jobs.running.is_empty() || self.jobs.io.is_running();
+        let cancel = busy && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let mut io = std::mem::take(&mut self.jobs.io);
-        io.poll(self, ctx);
+        io.poll(self, ctx, cancel);
         self.jobs.io = io;
         let active = self.session.active().map(|st| st.doc.id);
-        let cancel = !self.jobs.running.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let shown = self.jobs.running.iter().position(|r| active == Some(r.before.id)).unwrap_or(0);
         let mut pending = Vec::new();
-        for running in std::mem::take(&mut self.jobs.running) {
-            if cancel && active.is_none_or(|id| id == running.before.id) {
+        for (index, running) in std::mem::take(&mut self.jobs.running).into_iter().enumerate() {
+            if cancel && index == shown {
                 running.progress.cancel();
             }
             match running.receiver.try_recv() {

@@ -328,7 +328,8 @@ pub fn specs() -> Vec<CommandSpec> {
                 let (id, params) = last_filter(s).ok_or_else(|| EngineError::Other("no filter applied yet".into()))?;
                 run_filter(s, &id, &params)
             },
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

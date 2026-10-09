@@ -165,7 +165,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{} → {groups:[{name,patterns:[{id,name,width,height}]}],current}",
             enabled: always,
             run: list,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "pattern.presets.select",
@@ -175,7 +176,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"pattern":id|name,"applyToLayer":bool=true (also changes a selected Pattern Fill layer)} (Fill and new Pattern Fill layers default to it)"##,
             enabled: always,
             run: select,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "pattern.presets.apply",
@@ -185,7 +187,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"pattern":id|name?=selected,"scale":1..1000=100,"angle":deg=0} → {layer}"##,
             enabled: super::has_doc,
             run: apply,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "pattern.presets.new",
@@ -195,7 +198,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"name":str?,"group":name?,"rect":[x0,y0,x1,y1]?} (Define Pattern from the selection/canvas into a group)"##,
             enabled: super::has_doc,
             run: new_preset,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "pattern.presets.edit",
@@ -205,7 +209,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: super::GROUP_EDIT_PARAMS,
             enabled: always,
             run: edit,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

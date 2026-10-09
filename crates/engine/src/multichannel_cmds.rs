@@ -212,7 +212,8 @@ pub fn specs() -> Vec<CommandSpec> {
         params: r##"{} (flattens; RGB → Cyan/Magenta/Yellow, CMYK → Cyan/Magenta/Yellow/Black, Lab → Alpha 1–3, Grayscale → Black, Duotone → its inks)"##,
         enabled,
         run: to_multichannel,
-        journal: true, job: None,
+        journal: true,
+        job: None,
     }]
 }
 

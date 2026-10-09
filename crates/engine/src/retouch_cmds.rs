@@ -585,7 +585,8 @@ pub fn specs() -> Vec<CommandSpec> {
             ),
             enabled: has_pixel_layer,
             run: clone_stamp,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.healingBrush",
@@ -597,7 +598,8 @@ pub fn specs() -> Vec<CommandSpec> {
             ),
             enabled: has_pixel_layer,
             run: healing_brush,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.spotHealing",
@@ -607,7 +609,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","type":"contentAware|createTexture|proximityMatch"="contentAware""#),
             enabled: has_pixel_layer,
             run: spot_healing,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.dodge",
@@ -617,7 +620,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","range":"shadows|midtones|highlights"="midtones","exposure":1..100=50,"protectTones":bool=true"#),
             enabled: has_pixel_layer,
             run: |s, p| dodge_burn_cmd(s, p, false),
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.burn",
@@ -627,7 +631,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","range":"shadows|midtones|highlights"="midtones","exposure":1..100=50,"protectTones":bool=true"#),
             enabled: has_pixel_layer,
             run: |s, p| dodge_burn_cmd(s, p, true),
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.sponge",
@@ -637,7 +642,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","mode":"desaturate|saturate"="desaturate","vibrance":bool=true (flow = sponge strength)"#),
             enabled: has_pixel_layer,
             run: sponge_cmd,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.blur",
@@ -647,7 +653,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","strength":1..100=50"#),
             enabled: has_pixel_layer,
             run: |s, p| focus_cmd(s, p, false),
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.sharpen",
@@ -657,7 +664,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","strength":1..100=50,"protectDetail":bool=true"#),
             enabled: has_pixel_layer,
             run: |s, p| focus_cmd(s, p, true),
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.smudge",
@@ -667,7 +675,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","strength":1..100=50,"fingerPainting":bool=false (starts with the foreground colour)"#),
             enabled: has_pixel_layer,
             run: smudge_cmd,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.historyBrush",
@@ -677,7 +686,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: brush_params!(r#","state":index (into history.entries; default 0 = the oldest held state, normally the Open snapshot)"#),
             enabled: has_pixel_layer,
             run: history_brush,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

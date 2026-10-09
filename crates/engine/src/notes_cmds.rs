@@ -198,7 +198,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"x":px,"y":px,"text":str="","author":str="","color":"#rrggbb"|[r,g,b]=pale yellow,"open":bool=true}"##,
             enabled: has_doc,
             run: add,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "notes.set",
@@ -208,7 +209,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"index":n,"text":str?,"author":str?,"color":"#rrggbb"|[r,g,b]?,"x":px?,"y":px?,"open":bool?}"##,
             enabled: has_notes,
             run: set,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "notes.delete",
@@ -218,7 +220,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"index":n}|{"all":true}"##,
             enabled: has_notes,
             run: delete,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "notes.list",
@@ -228,7 +231,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{} → notes (index, author, text, colour, position, open, modified)"##,
             enabled: has_doc,
             run: list,
-            journal: false, job: None,
+            journal: false,
+            job: None,
         },
         CommandSpec {
             id: "file.import.notes",
@@ -238,7 +242,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":".psd|.psb|.pcraft with notes"}"##,
             enabled: has_doc,
             run: import,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

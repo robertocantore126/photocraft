@@ -53,10 +53,12 @@ pub fn stop_recording(app: &mut PhotocraftApp) {
 /// Replay an action; stops at the first failing step and reports it.
 pub fn play(app: &mut PhotocraftApp, idx: usize) -> Result<usize, String> {
     let steps = app.ui.actions.list.get(idx).map(|a| a.steps.clone()).ok_or("no such action")?;
-    for (i, (id, p)) in steps.iter().enumerate() {
-        app.run(id, p.clone()).map_err(|e| format!("Step {} ({id}) failed: {e}", i + 1))?;
-    }
-    Ok(steps.len())
+    // Each step reads the previous one's result: run them in order, never as background jobs.
+    let sync = std::mem::replace(&mut app.jobs.force_sync, true);
+    let result =
+        steps.iter().enumerate().try_for_each(|(i, (id, p))| app.run(id, p.clone()).map(drop).map_err(|e| format!("Step {} ({id}) failed: {e}", i + 1)));
+    app.jobs.force_sync = sync;
+    result.map(|()| steps.len())
 }
 
 fn label_of(id: &str) -> String {

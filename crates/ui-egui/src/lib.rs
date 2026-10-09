@@ -38,14 +38,14 @@ pub mod enable_rules;
 pub mod eraser_ui;
 pub mod export_dialog;
 pub mod file_open;
-mod jobs;
-mod io_jobs;
 pub mod file_ui;
 pub mod filter_dialog;
 pub mod gallery_ui;
 pub mod gpu_canvas;
 mod icon_data;
 pub mod icons;
+mod io_jobs;
+mod jobs;
 pub mod layer_menu_ui;
 pub mod layer_props_ui;
 mod layer_reveal;
@@ -120,7 +120,9 @@ pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<(Document, Vec<String>), S
 /// `photocraft_io::import_owned`).
 /// Native path importer retaining lazy pack handles.
 /// Thread-safe worker services are additive; capability-scoped automation keeps its own hooks.
-pub type BackgroundImportFn = std::sync::Arc<dyn Fn(&str, &photocraft_engine::jobs::Progress, &(dyn Fn(Document) + Send + Sync)) -> Result<(Document, Vec<String>), String> + Send + Sync>;
+pub type BackgroundImportFn = std::sync::Arc<
+    dyn Fn(&str, &photocraft_engine::jobs::Progress, &(dyn Fn(Document) + Send + Sync)) -> Result<(Document, Vec<String>), String> + Send + Sync,
+>;
 pub type BackgroundSaveFn = std::sync::Arc<dyn Fn(&Document, &str, bool, &photocraft_engine::jobs::Progress) -> Result<Vec<String>, String> + Send + Sync>;
 pub type ImportPathFn = Box<dyn Fn(&str) -> Result<(Document, Vec<String>), String>>;
 /// Streaming native document save.
@@ -458,13 +460,17 @@ impl PhotocraftApp {
                 Ok(Some(prepared)) => {
                     let before = prepared.before.clone();
                     let result = self.jobs.start(prepared);
-                    if result.is_err() { self.session.release_job(&before); }
+                    if result.is_err() {
+                        self.session.release_job(&before);
+                    }
                     result
                 }
                 Ok(None) => self.session.execute(id, params).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }
-        } else { self.session.execute(id, params).map_err(|e| e.to_string()) };
+        } else {
+            self.session.execute(id, params).map_err(|e| e.to_string())
+        };
         if r.is_ok() && matches!(id, "edit.copy" | "edit.cut" | "edit.copyMerged") {
             self.clip_external = false;
             self.export_os_clipboard();
@@ -641,12 +647,19 @@ impl PhotocraftApp {
             Some(p) => p,
             None => self.services.pick_save.as_mut().and_then(|f| f(&suggested)).ok_or("cancelled")?,
         };
-        if st.busy { return Err("document is busy".into()); }
+        if st.busy {
+            return Err("document is busy".into());
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        if photocraft_engine::jobs::enabled() && !self.automation_input && !self.jobs.force_sync
-            && let Some(save) = self.services.background_save.clone() {
+        if photocraft_engine::jobs::enabled()
+            && !self.automation_input
+            && !self.jobs.force_sync
+            && let Some(save) = self.services.background_save.clone()
+        {
             self.jobs.io.save(st.doc.clone(), st.revision, path.clone(), st.path.as_deref() != Some(path.as_str()), save)?;
-            if let Some(st) = self.session.active_mut() { st.busy = true; }
+            if let Some(st) = self.session.active_mut() {
+                st.busy = true;
+            }
             self.ui.status = format!("Saving {path}");
             self.ui.status_error = false;
             return Ok((path, Vec::new()));
@@ -975,10 +988,10 @@ impl PhotocraftApp {
         {
             return tex.id();
         }
-        if std::env::var("PHOTOCRAFT_BACKGROUND_THUMBS").as_deref() != Ok("0") {
-            if let Some(surface) = layer.surface() {
-                return self.queue_thumb(ctx, key, rev, surface, doc.size, false);
-            }
+        if std::env::var("PHOTOCRAFT_BACKGROUND_THUMBS").as_deref() != Ok("0")
+            && let Some(surface) = layer.surface()
+        {
+            return self.queue_thumb(ctx, key, rev, surface, doc.size, false);
         }
         let mut px = [0.0f32; 8];
         let img = thumb_image(doc, 64, |x, y| {

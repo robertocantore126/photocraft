@@ -373,7 +373,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: Some("Cmd+Shift+X"),
             params: L,
             enabled: crate::filters::has_filterable_layer,
-            journal: true, job: None,
+            journal: true,
+            job: None,
             run: liquify,
         },
         CommandSpec {
@@ -383,7 +384,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: P,
             enabled: pixel_layer,
-            journal: true, job: None,
+            journal: true,
+            job: None,
             run: |s, p| puppet(s, p, PUPPET),
         },
         CommandSpec {
@@ -393,7 +395,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: P,
             enabled: smart_layer,
-            journal: true, job: None,
+            journal: true,
+            job: None,
             run: |s, p| puppet(s, p, PUPPET_SMART),
         },
         CommandSpec {
@@ -403,7 +406,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: Q,
             enabled: pixel_layer,
-            journal: true, job: None,
+            journal: true,
+            job: None,
             run: |s, p| perspective(s, p, PERSPECTIVE),
         },
         CommandSpec {
@@ -413,7 +417,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: Q,
             enabled: smart_layer,
-            journal: true, job: None,
+            journal: true,
+            job: None,
             run: |s, p| perspective(s, p, PERSPECTIVE_SMART),
         },
     ]

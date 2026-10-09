@@ -173,7 +173,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"x":px,"y":px,"tolerance":0..255=32,"antiAlias":bool=true,"contiguous":bool=true,"sampleAllLayers":bool=false,"opacity":1..100=100}"##,
             enabled: has_pixel_layer,
             run: magic_eraser,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
         CommandSpec {
             id: "paint.backgroundEraser",
@@ -183,7 +184,8 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"points":[[x,y,pressure?],…],"size":px?,"hardness":0..1?,"brush":{…}?,"preset":name?,"sampling":"continuous|once|backgroundSwatch"="continuous","limits":"discontiguous|contiguous|findEdges"="contiguous","tolerance":0..100=50,"protectForegroundColor":bool=false,"seed":u64?}"##,
             enabled: has_pixel_layer,
             run: background_eraser,
-            journal: true, job: None,
+            journal: true,
+            job: None,
         },
     ]
 }

@@ -59,15 +59,15 @@ pub fn prepare_command(session: &Session, params: &Value) -> Result<Job> {
     if crate::filters::params_for(&id, &params).is_some() {
         return crate::filters::prepare_job(session, &id, &params);
     }
+    // Background commands act on the active document only: copy just that one (its tiles
+    // are shared copy-on-write), without history, journal or the other open documents.
     let mut isolated = Session::new();
-    isolated.docs = session.docs.clone();
-    for st in &mut isolated.docs {
-        st.busy = false;
-        st.history = Default::default();
-    }
-    isolated.active = session.active;
+    let mut st = session.active().ok_or(EngineError::NoDocument)?.clone();
+    st.busy = false;
+    st.history = Default::default();
+    isolated.docs = vec![st];
+    isolated.active = Some(0);
     isolated.tools = session.tools.clone();
-    isolated.journal = session.journal.clone();
     isolated.clipboard = session.clipboard.clone();
     let mut prefs = session.prefs.get().clone();
     prefs.script_events.enabled = false;

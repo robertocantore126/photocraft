@@ -484,7 +484,8 @@ pub fn specs() -> Vec<CommandSpec> {
             shortcut: None,
             params: "{} → {slices:[{number,id,origin:auto|layer|user,name,rect:[x,y,w,h],kind,layer,url,alt,…}], locked}",
             enabled: has_doc,
-            journal: false, job: None,
+            journal: false,
+            job: None,
             run: |s, _| list(s),
         },
         spec!(

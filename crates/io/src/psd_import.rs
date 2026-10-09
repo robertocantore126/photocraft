@@ -1,7 +1,7 @@
 //! PSD/PSB → [`Document`].
 
-use std::sync::Arc;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{AlphaChannel, Document, Effects, FillCache, Group, Layer, LayerContent, LayerMask, ShapeLayer, SmartObject, SmartSource, TextLayer};
@@ -55,18 +55,26 @@ pub(crate) struct Ctx<'a> {
     decoded: BTreeMap<usize, DecodedLayer>,
 }
 
-struct DecodedLayer { surface: Option<Surface>, mask: Option<LayerMask>, warnings: Vec<String> }
+struct DecodedLayer {
+    surface: Option<Surface>,
+    mask: Option<LayerMask>,
+    warnings: Vec<String>,
+}
 
 /// Decode pixel storage independently; layer ids, effects and the tree are assembled in order.
 fn decode_layer(file: &PsdFile, rec: &LayerRecord, fmt: PixelFormat, mask_fmt: PixelFormat, dpi: f32) -> DecodedLayer {
-    let mut cx = Ctx { file, fmt, mask_fmt, cc: fmt.mode.color_channels(), cmyk: fmt.mode == ColorMode::Cmyk,
-        warnings: Vec::new(), dpi, decoded: BTreeMap::new() };
+    let mut cx =
+        Ctx { file, fmt, mask_fmt, cc: fmt.mode.color_channels(), cmyk: fmt.mode == ColorMode::Cmyk, warnings: Vec::new(), dpi, decoded: BTreeMap::new() };
     let name = rec.name();
-    let surface = (!rec.section_type().is_folder() && !ADJUSTMENT_KEYS.iter().any(|k| rec.block(k).is_some()))
-        .then(|| cx.record_surface(rec, &name));
+    let mut surface = (!rec.section_type().is_folder() && !ADJUSTMENT_KEYS.iter().any(|k| rec.block(k).is_some())).then(|| cx.record_surface(rec, &name));
     let mask = cx.record_mask(rec, &name);
-    if std::env::var("PHOTOCRAFT_PSD_PRIME_BOUNDS").as_deref() != Ok("0") {
-        if let Some(surface) = &surface { photocraft_compose::bounds::content_bounds(surface); }
+    // The pixels are resident now: record the exact bounds once, so the view, the mip
+    // proxies and saves never rescan this layer (possibly from scratch) until it is edited.
+    if std::env::var("PHOTOCRAFT_PSD_PRIME_BOUNDS").as_deref() != Ok("0")
+        && let Some(surface) = &mut surface
+    {
+        let bounds = photocraft_compose::bounds::content_bounds(surface);
+        let _ = surface.restore_exact_content_bounds(bounds);
     }
     DecodedLayer { surface, mask, warnings: cx.warnings }
 }
@@ -126,13 +134,19 @@ impl Ctx<'_> {
 
     fn record_surface(&mut self, rec: &LayerRecord, name: &str) -> Surface {
         if let Some(decoded) = self.decoded.get_mut(&(rec as *const LayerRecord as usize))
-            && let Some(surface) = decoded.surface.take() { return surface; }
+            && let Some(surface) = decoded.surface.take()
+        {
+            return surface;
+        }
         let r = rec.rect;
         if r.is_empty() || r.size().is_err() {
             return Surface::new(self.fmt);
         }
         if std::env::var("PHOTOCRAFT_PSD_BANDS").as_deref() != Ok("0")
-            && let Some(surface) = crate::psd_bands::decode(self.file, rec, self.fmt) { return surface; }
+            && let Some(surface) = crate::psd_bands::decode(self.file, rec, self.fmt)
+        {
+            return surface;
+        }
         let (w, h) = r.size().unwrap_or((0, 0));
         let s = self.fmt.sample;
         let mut planes = Vec::with_capacity(self.cc + 1);
@@ -155,7 +169,9 @@ impl Ctx<'_> {
     }
 
     fn record_mask(&mut self, rec: &LayerRecord, name: &str) -> Option<LayerMask> {
-        if let Some(decoded) = self.decoded.get_mut(&(rec as *const LayerRecord as usize)) { return decoded.mask.take(); }
+        if let Some(decoded) = self.decoded.get_mut(&(rec as *const LayerRecord as usize)) {
+            return decoded.mask.take();
+        }
         let m = rec.layer_mask()?;
         let (id, rect, default, flags) = match selected_real_mask(rec) {
             Some(real) => (CHANNEL_REAL_USER_MASK, real.rect, real.background, real.flags),
@@ -465,10 +481,10 @@ fn merged_surface(file: &PsdFile, all: &[u8], fmt: PixelFormat) -> Surface {
             let band = Rect::new(canvas.x0, y, canvas.x1, y.saturating_add(TILE_SIZE).min(canvas.y1));
             s.read_region_into(band, &mut vals);
             for px in vals.chunks_exact_mut(cc + 1) {
-        let a = px[cc];
-        for c in 0..cc {
-            px[c] = if a <= 0.0 { 0.0 } else { crate::pixels::unmatte(px[c], a, white[c]) };
-        }
+                let a = px[cc];
+                for c in 0..cc {
+                    px[c] = if a <= 0.0 { 0.0 } else { crate::pixels::unmatte(px[c], a, white[c]) };
+                }
             }
             s.write_region(band, &vals);
             y = band.y1;
@@ -576,9 +592,11 @@ pub fn psd_to_document_with_events(file: &PsdFile, preview: &dyn Fn(Document), p
         cx.warn(format!("merged image could not be decoded: {e}"));
     }
 
-    if layered && !file.layers().is_empty()
+    if layered
+        && !file.layers().is_empty()
         && std::env::var("PHOTOCRAFT_PSD_PREVIEW").as_deref() != Ok("0")
-        && let Ok(all) = &merged {
+        && let Ok(all) = &merged
+    {
         let mut initial = doc.clone();
         initial.layers = vec![Layer::new("Opening preview", LayerContent::Raster(merged_surface(file, all, fmt)))];
         preview(initial);
@@ -614,7 +632,9 @@ pub fn psd_to_document_with_events(file: &PsdFile, preview: &dyn Fn(Document), p
             };
             #[cfg(target_arch = "wasm32")]
             let decoded: Vec<DecodedLayer> = file.layers().iter().map(decode).collect();
-            if !progress(total, total) { return (doc, cx.warnings); }
+            if !progress(total, total) {
+                return (doc, cx.warnings);
+            }
             for (rec, mut decoded) in file.layers().iter().zip(decoded) {
                 cx.warnings.append(&mut decoded.warnings);
                 cx.decoded.insert(rec as *const LayerRecord as usize, decoded);

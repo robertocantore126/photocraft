@@ -34,9 +34,9 @@ pub mod linked;
 mod multichannel_map;
 pub mod pattern_map;
 mod pixels;
+mod psd_bands;
 mod psd_export;
 mod psd_import;
-mod psd_bands;
 pub mod raw;
 pub mod slices_map;
 pub mod text_styles_map;
@@ -49,7 +49,7 @@ use photocraft_psd::{PsdError, PsdFile};
 pub use adjust_map::ADJUSTMENT_KEYS;
 pub use flat::document_to_image;
 pub use psd_export::{PsdExportOptions, document_to_psd, document_to_psd_with};
-pub use psd_import::{psd_to_document, psd_to_document_with_preview, psd_to_document_with_events};
+pub use psd_import::{psd_to_document, psd_to_document_with_events, psd_to_document_with_preview};
 
 /// Errors from import/export.
 #[derive(Debug, thiserror::Error)]
@@ -270,15 +270,23 @@ pub fn import_path_with_preview(path: &std::path::Path, preview: &dyn Fn(Documen
     import_path_with_events(path, preview, &|_, _| true)
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub fn import_path_with_events(path: &std::path::Path, preview: &dyn Fn(Document), progress: &(dyn Fn(usize, usize) -> bool + Sync)) -> Result<ImportResult, IoError> {
+pub fn import_path_with_events(
+    path: &std::path::Path,
+    preview: &dyn Fn(Document),
+    progress: &(dyn Fn(usize, usize) -> bool + Sync),
+) -> Result<ImportResult, IoError> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());
-    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) { return import_path(path); }
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pcraft")) {
+        return import_path(path);
+    }
     use std::io::{Read, Seek, SeekFrom};
     let mut source = std::fs::File::open(path).map_err(photocraft_format::FormatError::from)?;
     let mut signature = [0u8; 4];
     let psd = source.read_exact(&mut signature).is_ok() && &signature == b"8BPS";
     source.seek(SeekFrom::Start(0)).map_err(photocraft_format::FormatError::from)?;
-    if !psd { return import_path(path); }
+    if !psd {
+        return import_path(path);
+    }
     let file = if std::env::var("PHOTOCRAFT_PSD_STREAM").as_deref() != Ok("0") {
         PsdFile::from_reader(&mut std::io::BufReader::with_capacity(1 << 20, source))?
     } else {

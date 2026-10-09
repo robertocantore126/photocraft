@@ -2060,7 +2060,15 @@ impl Compositor {
         #[cfg(not(target_arch = "wasm32"))]
         let mut async_signature = 0;
         #[cfg(not(target_arch = "wasm32"))]
-        if self.async_effects && !self.nested && !region.is_empty() && progs.iter().any(|p| p.maps > 0) {
+        // Only a full rebuild (no maps yet, new settings or a new region size) goes to the
+        // workers. Tile edits and whole-pixel moves keep the incremental update below, so
+        // painting under an effect never drops its maps.
+        let full_rebuild = self
+            .fx
+            .get(&key)
+            .is_none_or(|e| e.doc != doc.id || e.shape_key != shape_key || (e.region.width(), e.region.height()) != (region.width(), region.height()));
+        #[cfg(not(target_arch = "wasm32"))]
+        if full_rebuild && self.async_effects && !self.nested && !region.is_empty() && progs.iter().any(|p| p.maps > 0) {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             (doc.id, shape_key, region).hash(&mut hash);
@@ -2073,29 +2081,27 @@ impl Compositor {
                 prog.key.hash(&mut hash);
             }
             async_signature = hash.finish() | 1;
-            if self.fx.get(&key).is_none_or(|e| e.doc != doc.id || e.async_signature != async_signature) {
-                if let Some(jobs) = &mut self.fx_jobs {
-                    // Only opt-in interactive Euclidean fields move to compute. The worker
-                    // still supplies compose's exact shape and every stroke field.
-                    let cpu_want: HashMap<_, _> = want
-                        .iter()
-                        .filter_map(|(&kind, &reach)| {
-                            let gpu = self.distance.as_ref().is_some_and(|engine| engine.supports(device, kind, reach, region));
-                            (!gpu).then_some((kind, reach))
-                        })
-                        .collect();
-                    match jobs.poll(key, async_signature, doc, layer, region, &cpu_want) {
-                        fx_jobs::Poll::Waiting => {
-                            self.fx.remove(&key);
-                            return;
-                        }
-                        fx_jobs::Poll::Ready(inputs) => {
-                            self.fx.remove(&key);
-                            prepared = Some(inputs);
-                        }
-                        fx_jobs::Poll::Failed(error) => {
-                            log::warn!("{error}; effect inputs use the synchronous fallback");
-                        }
+            if self.fx.get(&key).is_none_or(|e| e.doc != doc.id || e.async_signature != async_signature)
+                && let Some(jobs) = &mut self.fx_jobs
+            {
+                // Only opt-in interactive Euclidean fields move to compute. The worker
+                // still supplies compose's exact shape and every stroke field.
+                let cpu_want: HashMap<_, _> = want
+                    .iter()
+                    .filter_map(|(&kind, &reach)| {
+                        let gpu = self.distance.as_ref().is_some_and(|engine| engine.supports(device, kind, reach, region));
+                        (!gpu).then_some((kind, reach))
+                    })
+                    .collect();
+                match jobs.poll(key, async_signature, doc, layer, region, &cpu_want) {
+                    // Keep drawing the previous maps, if any, until the new ones arrive.
+                    fx_jobs::Poll::Waiting => return,
+                    fx_jobs::Poll::Ready(inputs) => {
+                        self.fx.remove(&key);
+                        prepared = Some(inputs);
+                    }
+                    fx_jobs::Poll::Failed(error) => {
+                        log::warn!("{error}; effect inputs use the synchronous fallback");
                     }
                 }
             }
