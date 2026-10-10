@@ -317,6 +317,7 @@ pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         return Some(t.id());
     }
     let t0 = crate::gpu_canvas::now_ms();
+    let _span = photocraft_trace::span("navigator");
     let buffer = if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() != Ok("0") {
         // A viewport filter proxy intentionally omits pixels away from the view; the navigator
         // keeps the complete committed image until the filter is applied in that case.
@@ -378,7 +379,9 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) 
         if let (Some(d), Some(t)) = (damage, current) {
             // Only what the edit or stroke touched: the reduced texture's pixels over it, with the
             // values the whole reduction gives them (factor 1 is the plain composite of `d`).
+            let span = photocraft_trace::span("cpu_canvas_damage");
             let buf = photocraft_compose::render_reduced_damage(&doc, w, h, d);
+            drop(span);
             let r = buf.rect;
             if !r.is_empty() {
                 let t1 = crate::gpu_canvas::now_ms();
@@ -388,7 +391,9 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) 
             }
         } else {
             // Reduced in bands straight from the compositor: no full-size composite in memory.
+            let span = photocraft_trace::span("cpu_canvas_full");
             let full = photocraft_compose::render_reduced(&doc, w, h);
+            drop(span);
             let t1 = crate::gpu_canvas::now_ms();
             let (img, scale) = (display_image(display.as_deref(), &full), 1.0 / factor as f32);
             match cache.texture.as_mut() {
@@ -809,9 +814,11 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, visible: DRect, zo
             .filter(|p| std::env::var("PHOTOCRAFT_FILTER_PROXY").as_deref() != Ok("0") && p.doc == doc_id && p.revision == revision && p.k == k)
             .map(|p| p.proxy.clone())
             .unwrap_or_else(|| std::sync::Arc::new(crate::proxy::proxy_document(&doc, k)));
+        let span = photocraft_trace::span("cpu_filter_preview");
         let result = crate::filter_dialog::preview_from_proxy_in(&proxy, active, channel, &cmd, &params, k).map(std::sync::Arc::new);
         if let Some(r) = &result {
             let buf = photocraft_compose::flatten(r);
+            drop(span);
             let t1 = crate::gpu_canvas::now_ms();
             let (display, _) = canvas_display(app, &doc);
             app.gpu.as_ref()?.upload_buffer_full(key, &texture_buffer(display.as_deref(), &buf), doc.depth);
@@ -850,6 +857,7 @@ fn ensure_adjust_proxy(app: &mut PhotocraftApp, idx: usize, zoom: f32) -> Option
 /// If a live adjustment preview is active on a large document, composite it on the proxy and upload
 /// it under its own GPU key. Returns (factor, gpu key) when the proxy should be drawn.
 fn ensure_proxy_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u64)> {
+    let _span = photocraft_trace::span("ensure_proxy_preview");
     let (layer, params) = app.live_adjust.clone()?;
     let (doc_id, revision, doc) = {
         let st = app.session.documents().get(idx)?;
@@ -876,7 +884,9 @@ fn ensure_proxy_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u64
             lm.content = LayerContent::Adjustment(preview);
         }
         let t0 = crate::gpu_canvas::now_ms();
+        let span = photocraft_trace::span("cpu_proxy_preview");
         let buf = photocraft_compose::flatten(&p);
+        drop(span);
         let t1 = crate::gpu_canvas::now_ms();
         let (display, _) = canvas_display(app, &doc);
         app.gpu.as_ref()?.upload_buffer_full(key, &texture_buffer(display.as_deref(), &buf), doc.depth);

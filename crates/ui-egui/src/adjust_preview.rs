@@ -205,6 +205,7 @@ fn cheap(app: &PhotocraftApp, doc: &Document) -> bool {
 
 /// Bring the cached preview up to date for document `idx` (the active one) and return it.
 fn update(app: &mut PhotocraftApp, idx: usize) -> Option<&AdjustPreview> {
+    let _span = photocraft_trace::span("adjust_preview");
     if app.session.active_index() != Some(idx) {
         return None;
     }
@@ -383,6 +384,7 @@ pub struct ProxyFrame {
 /// and the view is far enough out that a reduced copy shows the same detail as the full-size
 /// composite: each change then composites ~1/k² of the pixels. Built once per session and factor.
 pub fn gpu_proxy(app: &mut PhotocraftApp, idx: usize, zoom: f32) -> Option<ProxyFrame> {
+    let _span = photocraft_trace::span("adjust_gpu_proxy");
     let gpu = app.gpu.clone()?;
     update(app, idx)?;
     let p = app.adjust_preview.as_mut()?;

@@ -48,6 +48,7 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
   (default) because occluded macOS windows stop rendering
 - `ui.focus`: bring the main window to the front
 - `app.open {path}` / `app.save {path}`: relative file I/O through the configured automation roots (`app.open` reads under the read root, `app.save` writes under the write root; absolute paths, `..` and paths escaping the root are refused, and both fail closed when no root was granted). Both reply with `warnings` (import/export notes such as "adjustment layer flattened"; `[]` when none), also shown to the user in the status bar and as a notice (`notices` in `ui.inspect`); `app.open` also returns the `path` and document `name`, `app.save` the `path` written. Automation opens and saves never fire script events. `file.open`, `file.save`, `file.saveAs` and `file.saveACopy` reply with `warnings` the same way
+- `trace.save`: write the action tracer's last minute (see `photocraft-trace`) to `PHOTOCRAFT_TRACE_DIR`, else `%APPDATA%/Photocraft/traces`; replies `{path}`
 - `app.quit`
 
 ## Engine commands

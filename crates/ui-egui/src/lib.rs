@@ -1017,18 +1017,25 @@ impl PhotocraftApp {
     }
 
     /// Save the tracer's last minute next to `PHOTOCRAFT_TRACE_DIR` (else the config folder's
-    /// `traces`) and say where.
-    pub fn save_trace(&mut self) {
+    /// `traces`) and say where. Returns the file written.
+    pub fn save_trace(&mut self) -> Option<String> {
         let dir = std::env::var_os("PHOTOCRAFT_TRACE_DIR")
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("Photocraft").join("traces")));
         let Some(dir) = dir else {
             notices::post(self, "Trace not saved", vec!["No folder: set PHOTOCRAFT_TRACE_DIR".into()], true);
-            return;
+            return None;
         };
         match photocraft_trace::save(&dir) {
-            Ok(path) => notices::post(self, "Trace saved", vec![path.display().to_string()], false),
-            Err(e) => notices::post(self, "Trace not saved", vec![e.to_string()], true),
+            Ok(path) => {
+                let path = path.display().to_string();
+                notices::post(self, "Trace saved", vec![path.clone()], false);
+                Some(path)
+            }
+            Err(e) => {
+                notices::post(self, "Trace not saved", vec![e.to_string()], true);
+                None
+            }
         }
     }
 
