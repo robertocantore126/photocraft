@@ -123,3 +123,36 @@ impl PhotocraftApp {
         }
     }
 }
+
+#[cfg(test)]
+mod bughunt_ps {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn late_cancel_after_complete_never_commits_200_iterations() {
+        for _ in 0..200 {
+            let mut session = photocraft_engine::Session::new();
+            session.execute("file.new", json!({"width":17,"height":23})).unwrap();
+            session.execute("layer.new.layer", json!({})).unwrap();
+            session.execute("paint.stroke", json!({"points":[[2,3],[14,19]],"size":7})).unwrap();
+            let mut prepared = session.prepare_job("filter.blur.gaussianBlur", json!({"radius":1})).unwrap().unwrap();
+            let before = prepared.before.clone();
+            let revision = session.active().unwrap().revision;
+            let progress = Progress::default();
+            let result = prepared.run(&progress);
+            assert!(result.is_ok());
+            let (sender, receiver) = mpsc::channel();
+            assert!(sender.send((prepared, result)).is_ok());
+            // Worker completed and sent before cancellation; delivery is pending.
+            progress.cancel();
+            let mut app = PhotocraftApp::new(session, Default::default());
+            app.jobs.running.push(Running { before: before.clone(), label: "blur".into(), progress, receiver });
+            app.poll_jobs(&egui::Context::default());
+            assert!(app.jobs.running.is_empty());
+            assert_eq!(app.session.active().unwrap().doc, before);
+            assert_eq!(app.session.active().unwrap().revision, revision);
+            assert!(!app.session.active().unwrap().busy);
+        }
+    }
+}

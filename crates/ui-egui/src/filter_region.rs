@@ -262,3 +262,61 @@ pub fn update(
     }
     region.poll(hash);
 }
+
+#[cfg(test)]
+mod bughunt_ps {
+    use super::*;
+    use photocraft_engine::Session;
+    use serde_json::json;
+
+    fn scene() -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":101,"height":401,"background":"transparent"})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("paint.stroke", json!({"points":[[3,7],[52,160],[96,395]],"size":19,"color":"#e73491"})).unwrap();
+        s
+    }
+
+    fn preview(s: &Session, params: Value) -> Arc<Document> {
+        let st = s.active().unwrap();
+        Request {
+            doc: st.doc.clone(),
+            active: st.active_layer.unwrap(),
+            command: "filter.blur.gaussianBlur".into(),
+            params,
+            visible: st.doc.bounds(),
+            hash: 1,
+            level: 0,
+            proxy: None,
+            gpu: None,
+        }
+        .run(&Progress::default())
+        .unwrap()
+        .result
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "BUG-02: viewport preview filters pixels instead of the targeted alpha channel"]
+    fn bug_02_channel_preview() {
+        let mut s = scene();
+        s.execute("channel.new", json!({"name":"alpha","fill":"white"})).unwrap();
+        let params = json!({"radius":2.0,"target":{"channel":0}});
+        let shown = preview(&s, params.clone());
+        s.execute("filter.blur.gaussianBlur", params).unwrap();
+        let actual = &s.active().unwrap().doc;
+        let shown = photocraft_compose::flatten(&shown).px;
+        let actual = photocraft_compose::flatten(actual).px;
+        let differing = shown.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "BUG-02: preview modifies raster pixels; applied command modifies only alpha");
+    }
+
+    #[test]
+    fn viewport_cpu_preview_matches_applied_at_100_percent() {
+        let mut s = scene();
+        let params = json!({"radius":2.0});
+        let shown = preview(&s, params.clone());
+        s.execute("filter.blur.gaussianBlur", params).unwrap();
+        assert_eq!(photocraft_compose::flatten(&shown).px, photocraft_compose::flatten(&s.active().unwrap().doc).px);
+    }
+}
