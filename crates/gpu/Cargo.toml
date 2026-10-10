@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+photocraft-trace = { workspace = true }
 half = "2"
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }

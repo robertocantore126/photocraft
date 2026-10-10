@@ -158,6 +158,7 @@ fn worker(shared: Arc<Shared>, sender: mpsc::SyncSender<Finished>) {
     }
 }
 fn render(request: Request) -> Finished {
+    let _span = photocraft_trace::span("thumbnail");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| image(&request.surface, request.size, request.mask)))
         .unwrap_or_else(|_| Err("thumbnail worker failed while reading layer pixels".into()));
     Finished { key: request.key, revision: request.revision, image: result }

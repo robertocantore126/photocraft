@@ -1146,6 +1146,9 @@ impl Compositor {
         sink: &mut dyn FnMut(&mut wgpu::CommandEncoder, ChunkOut<'_>),
         flush: bool,
     ) -> Result<Stats, Unsupported> {
+        let _span = photocraft_trace::span_with(if self.nested { "encode_nested" } else { "encode" }, || {
+            format!("{}x{} of {}x{}", region.width(), region.height(), doc.size.width, doc.size.height)
+        });
         let canvas = doc.bounds();
         self.fx_view = (doc.size.width, doc.size.height);
         let mut region = region.intersect(&canvas);
@@ -2043,6 +2046,7 @@ impl Compositor {
         stats: &mut Stats,
     ) {
         let layer = f.layer;
+        let _span = photocraft_trace::span_with("sync_fx", || format!("{} ({}x{})", layer.name, region.width(), region.height()));
         let canvas = doc.bounds();
         let is_group = matches!(layer.content, LayerContent::Group(_));
         let cached_key = (is_group && self.pixels_only).then(|| self.fx.get(&key).map(|e| e.shape_key)).flatten();

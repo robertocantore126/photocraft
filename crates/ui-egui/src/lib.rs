@@ -226,6 +226,17 @@ pub struct Services {
     pub preset_store: Option<std::sync::mpsc::Receiver<photocraft_engine::preset_store::Opened>>,
 }
 
+/// View and input state the action tracer compares frame to frame.
+#[derive(Default)]
+struct TraceSeen {
+    /// Active document index, zoom and centre.
+    view: Option<(usize, f32, [f32; 2])>,
+    /// When the zoom / the centre last changed (ms): a change after a pause starts a new action.
+    zoomed: f64,
+    panned: f64,
+    dialogs: Vec<u64>,
+}
+
 pub struct PhotocraftApp {
     pub session: Session,
     jobs: jobs::Jobs,
@@ -259,6 +270,8 @@ pub struct PhotocraftApp {
     pub last_canvas_rect: egui::Rect,
     pub fps: f32,
     last_frame_time: f64,
+    /// What the action tracer saw last frame (see `trace_actions`).
+    trace_seen: TraceSeen,
     thumbs: HashMap<thumbs::Key, (u64, egui::TextureHandle)>,
     thumb_queue: thumbs::ThumbQueue,
     /// Snapshots whose live layer/mask keys were last used to prune thumbnail handles.
@@ -366,6 +379,7 @@ impl PhotocraftApp {
             last_canvas_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
             fps: 0.0,
             last_frame_time: 0.0,
+            trace_seen: TraceSeen::default(),
             thumbs: HashMap::new(),
             thumb_queue: thumbs::ThumbQueue::default(),
             thumb_documents: Vec::new(),
@@ -432,6 +446,8 @@ impl PhotocraftApp {
 
     /// Run an engine command, reporting errors in the status bar.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        photocraft_trace::action(|| format!("cmd {id}"));
+        let _span = photocraft_trace::span_with("command", || id.to_string());
         let clip_read = std::mem::take(&mut self.clip_read_for_paste);
         if self.automation_input
             && let Some(authorize) = self.services.automation_command.as_ref()
@@ -852,6 +868,8 @@ impl eframe::App for PhotocraftApp {
             self.automation_input = false;
             return;
         }
+        let _frame = photocraft_trace::span(photocraft_trace::FRAME);
+        self.trace_actions(&ctx);
         let t0 = gpu_canvas::now_ms();
         // View › Screen Mode › Full Screen Mode: only the image, on black (F or Esc returns).
         let chrome = !self.ui.view.hides_chrome();
@@ -882,12 +900,14 @@ impl eframe::App for PhotocraftApp {
         }
         split(&mut self.perf, "ui:toolbar");
         if chrome {
+            let _dock = photocraft_trace::span("ui_dock");
             panels::right_dock(self, ui);
         }
         split(&mut self.perf, "ui:dock");
         let t = theme::Tokens::get(&ctx);
         let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
+            let _canvas = photocraft_trace::span("ui_canvas");
             canvas::document_area(self, ui);
         });
         split(&mut self.perf, "ui:canvas");
@@ -910,6 +930,9 @@ impl eframe::App for PhotocraftApp {
         split(&mut self.perf, "ui:windows");
         self.automation_input = false;
         self.perf.frame(gpu_canvas::now_ms() - t0);
+        // The tracer's "settled": nothing (canvas cells, effects, previews, jobs) asked for
+        // another frame.
+        photocraft_trace::counter(photocraft_trace::CANVAS_PENDING, if ctx.has_requested_repaint() { 1.0 } else { 0.0 });
         // Synthetic input is injected one press/release step per frame: keep frames coming until
         // the queue is empty, then release control replies waiting on it.
         if !self.synthetic.is_empty() {
@@ -942,6 +965,66 @@ fn read_dropped(_f: &dyn egui::DroppedFile) -> Result<Vec<u8>, String> {
 }
 
 impl PhotocraftApp {
+    /// Record user actions the commands don't show: zoom and pan of the active view (a change
+    /// after 300 ms without one starts an action), presses on the canvas, dialogs opening.
+    fn trace_actions(&mut self, ctx: &egui::Context) {
+        if !photocraft_trace::enabled() {
+            return;
+        }
+        let now = gpu_canvas::now_ms();
+        let view = self.session.active_index().and_then(|i| self.ui.views.get(i).map(|v| (i, v.zoom, v.center)));
+        let seen = &mut self.trace_seen;
+        if let (Some((i, zoom, center)), Some((pi, pzoom, pcenter))) = (view, seen.view)
+            && i == pi
+        {
+            if zoom != pzoom {
+                if now - seen.zoomed > 300.0 {
+                    photocraft_trace::action(|| format!("zoom {:.1}% -> {:.1}%", pzoom * 100.0, zoom * 100.0));
+                }
+                seen.zoomed = now;
+            } else if center != pcenter {
+                if now - seen.panned > 300.0 {
+                    photocraft_trace::action(|| "pan".into());
+                }
+                seen.panned = now;
+            }
+        }
+        seen.view = view;
+        let ids: Vec<u64> = self.ui.dialogs.iter().map(|d| d.id).collect();
+        for d in self.ui.dialogs.iter().filter(|d| !seen.dialogs.contains(&d.id)) {
+            let command = d.fields.get("__command").and_then(serde_json::Value::as_str).unwrap_or("");
+            photocraft_trace::action(|| format!("dialog {:?} {command}", d.kind));
+        }
+        seen.dialogs = ids;
+        let canvas = self.last_canvas_rect;
+        let tool = self.ui.tool.label();
+        ctx.input(|i| {
+            let over = i.pointer.interact_pos().is_some_and(|p| canvas.contains(p));
+            if over && i.pointer.primary_pressed() {
+                photocraft_trace::action(|| format!("press {tool}"));
+            }
+            if i.pointer.primary_released() && i.pointer.interact_pos().is_some_and(|p| canvas.contains(p)) {
+                photocraft_trace::action(|| format!("release {tool}"));
+            }
+        });
+    }
+
+    /// Save the tracer's last minute next to `PHOTOCRAFT_TRACE_DIR` (else the config folder's
+    /// `traces`) and say where.
+    pub fn save_trace(&mut self) {
+        let dir = std::env::var_os("PHOTOCRAFT_TRACE_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("Photocraft").join("traces")));
+        let Some(dir) = dir else {
+            notices::post(self, "Trace not saved", vec!["No folder: set PHOTOCRAFT_TRACE_DIR".into()], true);
+            return;
+        };
+        match photocraft_trace::save(&dir) {
+            Ok(path) => notices::post(self, "Trace saved", vec![path.display().to_string()], false),
+            Err(e) => notices::post(self, "Trace not saved", vec![e.to_string()], true),
+        }
+    }
+
     fn prune_thumbs(&mut self) {
         let documents = self.session.documents();
         if self.thumb_documents.len() == documents.len()

@@ -463,6 +463,7 @@ impl GpuCanvas {
         key: u64,
         owner: u64,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        let _span = photocraft_trace::span_with("composite_view", || format!("{}x{} px", region.width(), region.height()));
         let result = self.composite_output(doc, region, encode_srgb, 0, Some(output), key);
         let mut renderer = self.rs.renderer.write();
         if let Some(res) = renderer.callback_resources.get_mut::<Resources>() {
@@ -625,6 +626,7 @@ impl GpuCanvas {
             // next edit doesn't queue behind unfinished work. `PHOTOCRAFT_GPU_ASYNC=1` restores
             // the old behaviour for comparisons.
             if std::env::var_os("PHOTOCRAFT_GPU_ASYNC").is_none() {
+                let _wait = photocraft_trace::span("gpu_wait");
                 let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
             }
         } else if fresh {
@@ -1006,7 +1008,9 @@ impl GpuCanvas {
             queue.submit([enc.finish()]);
             let slice = buf.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
+            let wait = photocraft_trace::span("gpu_readback_wait");
             device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok()?;
+            drop(wait);
             let data = slice.get_mapped_range().ok()?;
             for y in 0..th as usize {
                 let src = data.get(y * row as usize..)?;

@@ -156,6 +156,7 @@ pub fn document(doc: &Document, level: u32) -> Result<Document, String> {
 
 /// Display-only layer pyramid tiles covering the view and every surrounding effect's reach.
 pub fn document_region(doc: &Document, level: u32, visible: Rect) -> Result<Document, String> {
+    let _span = photocraft_trace::span_with("mip_view", || format!("level {level}, {}x{}", visible.width(), visible.height()));
     if level > 16 {
         return Err("display mip level exceeds 16".into());
     }

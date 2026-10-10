@@ -3497,6 +3497,7 @@ dependencies = [
  "photocraft-geom",
  "photocraft-paint",
  "photocraft-raster",
+ "photocraft-trace",
  "photocraft-vector",
  "proptest",
  "rayon",
@@ -3581,6 +3582,7 @@ dependencies = [
  "photocraft-doc",
  "photocraft-geom",
  "photocraft-raster",
+ "photocraft-trace",
  "photocraft-vector",
  "pollster 1.0.1",
  "rayon",
@@ -3699,6 +3701,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "photocraft-trace"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "photocraft-ui-egui"
 version = "0.2.0"
 dependencies = [
@@ -3721,6 +3730,7 @@ dependencies = [
  "photocraft-plugins",
  "photocraft-raster",
  "photocraft-text",
+ "photocraft-trace",
  "photocraft-vector",
  "rayon",
  "serde",

@@ -69,6 +69,9 @@ impl Jobs {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
+                    let span = photocraft_trace::span_with("fx_inputs", || {
+                        format!("{} ({}x{}, {} fields)", request.layer.name, request.region.width(), request.region.height(), request.fields.len())
+                    });
                     let inputs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let shape = fx::shape(&request.doc, &request.layer, request.region);
                         let mut fields = HashMap::new();
@@ -82,10 +85,14 @@ impl Jobs {
                         Ok(Inputs { shape, fields })
                     }))
                     .unwrap_or_else(|_| Err("effect input computation failed with an internal error".into()));
+                    drop(span);
+                    let drop_span = photocraft_trace::span("fx_request_drop");
+                    let Request { key, serial, region, .. } = request;
+                    drop(drop_span);
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    if replies.send(Reply { key: request.key, serial: request.serial, region: request.region, inputs }).is_err() {
+                    if replies.send(Reply { key, serial, region, inputs }).is_err() {
                         break;
                     }
                 }
@@ -109,18 +116,22 @@ impl Jobs {
         self.collect();
         let key = (doc.id, key);
         if self.pending.get(&key).is_some_and(|p| p.signature != signature && p.reply.is_none()) {
+            photocraft_trace::instant("fx_wait_superseded", || Some(layer.name.clone()));
             return Poll::Waiting;
         }
         if self.pending.get(&key).is_some_and(|p| p.signature != signature) {
+            photocraft_trace::instant("fx_discarded", || Some(layer.name.clone()));
             self.pending.remove(&key);
         }
         if let Some(pending) = self.pending.get_mut(&key).filter(|p| p.signature == signature) {
             return match pending.reply.take() {
                 Some(Ok(inputs)) => {
+                    photocraft_trace::instant("fx_ready", || Some(layer.name.clone()));
                     self.pending.remove(&key);
                     Poll::Ready(inputs)
                 }
                 Some(Err(error)) => {
+                    photocraft_trace::instant("fx_failed", || Some(format!("{}: {error}", layer.name)));
                     self.pending.remove(&key);
                     Poll::Failed(error)
                 }
@@ -135,6 +146,7 @@ impl Jobs {
             self.pending.retain(|_, pending| pending.reply.is_none());
         }
         if self.pending.len() >= 12 && !self.pending.contains_key(&key) {
+            photocraft_trace::instant("fx_deferred", || Some(format!("{}: 12 in flight", layer.name)));
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
         }
@@ -151,19 +163,27 @@ impl Jobs {
             held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
         }
         if held.saturating_add(bytes) > 256 << 20 {
+            photocraft_trace::instant("fx_deferred", || Some(format!("{}: 256 MiB reserve", layer.name)));
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
         }
         self.serial = self.serial.wrapping_add(1);
         let serial = self.serial;
+        let clone = photocraft_trace::span_with("fx_request_clone", || format!("{} layers", doc.layers.len()));
         let request = Request { key, serial, doc: doc.clone(), layer: layer.clone(), region, fields: fields.clone() };
+        drop(clone);
         let Some(sender) = &self.sender else { return Poll::Failed("effect worker disconnected".into()) };
         match sender.try_send(request) {
             Ok(()) => {
+                photocraft_trace::instant("fx_queued", || Some(format!("{} ({}x{})", layer.name, region.width(), region.height())));
                 self.pending.insert(key, Pending { signature, bytes, serial, reply: None });
                 Poll::Waiting
             }
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::TrySendError::Full(rejected)) => {
+                photocraft_trace::instant("fx_deferred", || Some(format!("{}: queue full", layer.name)));
+                let drop_span = photocraft_trace::span("fx_request_drop");
+                drop(rejected);
+                drop(drop_span);
                 self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
                 Poll::Waiting
             }

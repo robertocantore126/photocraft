@@ -43,7 +43,9 @@ impl Jobs {
             std::thread::Builder::new()
                 .name("photocraft-command".into())
                 .spawn(move || {
+                    let span = photocraft_trace::span_with("job", || prepared.label.clone());
                     let result = prepared.run(&handle);
+                    drop(span);
                     let _ = sender.send((prepared, result));
                 })
                 .map_err(|e| format!("could not start background work: {e}"))?;

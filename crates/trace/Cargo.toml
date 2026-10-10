@@ -1,0 +1,12 @@
+[package]
+name = "photocraft-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process action tracer: spans, actions and counters in a ring buffer, saved as Chrome trace JSON with a per-action summary"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
