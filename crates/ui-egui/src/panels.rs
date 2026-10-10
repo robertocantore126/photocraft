@@ -325,6 +325,13 @@ pub fn title_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     if ui.add(discord).on_hover_text(format!("Join the ArtCraft Discord ({})", crate::links::DISCORD)).clicked() {
                         crate::links::open(app, ui.ctx(), crate::links::DISCORD);
                     }
+                    // Action tracer: save the last minute of timings and actions as JSON.
+                    if photocraft_trace::enabled() {
+                        let save = egui::Button::new(egui::RichText::new("● Save trace").color(t.warning).size(12.0)).frame(false);
+                        if ui.add(save).on_hover_text("Save the last minute of timings (frames, effects, GPU waits, actions) as JSON").clicked() {
+                            app.save_trace();
+                        }
+                    }
                 });
             });
         });
@@ -676,14 +683,6 @@ pub fn status_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             let r = ui.max_rect();
             ui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.separator));
-            // Action tracer: save the last minute of spans and actions as JSON.
-            if photocraft_trace::enabled() {
-                let button = egui::Rect::from_min_max(egui::pos2(r.right() - 96.0, r.top() + 2.0), egui::pos2(r.right() - 4.0, r.bottom() - 2.0));
-                let save = ui.put(button, egui::Button::new(egui::RichText::new("● Save trace").size(11.0).color(t.warning)).small());
-                if save.on_hover_text("Save the last minute of timings (frames, effects, GPU waits, actions) as JSON").clicked() {
-                    app.save_trace();
-                }
-            }
             ui.horizontal_centered(|ui| {
                 if t.pro {
                     crate::chrome_ui::status_bar_pro(app, ui);
