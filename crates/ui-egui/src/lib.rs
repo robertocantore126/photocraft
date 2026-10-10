@@ -300,6 +300,8 @@ pub struct PhotocraftApp {
     pub(crate) automation_input: bool,
     /// Levels/Curves histogram cache: (document, adjustment layer, revision it is valid for).
     pub(crate) tone_hist: Option<(DocId, photocraft_doc::LayerId, u64, std::sync::Arc<tone::Histograms>)>,
+    /// The tone histogram computing in the background (native).
+    pub(crate) tone_hist_job: Option<tone::HistJob>,
     /// Histogram panel cache: (document, revision, computed at ms, histograms).
     pub(crate) doc_hist: Option<(DocId, u64, f64, std::sync::Arc<tone::Histograms>)>,
     /// Free Transform preview (document without the moving pixels + their texture).
@@ -412,6 +414,7 @@ impl PhotocraftApp {
             camera_raw: None,
             wide_angle: None,
             tone_hist: None,
+            tone_hist_job: None,
             doc_hist: None,
             gpu: None,
             perf: Default::default(),
@@ -930,6 +933,10 @@ impl eframe::App for PhotocraftApp {
         split(&mut self.perf, "ui:windows");
         self.automation_input = false;
         self.perf.frame(gpu_canvas::now_ms() - t0);
+        // A tone histogram computing in the background shows when it arrives.
+        if self.tone_hist_job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
         // The tracer's "settled": nothing (canvas cells, effects, previews, jobs) asked for
         // another frame.
         photocraft_trace::counter(photocraft_trace::CANVAS_PENDING, if ctx.has_requested_repaint() { 1.0 } else { 0.0 });

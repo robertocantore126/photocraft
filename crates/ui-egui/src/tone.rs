@@ -66,8 +66,25 @@ fn isolate(layers: &mut [Layer], id: LayerId) -> bool {
     found
 }
 
+/// Longest side of the display mip the histogram is computed from.
+const HIST_SOURCE_SIDE: u32 = 1024;
+
+/// A histogram computing on a worker thread (see [`histograms`]).
+pub struct HistJob {
+    doc: photocraft_doc::DocId,
+    layer: LayerId,
+    revision: u64,
+    tag: u64,
+    receive: std::sync::mpsc::Receiver<Histograms>,
+}
+
 /// Histograms of `doc` as seen by `source`, in the channels of `space`.
+///
+/// Computed from a display mip of about [`HIST_SOURCE_SIDE`] px (effects scaled with it), not
+/// the full-size composite: on a 20 MP, 479-layer PSB with layer effects the full composite
+/// took minutes on the CPU, and a 256-bin histogram does not need it.
 pub fn compute_histograms(doc: &Document, source: HistSource, space: ToneSpace) -> Histograms {
+    let _span = photocraft_trace::span("histogram");
     let mut d = doc.clone();
     match source {
         HistSource::BelowLayer(hide) => {
@@ -78,6 +95,13 @@ pub fn compute_histograms(doc: &Document, source: HistSource, space: ToneSpace) 
         HistSource::Layer(id) => {
             isolate(&mut d.layers, id);
         }
+    }
+    let longest = d.size.width.max(d.size.height);
+    let level = (longest / HIST_SOURCE_SIDE).checked_ilog2().unwrap_or(0).min(8);
+    if level > 0
+        && let Ok(reduced) = photocraft_compose::mip_view::document(&d, level)
+    {
+        d = reduced;
     }
     let img = photocraft_compose::thumbnail(&d, 384);
     let n = match space {
@@ -135,11 +159,48 @@ pub fn histograms(app: &mut PhotocraftApp, source: HistSource, space: ToneSpace)
     {
         return h.clone();
     }
-    let t0 = crate::gpu_canvas::now_ms();
-    let h = Arc::new(compute_histograms(&st.doc, source, space));
-    app.perf.span("histogram", crate::gpu_canvas::now_ms() - t0);
-    app.tone_hist = Some((doc_id, layer, rev, h.clone()));
-    h
+    // The web has no threads; this crate's unit tests read results in the same call.
+    if cfg!(target_arch = "wasm32") || app.jobs.force_sync {
+        let h = Arc::new(compute_histograms(&st.doc, source, space));
+        app.tone_hist = Some((doc_id, layer, rev, h.clone()));
+        return h;
+    }
+    // Native: on a worker, so a big document never stalls the frame. The editor shows the last
+    // histogram of this layer (or none) until the new one arrives; the UI keeps repainting
+    // while a job runs (see `PhotocraftApp::ui`).
+    {
+        let doc = st.doc.clone();
+        if let Some(job) = &app.tone_hist_job {
+            match job.receive.try_recv() {
+                Ok(h) => {
+                    let h = Arc::new(h);
+                    let fresh = (job.doc, job.layer, job.revision, job.tag) == (doc_id, layer, rev, want);
+                    app.tone_hist = Some((job.doc, job.layer, job.revision, h.clone()));
+                    app.tone_hist_job = None;
+                    if fresh {
+                        return h;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => app.tone_hist_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // One job at a time: a newer request starts when the running one finishes.
+        if app.tone_hist_job.is_none() {
+            let (send, receive) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new().name("photocraft-histogram".into()).spawn(move || {
+                let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_histograms(&doc, source, space))).unwrap_or_default();
+                let _ = send.send(h);
+            });
+            if spawned.is_ok() {
+                app.tone_hist_job = Some(HistJob { doc: doc_id, layer, revision: rev, tag: want, receive });
+            }
+        }
+        match &app.tone_hist {
+            Some((d, l, _, h)) if *d == doc_id && *l == layer && h.tag == want => h.clone(),
+            _ => Arc::new(Histograms { tag: want, ch: Vec::new() }),
+        }
+    }
 }
 
 /// After an editor commits its own adjustment layer, the image below it is unchanged: keep the
