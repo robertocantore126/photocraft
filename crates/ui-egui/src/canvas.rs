@@ -873,9 +873,16 @@ fn ensure_proxy_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u64
     if k <= 1 {
         return None;
     }
+    // A display mip (effects and vector masks scaled with the pixels, layers reduced on all
+    // cores from the cached pyramid) rather than the point-sampled proxy: that one left effect
+    // sizes in document pixels (shadows several times too big in the preview) and took 13 s on
+    // the UI thread for a 479-layer PSB.
+    let level = k.next_power_of_two().trailing_zeros();
+    let k = 1u32 << level;
     let fresh = matches!(&app.proxy, Some((d, r, kk, _)) if *d == doc_id && *r == revision && *kk == k);
     if !fresh {
-        app.proxy = Some((doc_id, revision, k, std::sync::Arc::new(crate::proxy::proxy_document(&doc, k))));
+        let proxy = photocraft_compose::mip_view::document(&doc, level).ok()?;
+        app.proxy = Some((doc_id, revision, k, std::sync::Arc::new(proxy)));
     }
     let proxy = app.proxy.as_ref()?.3.clone();
     let key = doc_id.0 ^ (1u64 << 62);
