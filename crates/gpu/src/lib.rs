@@ -1151,6 +1151,12 @@ impl Compositor {
         });
         let canvas = doc.bounds();
         self.fx_view = (doc.size.width, doc.size.height);
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.nested
+            && let Some(jobs) = &mut self.fx_jobs
+        {
+            jobs.next_frame();
+        }
         let mut region = region.intersect(&canvas);
         if self.render_mip > 0 {
             // Native texture mip extents round down. Leave the trailing subpixel edge for

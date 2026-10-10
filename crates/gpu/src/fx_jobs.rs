@@ -35,7 +35,21 @@ struct Pending {
     bytes: u64,
     serial: u64,
     reply: Option<Result<Inputs, String>>,
+    /// Render (`Jobs::next_frame`) that last asked for it.
+    last_polled: u64,
 }
+
+/// Requests waiting in the channel plus one running on each worker: a full channel never
+/// rejects a request this admits, so no document snapshot is made only to be dropped.
+const QUEUE: usize = 8;
+const WORKERS: usize = 2;
+const IN_FLIGHT: usize = QUEUE + WORKERS;
+/// Bytes of queued and completed inputs held at once.
+const RESERVE: u64 = 256 << 20;
+/// A completed result its layer has not asked for in this many renders may be dropped under
+/// memory pressure; after `STALE` renders it is dropped regardless.
+const IDLE: u64 = 8;
+const STALE: u64 = 120;
 
 pub(crate) enum Poll {
     Waiting,
@@ -50,15 +64,17 @@ pub(crate) struct Jobs {
     pending: HashMap<(DocId, FxKey), Pending>,
     damage: HashMap<DocId, Rect>,
     serial: u64,
+    /// Top-level renders so far (see `next_frame`).
+    frame: u64,
 }
 
 impl Jobs {
     pub fn new() -> Result<Self, std::io::Error> {
-        let (sender, requests) = mpsc::sync_channel::<Request>(8);
+        let (sender, requests) = mpsc::sync_channel::<Request>(QUEUE);
         let (replies, receiver) = mpsc::sync_channel(2);
         let requests = Arc::new(Mutex::new(requests));
         let stopped = Arc::new(AtomicBool::new(false));
-        for worker in 0..2 {
+        for worker in 0..WORKERS {
             let requests = requests.clone();
             let replies = replies.clone();
             let stop = stopped.clone();
@@ -101,7 +117,14 @@ impl Jobs {
                 return Err(error);
             }
         }
-        Ok(Self { sender: Some(sender), receiver: Mutex::new(receiver), stopped, pending: HashMap::new(), damage: HashMap::new(), serial: 0 })
+        Ok(Self { sender: Some(sender), receiver: Mutex::new(receiver), stopped, pending: HashMap::new(), damage: HashMap::new(), serial: 0, frame: 0 })
+    }
+
+    /// A top-level render begins: results nobody has asked for in a long while are dropped.
+    pub fn next_frame(&mut self) {
+        self.frame += 1;
+        let frame = self.frame;
+        self.pending.retain(|_, p| p.reply.is_none() || p.last_polled + STALE >= frame);
     }
 
     pub fn collect(&mut self) {
@@ -124,6 +147,7 @@ impl Jobs {
             self.pending.remove(&key);
         }
         if let Some(pending) = self.pending.get_mut(&key).filter(|p| p.signature == signature) {
+            pending.last_polled = self.frame;
             return match pending.reply.take() {
                 Some(Ok(inputs)) => {
                     photocraft_trace::instant("fx_ready", || Some(layer.name.clone()));
@@ -140,13 +164,12 @@ impl Jobs {
         }
         // Bound snapshots as well as queued and completed allocations. Retry next frame
         // when the queue is full rather than doing the expensive work on the UI thread.
-        // Completed offscreen requests must not permanently reserve every slot. They
-        // can be rebuilt if their layer becomes visible again; in-flight work stays tracked.
-        if self.pending.len() >= 12 {
-            self.pending.retain(|_, pending| pending.reply.is_none());
-        }
-        if self.pending.len() >= 12 && !self.pending.contains_key(&key) {
-            photocraft_trace::instant("fx_deferred", || Some(format!("{}: 12 in flight", layer.name)));
+        // Only work in flight counts against the queue: a completed result waits for its layer
+        // to collect it later in this same render. Dropping completed results to make room
+        // (as before) livelocked as soon as more layers had effects than there were slots:
+        // every result was discarded before its layer asked, so every layer re-queued forever.
+        if self.pending.values().filter(|p| p.reply.is_none()).count() >= IN_FLIGHT {
+            photocraft_trace::instant("fx_deferred", || Some(format!("{}: {IN_FLIGHT} in flight", layer.name)));
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
         }
@@ -154,15 +177,18 @@ impl Jobs {
             .checked_mul(u64::from(region.height()))
             .and_then(|pixels| pixels.checked_mul((fields.len() as u64).saturating_add(1)))
             .and_then(|samples| samples.checked_mul(4));
-        let Some(bytes) = bytes.filter(|bytes| *bytes <= 256 << 20) else {
+        let Some(bytes) = bytes.filter(|bytes| *bytes <= RESERVE) else {
             return Poll::Failed("effect input window exceeds the worker memory limit".into());
         };
         let mut held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
-        if held.saturating_add(bytes) > 256 << 20 {
-            self.pending.retain(|_, pending| pending.reply.is_none());
+        if held.saturating_add(bytes) > RESERVE {
+            // Free completed results whose layers stopped asking (offscreen), never the ones
+            // still being collected.
+            let frame = self.frame;
+            self.pending.retain(|_, p| p.reply.is_none() || p.last_polled + IDLE >= frame);
             held = self.pending.values().fold(0u64, |sum, pending| sum.saturating_add(pending.bytes));
         }
-        if held.saturating_add(bytes) > 256 << 20 {
+        if held.saturating_add(bytes) > RESERVE {
             photocraft_trace::instant("fx_deferred", || Some(format!("{}: 256 MiB reserve", layer.name)));
             self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
             return Poll::Waiting;
@@ -176,7 +202,7 @@ impl Jobs {
         match sender.try_send(request) {
             Ok(()) => {
                 photocraft_trace::instant("fx_queued", || Some(format!("{} ({}x{})", layer.name, region.width(), region.height())));
-                self.pending.insert(key, Pending { signature, bytes, serial, reply: None });
+                self.pending.insert(key, Pending { signature, bytes, serial, reply: None, last_polled: self.frame });
                 Poll::Waiting
             }
             Err(mpsc::TrySendError::Full(rejected)) => {
@@ -194,7 +220,11 @@ impl Jobs {
     /// Work in flight for `doc`, or a request deferred because the queue or the memory reserve
     /// was full: its damage is retried on the next frame, so the caller must ask for one.
     pub fn pending(&self, doc: DocId) -> bool {
-        self.pending.keys().any(|(id, _)| *id == doc) || self.damage.contains_key(&doc)
+        // A completed result counts while its layer still asks for it: one more render
+        // collects it. One nobody asked for lately (an offscreen layer) does not keep frames
+        // coming.
+        let frame = self.frame;
+        self.pending.iter().any(|((id, _), p)| *id == doc && (p.reply.is_none() || p.last_polled + IDLE >= frame)) || self.damage.contains_key(&doc)
     }
 
     pub fn take_damage(&mut self, doc: DocId) -> Option<Rect> {
@@ -227,8 +257,8 @@ mod tests {
         let mut jobs = Jobs::new().unwrap();
         let a = Document::new("a", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
         let b = Document::new("b", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
-        for i in 0..12 {
-            jobs.pending.insert((a.id, (LayerId(i), None, (64, 64))), Pending { signature: 1, bytes: 0, serial: u64::from(i as u32), reply: None });
+        for i in 0..IN_FLIGHT as u64 {
+            jobs.pending.insert((a.id, (LayerId(i), None, (64, 64))), Pending { signature: 1, bytes: 0, serial: i, reply: None, last_polled: 0 });
         }
         let layer = photocraft_doc::Layer::raster("l", b.pixel_format());
         let region = Rect::new(0, 0, 64, 64);
@@ -238,5 +268,42 @@ mod tests {
         // The next frame turns the damage into dirty cells and polls again.
         assert_eq!(jobs.take_damage(b.id), Some(region));
         assert!(!jobs.pending(b.id));
+    }
+
+    /// With more effect layers than queue slots, a result completed for one layer must survive
+    /// another layer's request in the same render until its own layer collects it. Dropping
+    /// completed results to make room livelocked a 479-layer PSB: every layer re-queued its
+    /// inputs every frame and none ever arrived (thousands queued, zero ready, in one minute).
+    #[test]
+    fn completed_results_survive_until_collected() {
+        let mut jobs = Jobs::new().unwrap();
+        let doc = Document::new("d", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+        let layer = photocraft_doc::Layer::raster("l", doc.pixel_format());
+        let region = Rect::new(0, 0, 64, 64);
+        jobs.next_frame();
+        let done = |serial| Pending {
+            signature: 7,
+            bytes: 64 * 64 * 4,
+            serial,
+            reply: Some(Ok(Inputs { shape: vec![0.0; 64 * 64], fields: HashMap::new() })),
+            last_polled: 1,
+        };
+        for i in 0..20u64 {
+            jobs.pending.insert((doc.id, (LayerId(100 + i), None, (64, 64))), done(i));
+        }
+        // Another layer asks first in this render: it is admitted (nothing is in flight) and
+        // must not cost the twenty completed results their place.
+        let other = (LayerId(1), None, (64, 64));
+        assert!(matches!(jobs.poll(other, 9, &doc, &layer, region, &HashMap::new()), Poll::Waiting));
+        for i in 0..20u64 {
+            let key = (LayerId(100 + i), None, (64, 64));
+            assert!(matches!(jobs.poll(key, 7, &doc, &layer, region, &HashMap::new()), Poll::Ready(_)), "layer {i} lost its result");
+        }
+        // Results nobody collects go away eventually and stop counting as pending work.
+        jobs.pending.insert((doc.id, (LayerId(999), None, (64, 64))), done(99));
+        for _ in 0..=STALE {
+            jobs.next_frame();
+        }
+        assert!(!jobs.pending.contains_key(&(doc.id, (LayerId(999), None, (64, 64)))));
     }
 }
