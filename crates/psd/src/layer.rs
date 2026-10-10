@@ -647,11 +647,7 @@ impl LayerInfo {
     /// Serializes the body (without a length field).
     pub(crate) fn write_body(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
         let start = out.len();
-        let n = i16::try_from(self.layers.len()).map_err(|_| PsdError::LimitExceeded("more than 32767 layers"))?;
-        out.put_i16(if self.merged_alpha { -n } else { n });
-        for l in &self.layers {
-            l.write(out, version)?;
-        }
+        self.write_records(out, version)?;
         for l in &self.layers {
             for c in &l.channels {
                 if let Some(comp) = c.compression {
@@ -660,6 +656,36 @@ impl LayerInfo {
                 }
             }
         }
+        self.write_padding(out, start);
+        Ok(())
+    }
+
+    /// [`write_body`](Self::write_body), freeing each channel's data once copied.
+    pub(crate) fn write_body_owned(&mut self, out: &mut Vec<u8>, version: Version) -> Result<()> {
+        let start = out.len();
+        self.write_records(out, version)?;
+        for l in &mut self.layers {
+            for c in &mut l.channels {
+                if let Some(comp) = c.compression {
+                    out.put_u16(comp.as_u16());
+                    out.put(&std::mem::take(&mut c.data));
+                }
+            }
+        }
+        self.write_padding(out, start);
+        Ok(())
+    }
+
+    fn write_records(&self, out: &mut Vec<u8>, version: Version) -> Result<()> {
+        let n = i16::try_from(self.layers.len()).map_err(|_| PsdError::LimitExceeded("more than 32767 layers"))?;
+        out.put_i16(if self.merged_alpha { -n } else { n });
+        for l in &self.layers {
+            l.write(out, version)?;
+        }
+        Ok(())
+    }
+
+    fn write_padding(&self, out: &mut Vec<u8>, start: usize) {
         match &self.padding {
             Some(p) => out.put(p),
             None => {
@@ -668,7 +694,6 @@ impl LayerInfo {
                 }
             }
         }
-        Ok(())
     }
 }
 

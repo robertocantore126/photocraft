@@ -343,6 +343,7 @@ pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
 
 /// Make sure the canvas texture for document `idx` is current; returns (texture id, scale).
 pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<(egui::TextureId, f32)> {
+    let _span = photocraft_trace::span("cpu_texture");
     let (revision, last_damage, id) = {
         let st = app.session.documents().get(idx)?;
         (st.revision, st.last_damage, st.doc.id)
@@ -447,6 +448,7 @@ pub(crate) struct ViewTexture {
 }
 
 fn ensure_view_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform, view_id: egui::Id) -> Option<(egui::TextureId, DRect)> {
+    let _span = photocraft_trace::span("cpu_view_texture");
     if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
         return None;
     }
@@ -521,6 +523,7 @@ struct GpuView {
 /// Composite only the visible rectangle into a texture of that rectangle's size. At low
 /// zoom its layers are native CPU mip surfaces, so GPU upload never needs their level zero.
 fn ensure_gpu_view(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf: &ViewXform, view_id: egui::Id) -> Option<GpuView> {
+    let _span = photocraft_trace::span("gpu_view");
     if std::env::var("PHOTOCRAFT_VIEW_COMPOSE").as_deref() == Ok("0") {
         return None;
     }
@@ -671,6 +674,7 @@ pub(crate) fn effect_reach(layers: &[photocraft_doc::Layer]) -> i32 {
 /// and upload only their damage rect; everything else re-composites the whole document.
 /// Returns false if there is no GPU canvas.
 fn ensure_gpu(app: &mut PhotocraftApp, idx: usize, visible: DRect, zoom: f32) -> bool {
+    let _span = photocraft_trace::span("gpu_full_canvas");
     let Some(gpu) = app.gpu.clone() else { return false };
     gpu.begin_frame(app.frame);
     let Some((revision, last_damage, id)) = app.session.documents().get(idx).map(|st| (st.revision, st.last_damage, st.doc.id)) else {
@@ -782,6 +786,7 @@ fn gpu_budget(app: &mut PhotocraftApp, gpu: &crate::gpu_canvas::GpuCanvas, idx: 
 
 /// Live preview for an open filter dialog: run the filter on the proxy and upload it.
 fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, visible: DRect, zoom: f32) -> Option<(u32, u64)> {
+    let _span = photocraft_trace::span("filter_preview");
     if crate::adjust_preview::on_layer(app, idx) {
         return None;
     }
@@ -840,6 +845,7 @@ fn visible_doc_rect(xf: &ViewXform) -> DRect {
 /// reduced preview document (`adjust_preview::gpu_proxy`) into its own texture, over the target's
 /// area after the first frame. Returns (factor, gpu key) to draw.
 fn ensure_adjust_proxy(app: &mut PhotocraftApp, idx: usize, zoom: f32) -> Option<(u32, u64)> {
+    let _span = photocraft_trace::span("adjust_proxy");
     let frame = crate::adjust_preview::gpu_proxy(app, idx, zoom)?;
     let key = frame.doc.id.0;
     let size = [frame.doc.size.width, frame.doc.size.height];

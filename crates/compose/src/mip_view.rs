@@ -90,9 +90,7 @@ fn layer(layer: &mut Layer, level: u32, depth: u32, visible: Rect) -> Result<(),
             if let Some(artboard) = &mut g.artboard {
                 artboard.rect = Surface::mip_bounds(artboard.rect, level);
             }
-            for child in &mut g.children {
-                self::layer(child, level, depth + 1, visible)?;
-            }
+            each(&mut g.children, |child| self::layer(child, level, depth + 1, visible))?;
         }
         LayerContent::Text(t) => {
             t.transform = a.mul(&t.transform);
@@ -124,6 +122,18 @@ fn layer(layer: &mut Layer, level: u32, depth: u32, visible: Rect) -> Result<(),
         LayerContent::Adjustment(_) => {}
     }
     Ok(())
+}
+
+/// Reduce sibling layers on all cores: each reads and averages its own tiles, independently. On
+/// one core this took 12 s on the UI thread for the first view of a 479-layer PSB.
+fn each(layers: &mut [Layer], f: impl Fn(&mut Layer) -> Result<(), String> + Sync + Send) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        layers.par_iter_mut().try_for_each(f)
+    }
+    #[cfg(target_arch = "wasm32")]
+    layers.iter_mut().try_for_each(f)
 }
 
 fn reach(layers: &[Layer], depth: u32) -> i32 {
@@ -167,9 +177,7 @@ pub fn document_region(doc: &Document, level: u32, visible: Rect) -> Result<Docu
     let factor = 1u32 << level;
     result.size = Size::new(doc.size.width.div_ceil(factor), doc.size.height.div_ceil(factor));
     let visible = visible.inflate(source_margin(doc).saturating_add((factor as i32).saturating_mul(2)));
-    for l in &mut result.layers {
-        layer(l, level, 0, visible)?;
-    }
+    each(&mut result.layers, |l| layer(l, level, 0, visible))?;
     for channel in &mut result.channels {
         channel.surface = surface(&channel.surface, level, visible)?;
     }

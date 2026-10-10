@@ -134,31 +134,47 @@ impl PsdFile {
 
     /// Serializes the file.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_to(&mut out, self.layer_info.as_ref().map(Body::Shared))?;
+        Ok(out)
+    }
+
+    /// [`to_bytes`](Self::to_bytes) consuming the file: the output is sized up front and each
+    /// layer channel is freed once copied, so the peak is about one copy of the file instead of
+    /// the model, the output and the output's growth (a 2.5 GB, 479-layer PSB save ran a
+    /// 16 GB machine out of memory).
+    pub fn into_bytes(mut self) -> Result<Vec<u8>> {
+        let channels: usize = self.layers().iter().flat_map(|l| &l.channels).map(|c| c.data.len() + 2).sum();
+        let mut out = Vec::with_capacity(channels.saturating_add(self.image_data.data.len()).saturating_add(64 << 20));
+        let mut info = self.layer_info.take();
+        self.write_to(&mut out, info.as_mut().map(Body::Owned))?;
+        Ok(out)
+    }
+
+    fn write_to(&self, out: &mut Vec<u8>, mut body: Option<Body<'_>>) -> Result<()> {
         let v = self.header.version;
         let psb = v.is_psb();
-        let mut out = Vec::new();
-        self.header.write(&mut out);
+        self.header.write(out);
         out.put_len(self.color_mode_data.len() as u64, false)?;
         out.put(&self.color_mode_data);
-        resources::write_section(&mut out, &self.resources)?;
+        resources::write_section(out, &self.resources)?;
 
         let in_block = matches!(self.layer_info_placement, LayerInfoPlacement::GlobalBlock { .. });
         // An entirely empty section is written as a zero length. (A section
         // containing only a zero layer-info length cannot be distinguished in
         // the model and is normalized to this form.)
-        let section_empty =
-            self.layer_info.is_none() && self.global_layer_mask.is_none() && self.global_blocks.is_empty() && self.layer_mask_trailing.is_empty();
+        let section_empty = body.is_none() && self.global_layer_mask.is_none() && self.global_blocks.is_empty() && self.layer_mask_trailing.is_empty();
         let at = out.begin_len(psb);
         if !section_empty {
             let li = out.begin_len(psb);
-            if let (Some(info), false) = (&self.layer_info, in_block) {
-                info.write_body(&mut out, v)?;
+            if let (Some(info), false) = (body.as_mut(), in_block) {
+                info.write(out, v)?;
             }
             out.end_len(li, psb)?;
-            let blocks: std::borrow::Cow<'_, [TaggedBlock]> = match (&self.layer_info, &self.layer_info_placement) {
+            let blocks: std::borrow::Cow<'_, [TaggedBlock]> = match (body.as_mut(), &self.layer_info_placement) {
                 (Some(info), LayerInfoPlacement::GlobalBlock { index, signature, key, padding }) => {
                     let mut data = Vec::new();
-                    info.write_body(&mut data, v)?;
+                    info.write(&mut data, v)?;
                     let mut blocks = self.global_blocks.clone();
                     let idx = (*index).min(blocks.len());
                     blocks.insert(idx, TaggedBlock { signature: *signature, key: *key, data, padding: padding.clone() });
@@ -173,14 +189,14 @@ impl PsdFile {
                 out.put_len(gm.len() as u64, false)?;
                 out.put(gm);
             }
-            write_blocks(&mut out, blocks_ref, v)?;
+            write_blocks(out, blocks_ref, v)?;
             out.put(&self.layer_mask_trailing);
         }
         out.end_len(at, psb)?;
 
         out.put_u16(self.image_data.compression.as_u16());
         out.put(&self.image_data.data);
-        Ok(out)
+        Ok(())
     }
 
     /// Layer records in file order (bottom-most first); empty if none.
@@ -266,5 +282,20 @@ impl PsdFile {
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let b = self.to_bytes().map_err(std::io::Error::other)?;
         std::fs::write(path, b)
+    }
+}
+
+/// The layer section body to write: borrowed, or owned so its channels can be freed as written.
+enum Body<'a> {
+    Shared(&'a LayerInfo),
+    Owned(&'a mut LayerInfo),
+}
+
+impl Body<'_> {
+    fn write(&mut self, out: &mut Vec<u8>, version: Version) -> Result<()> {
+        match self {
+            Body::Shared(info) => info.write_body(out, version),
+            Body::Owned(info) => info.write_body_owned(out, version),
+        }
     }
 }

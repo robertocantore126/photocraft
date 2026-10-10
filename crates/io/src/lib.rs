@@ -218,8 +218,11 @@ pub fn export(doc: &Document, name_or_ext: &str, opts: &ExportOptions) -> Result
     }
     if ext == "psd" || ext == "psb" {
         let o = PsdExportOptions { force_psb: opts.force_psb || ext == "psb" };
+        let build = photocraft_trace::span("psd_build");
         let (file, warnings) = document_to_psd_with(doc, &o);
-        let bytes = file.to_bytes()?;
+        drop(build);
+        let _serialize = photocraft_trace::span("psd_serialize");
+        let bytes = file.into_bytes()?;
         return Ok(ExportResult { bytes, warnings });
     }
     let format = photocraft_codecs::from_extension(&ext).ok_or_else(|| IoError::UnknownFormat(name_or_ext.to_string()))?;
