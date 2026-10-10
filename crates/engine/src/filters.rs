@@ -335,7 +335,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// The most recent filter command in the session journal.
-fn last_filter(s: &Session) -> Option<(String, Value)> {
+pub(crate) fn last_filter(s: &Session) -> Option<(String, Value)> {
     s.journal.iter().rev().find(|(id, _)| params_for(id, &Value::Null).is_some() && id.starts_with("filter.")).cloned()
 }
 

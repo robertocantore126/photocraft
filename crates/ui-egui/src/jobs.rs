@@ -22,6 +22,8 @@ pub(crate) struct Jobs {
     pub force_sync: bool,
     pub io: crate::io_jobs::IoJobs,
 }
+// Derivable only outside `cfg(test)`, where `force_sync` is true.
+#[allow(clippy::derivable_impls)]
 impl Default for Jobs {
     fn default() -> Self {
         // This crate's unit tests drive commands and read their results in the same call:

@@ -383,11 +383,25 @@ pub fn preview_document(doc: &Document, active: Option<photocraft_doc::LayerId>,
 
 /// Reuse the immutable dialog proxy while changing only command parameters.
 pub fn preview_from_proxy(proxy: &Document, active: Option<photocraft_doc::LayerId>, command: &str, params: &Value, k: u32) -> Option<Document> {
+    preview_from_proxy_in(proxy, active, photocraft_engine::channel_cmds::ChannelTarget::Composite, command, params, k)
+}
+
+/// As [`preview_from_proxy`], with the Channels panel target of the real document, so the engine
+/// routes the preview to the same alpha channel, Quick Mask or single colour channel as the command.
+pub fn preview_from_proxy_in(
+    proxy: &Document,
+    active: Option<photocraft_doc::LayerId>,
+    channel: photocraft_engine::channel_cmds::ChannelTarget,
+    command: &str,
+    params: &Value,
+    k: u32,
+) -> Option<Document> {
     let mut s = photocraft_engine::Session::new();
     s.add_document(proxy.clone(), None);
     if let Some(id) = active {
         s.select_layer(id).ok()?;
     }
+    s.active_mut()?.channel_view.target = channel;
     let mut p = params.clone();
     if k > 1
         && let Some(o) = p.as_object_mut()

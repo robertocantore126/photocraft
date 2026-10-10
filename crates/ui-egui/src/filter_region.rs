@@ -6,6 +6,12 @@ use photocraft_geom::Rect;
 use serde_json::Value;
 use std::sync::{Arc, mpsc};
 
+/// Whether the filter edits the layer's own pixels: an explicit or Channels panel target (alpha
+/// channel, Quick Mask, one colour channel) needs the engine's routing, which this path skips.
+pub fn pixels_target(channel: &photocraft_engine::channel_cmds::ChannelTarget, params: &Value) -> bool {
+    matches!(channel, photocraft_engine::channel_cmds::ChannelTarget::Composite) && params.get("target").is_none_or(|t| t == "pixels")
+}
+
 pub fn supported(doc: &Document, active: Option<LayerId>, command: &str) -> bool {
     fn visible_raster(layers: &[photocraft_doc::Layer], target: LayerId, depth: u32) -> bool {
         if depth >= 256 {
@@ -21,7 +27,8 @@ pub fn supported(doc: &Document, active: Option<LayerId>, command: &str) -> bool
             false
         })
     }
-    active.is_some_and(|id| visible_raster(&doc.layers, id, 0))
+    doc.quick_mask.is_none()
+        && active.is_some_and(|id| visible_raster(&doc.layers, id, 0))
         && matches!(
             command,
             "filter.blur.gaussianBlur" | "filter.blur.boxBlur" | "filter.blur.motionBlur" | "filter.sharpen.unsharpMask" | "filter.other.highPass"
@@ -49,7 +56,7 @@ struct Completed {
 
 impl Request {
     fn run(&self, progress: &Progress) -> Option<Completed> {
-        if progress.is_cancelled() {
+        if progress.is_cancelled() || self.params.get("target").is_some_and(|t| t != "pixels") {
             return None;
         }
         let original_fp = photocraft_engine::filters::params_for(&self.command, &self.params)?;
@@ -209,6 +216,7 @@ impl RegionPreview {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update(
     app: &mut crate::PhotocraftApp,
     doc: Arc<Document>,
@@ -297,18 +305,46 @@ mod bughunt_ps {
     }
 
     #[test]
-    #[ignore = "BUG-02: viewport preview filters pixels instead of the targeted alpha channel"]
     fn bug_02_channel_preview() {
-        let mut s = scene();
-        s.execute("channel.new", json!({"name":"alpha","fill":"white"})).unwrap();
-        let params = json!({"radius":2.0,"target":{"channel":0}});
-        let shown = preview(&s, params.clone());
-        s.execute("filter.blur.gaussianBlur", params).unwrap();
-        let actual = &s.active().unwrap().doc;
-        let shown = photocraft_compose::flatten(&shown).px;
-        let actual = photocraft_compose::flatten(actual).px;
-        let differing = shown.iter().zip(&actual).filter(|(a, b)| a != b).count();
-        assert_eq!(differing, 0, "BUG-02: preview modifies raster pixels; applied command modifies only alpha");
+        use photocraft_engine::channel_cmds::ChannelTarget;
+        let cases = [
+            (json!({"radius":2.0,"target":{"channel":0}}), ChannelTarget::Composite),
+            (json!({"radius":2.0}), ChannelTarget::Alpha(0)),
+            (json!({"radius":2.0}), ChannelTarget::Color(1)),
+        ];
+        for (params, channel) in cases {
+            let mut s = scene();
+            s.execute("channel.new", json!({"name":"alpha","fill":"white"})).unwrap();
+            s.execute("paint.stroke", json!({"points":[[10,30],[80,300]],"size":23,"color":"#000000","target":{"channel":0}})).unwrap();
+            s.active_mut().unwrap().channel_view.target = channel;
+            // The canvas dispatch: the viewport path must refuse, the proxy path runs the command.
+            assert!(!pixels_target(&channel, &params), "{channel:?} {params}");
+            let st = s.active().unwrap();
+            let request = Request {
+                doc: st.doc.clone(),
+                active: st.active_layer.unwrap(),
+                command: "filter.blur.gaussianBlur".into(),
+                params: params.clone(),
+                visible: st.doc.bounds(),
+                hash: 1,
+                level: 0,
+                proxy: None,
+                gpu: None,
+            };
+            if params.get("target").is_some() {
+                assert!(request.run(&Progress::default()).is_none());
+            }
+            let shown = super::super::preview_from_proxy_in(&st.doc, st.active_layer, channel, "filter.blur.gaussianBlur", &params, 1).unwrap();
+            let before = st.doc.clone();
+            s.execute("filter.blur.gaussianBlur", params.clone()).unwrap();
+            let actual = &s.active().unwrap().doc;
+            assert_ne!(**actual, *before, "{channel:?}: the filter changed nothing");
+            assert_eq!(shown.channels, actual.channels, "{channel:?} {params}: alpha channels");
+            let shown = photocraft_compose::flatten(&shown).px;
+            let actual = photocraft_compose::flatten(actual).px;
+            let differing = shown.iter().zip(&actual).filter(|(a, b)| a != b).count();
+            assert_eq!(differing, 0, "{channel:?} {params}: preview differs from the applied command");
+        }
     }
 
     #[test]

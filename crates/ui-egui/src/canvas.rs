@@ -786,16 +786,19 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, visible: DRect, zo
     }
     let cmd = d.fields.get("__command")?.as_str()?.to_string();
     let params = crate::filter_dialog::params_of(&d.fields);
-    let (doc_id, revision, doc, active) = {
+    let (doc_id, revision, doc, active, channel) = {
         let st = app.session.documents().get(idx)?;
-        (st.doc.id, st.revision, st.doc.clone(), st.active_layer)
+        (st.doc.id, st.revision, st.doc.clone(), st.active_layer, st.channel_view.target)
     };
-    if std::env::var("PHOTOCRAFT_FILTER_VIEW").as_deref() != Ok("0") && crate::filter_dialog::region::supported(&doc, active, &cmd) {
+    if std::env::var("PHOTOCRAFT_FILTER_VIEW").as_deref() != Ok("0")
+        && crate::filter_dialog::region::pixels_target(&channel, &params)
+        && crate::filter_dialog::region::supported(&doc, active, &cmd)
+    {
         crate::filter_dialog::region::update(app, doc, revision, active, cmd, params, visible, zoom);
         return None;
     }
     let k = crate::proxy::factor(&doc);
-    let hash = format!("{cmd}{params}").bytes().fold(k as u64 ^ revision.wrapping_mul(0x9e37), |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+    let hash = format!("{cmd}{params}{channel:?}").bytes().fold(k as u64 ^ revision.wrapping_mul(0x9e37), |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
     let key = doc_id.0 ^ (1u64 << 61);
     let fresh = matches!(&app.filter_preview, Some(p) if p.doc == doc_id && p.hash == hash && p.active == active);
     if !fresh {
@@ -806,7 +809,7 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, visible: DRect, zo
             .filter(|p| std::env::var("PHOTOCRAFT_FILTER_PROXY").as_deref() != Ok("0") && p.doc == doc_id && p.revision == revision && p.k == k)
             .map(|p| p.proxy.clone())
             .unwrap_or_else(|| std::sync::Arc::new(crate::proxy::proxy_document(&doc, k)));
-        let result = crate::filter_dialog::preview_from_proxy(&proxy, active, &cmd, &params, k).map(std::sync::Arc::new);
+        let result = crate::filter_dialog::preview_from_proxy_in(&proxy, active, channel, &cmd, &params, k).map(std::sync::Arc::new);
         if let Some(r) = &result {
             let buf = photocraft_compose::flatten(r);
             let t1 = crate::gpu_canvas::now_ms();

@@ -55,6 +55,12 @@ pub fn prepare_command(session: &Session, params: &Value) -> Result<Job> {
     if let Some(map) = params.as_object_mut() {
         map.remove("__job_command");
     }
+    // Last Filter reads the session journal, which the worker does not have: resolve it here,
+    // the same way the synchronous command does.
+    if id == "filter.lastFilter" {
+        let (last, last_params) = crate::filters::last_filter(session).ok_or_else(|| EngineError::Other("no filter applied yet".into()))?;
+        return crate::filters::prepare_job(session, &last, &last_params);
+    }
     // Ordinary algorithm filters resolve session dependencies before leaving the UI thread.
     if crate::filters::params_for(&id, &params).is_some() {
         return crate::filters::prepare_job(session, &id, &params);

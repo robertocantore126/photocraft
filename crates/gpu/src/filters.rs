@@ -288,7 +288,6 @@ impl FilterEngine {
             }
         }
         run(&self.finish, 0, 0, &[1.0], false, true);
-        drop(run);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pc_filter_readback"),
             size: bytes,
@@ -337,10 +336,13 @@ impl FilterEngine {
     }
 }
 
+/// (radius, halo, final kind, amount factor, threshold, motion vector, samples)
+#[cfg(not(target_arch = "wasm32"))]
+type Config = (f32, i32, u32, f32, f32, [f32; 2], u32);
+
 impl Filter {
-    // (radius, halo, final kind, amount factor, threshold, motion vector, samples)
     #[cfg(not(target_arch = "wasm32"))]
-    fn config(self) -> Result<(f32, i32, u32, f32, f32, [f32; 2], u32), Unsupported> {
+    fn config(self) -> Result<Config, Unsupported> {
         let (radius, kind, amount, threshold) = match self {
             Self::Gaussian { radius } | Self::Box { radius } => (radius, 0, 0.0, 0.0),
             Self::HighPass { radius } => (radius, 2, 0.0, 0.0),

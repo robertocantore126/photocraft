@@ -157,21 +157,24 @@ impl Jobs {
         self.serial = self.serial.wrapping_add(1);
         let serial = self.serial;
         let request = Request { key, serial, doc: doc.clone(), layer: layer.clone(), region, fields: fields.clone() };
-        match self.sender.as_ref().map(|s| s.try_send(request)) {
-            Some(Ok(())) => {
+        let Some(sender) = &self.sender else { return Poll::Failed("effect worker disconnected".into()) };
+        match sender.try_send(request) {
+            Ok(()) => {
                 self.pending.insert(key, Pending { signature, bytes, serial, reply: None });
                 Poll::Waiting
             }
-            Some(Err(mpsc::TrySendError::Full(_))) => {
+            Err(mpsc::TrySendError::Full(_)) => {
                 self.damage.entry(doc.id).and_modify(|r| *r = r.union(&region)).or_insert(region);
                 Poll::Waiting
             }
-            _ => Poll::Failed("effect worker disconnected".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Poll::Failed("effect worker disconnected".into()),
         }
     }
 
+    /// Work in flight for `doc`, or a request deferred because the queue or the memory reserve
+    /// was full: its damage is retried on the next frame, so the caller must ask for one.
     pub fn pending(&self, doc: DocId) -> bool {
-        self.pending.keys().any(|(id, _)| *id == doc)
+        self.pending.keys().any(|(id, _)| *id == doc) || self.damage.contains_key(&doc)
     }
 
     pub fn take_damage(&mut self, doc: DocId) -> Option<Rect> {
@@ -189,5 +192,31 @@ impl Drop for Jobs {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
         self.sender.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photocraft_doc::{ColorMode, LayerId, SampleType, Size};
+
+    /// BUG-04: a tab whose request is deferred (every reservation held by another tab) must still
+    /// report pending work, or the canvas stops asking for frames and its effects never appear.
+    #[test]
+    fn deferred_request_keeps_the_document_pending() {
+        let mut jobs = Jobs::new().unwrap();
+        let a = Document::new("a", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+        let b = Document::new("b", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+        for i in 0..12 {
+            jobs.pending.insert((a.id, (LayerId(i), None, (64, 64))), Pending { signature: 1, bytes: 0, serial: u64::from(i as u32), reply: None });
+        }
+        let layer = photocraft_doc::Layer::raster("l", b.pixel_format());
+        let region = Rect::new(0, 0, 64, 64);
+        assert!(matches!(jobs.poll((layer.id, None, (64, 64)), 7, &b, &layer, region, &HashMap::new()), Poll::Waiting));
+        assert!(!jobs.pending.keys().any(|(id, _)| *id == b.id), "the request was deferred, not queued");
+        assert!(jobs.pending(b.id), "a deferred request must keep the canvas repainting");
+        // The next frame turns the damage into dirty cells and polls again.
+        assert_eq!(jobs.take_damage(b.id), Some(region));
+        assert!(!jobs.pending(b.id));
     }
 }

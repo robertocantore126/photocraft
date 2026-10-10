@@ -183,8 +183,9 @@ type Cell = (i32, i32);
 /// A resident layer page.
 type ResKey = (LayerId, Role, Cell);
 /// Effect maps of a layer: over its whole effect region (`None`), or one page cell of a region
-/// larger than the texture limit.
-type FxKey = (LayerId, Option<Cell>);
+/// larger than the texture limit, for one canvas size (a display mip level of the same document
+/// keeps its own maps, so returning to a zoom reuses them).
+type FxKey = (LayerId, Option<Cell>, (u32, u32));
 
 struct Resident {
     texture: wgpu::Texture,
@@ -528,6 +529,8 @@ pub struct Compositor {
     /// that changed then (a stroke changes the same one refresh after refresh).
     prefix_last: HashMap<(DocId, Cell), PrefixSeen>,
     render_mip: u32,
+    /// Canvas size of the document being encoded: the last part of every `FxKey`.
+    fx_view: (u32, u32),
     mip_kit: Option<MipKit>,
     kit: Kit,
     pool: Vec<(wgpu::Texture, wgpu::TextureView)>,
@@ -785,6 +788,7 @@ impl Compositor {
             prefix: HashMap::new(),
             prefix_last: HashMap::new(),
             render_mip: 0,
+            fx_view: (0, 0),
             mip_kit: None,
             residents: HashMap::new(),
             fx: HashMap::new(),
@@ -1143,6 +1147,7 @@ impl Compositor {
         flush: bool,
     ) -> Result<Stats, Unsupported> {
         let canvas = doc.bounds();
+        self.fx_view = (doc.size.width, doc.size.height);
         let mut region = region.intersect(&canvas);
         if self.render_mip > 0 {
             // Native texture mip extents round down. Leave the trailing subpixel edge for
@@ -1190,7 +1195,7 @@ impl Compositor {
             // whose effects, new and cached, lie wholly outside this refresh keeps its maps as
             // they are until a refresh reaches them: a stroke on a 54-effect PSB re-checked
             // every one of them (4 ms) before.
-            let key = (f.layer.id, None);
+            let key = (f.layer.id, None, self.fx_view);
             let misses = |r: Rect| r.intersect(&region).is_empty();
             if misses(f.region) && self.fx.get(&key).is_none_or(|e| misses(e.region)) {
                 continue;
@@ -1234,7 +1239,7 @@ impl Compositor {
                     continue;
                 }
                 let window = fx::slice_window(pf, f.region, aprons.get(i).copied().unwrap_or(0));
-                self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, Some(cell)), window, &mut stats);
+                self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, Some(cell), self.fx_view), window, &mut stats);
             }
             let chunks = grid_rects(part, self.chunk << self.render_mip);
             stats.chunks += chunks.len();
@@ -1270,7 +1275,7 @@ impl Compositor {
         if !self.nested {
             let live: std::collections::HashSet<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
             self.residents.retain(|(id, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
-            self.fx.retain(|(id, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
+            self.fx.retain(|(id, _, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
             stats.evicted += self.evict().0;
         }
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
@@ -1413,7 +1418,7 @@ impl Compositor {
             views.push((tex, mask));
             maps.push(p.map.and_then(|m| {
                 let f = plan.fx.get(m.fx)?;
-                let key = (f.layer.id, paged.get(m.fx).copied().unwrap_or(false).then_some(cell));
+                let key = (f.layer.id, paged.get(m.fx).copied().unwrap_or(false).then_some(cell), self.fx_view);
                 let e = self.fx.get(&key)?;
                 let t = e.progs.get(m.item)?.maps.get(m.map)?.as_ref()?;
                 Some((t.view.clone(), e.region))
@@ -1755,7 +1760,7 @@ impl Compositor {
             .map
             .and_then(|m| {
                 let f = plan.fx.get(m.fx)?;
-                self.fx.get(&(f.layer.id, paged.get(m.fx).copied().unwrap_or(false).then_some(cell))).map(|e| e.version)
+                self.fx.get(&(f.layer.id, paged.get(m.fx).copied().unwrap_or(false).then_some(cell), self.fx_view)).map(|e| e.version)
             })
             .unwrap_or(0);
         tex.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ mask.rotate_left(21) ^ map.rotate_left(42)
@@ -2017,11 +2022,11 @@ impl Compositor {
         (solo.opacity, solo.fill_opacity, solo.blend, solo.visible, solo.clipped) = (1.0, 1.0, photocraft_color::BlendMode::Normal, true, false);
         let mut sub = doc.clone();
         sub.layers = vec![solo];
-        let saved = (self.nested, self.render_mip, self.staged, self.focus.take());
+        let saved = (self.nested, self.render_mip, self.staged, self.focus.take(), self.fx_view);
         self.nested = true;
         self.render_mip = 0;
         let px = render_to_vec(self, device, queue, &sub, r);
-        (self.nested, self.render_mip, self.staged, self.focus) = saved;
+        (self.nested, self.render_mip, self.staged, self.focus, self.fx_view) = saved;
         px.ok().map(|px| px.iter().map(|p| p[3]).collect())
     }
 

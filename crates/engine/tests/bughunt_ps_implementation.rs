@@ -11,7 +11,6 @@ fn scene(depth: u32) -> Session {
 }
 
 #[test]
-#[ignore = "BUG-01: Last Filter cannot prepare its isolated worker session"]
 fn bug_01_repeat_filter_worker() {
     let mut s = scene(8);
     s.execute("filter.blur.gaussianBlur", json!({"radius":1.5})).unwrap();
