@@ -1003,6 +1003,16 @@ impl PhotocraftApp {
             photocraft_trace::action(|| format!("dialog {:?} {command}", d.kind));
         }
         seen.dialogs = ids;
+        // A frame without input: record who asked for it, so a UI that never goes idle shows
+        // its cause (file:line of the repaint request).
+        if ctx.input(|i| i.events.is_empty() && !i.pointer.is_moving()) {
+            let causes = ctx.repaint_causes();
+            if !causes.is_empty() {
+                photocraft_trace::instant("idle_repaint", || {
+                    Some(causes.iter().map(|c| format!("{}:{} {}", c.file, c.line, c.reason)).collect::<Vec<_>>().join("; "))
+                });
+            }
+        }
         let canvas = self.last_canvas_rect;
         let tool = self.ui.tool.label();
         ctx.input(|i| {

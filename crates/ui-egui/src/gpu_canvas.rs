@@ -192,6 +192,38 @@ pub struct GpuCanvas {
     filter_engine: std::sync::Arc<std::sync::OnceLock<Result<photocraft_gpu::filters::FilterEngine, photocraft_gpu::Unsupported>>>,
 }
 
+/// GPU memory the off-canvas compositor may keep resident between renders.
+#[cfg(not(target_arch = "wasm32"))]
+const ACCELERATOR_BUDGET: u64 = 768 << 20;
+
+/// Large whole-document composites outside the canvas (a save's merged image, exports,
+/// histograms, adjustment previews, the navigator) go through a GPU compositor of their own
+/// instead of the CPU reference compositor (see `photocraft_compose::accel`). It is created on
+/// first use and shared, one render at a time, by whichever thread asks.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_compose_accelerator(rs: &RenderState) {
+    let (device, queue) = (rs.device.clone(), rs.queue.clone());
+    let format = photocraft_gpu::Compositor::preferred_acc_format(&rs.adapter);
+    let compositor: std::sync::Mutex<Option<photocraft_gpu::Compositor>> = std::sync::Mutex::new(None);
+    photocraft_compose::accel::set(Some(std::sync::Arc::new(move |doc: &photocraft_doc::Document, rect: photocraft_geom::Rect| {
+        let _span = photocraft_trace::span_with("gpu_compose", || format!("{}x{} of {}x{}", rect.width(), rect.height(), doc.size.width, doc.size.height));
+        let mut guard = compositor.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            let mut comp = photocraft_gpu::Compositor::try_new_with_format(&device, format).ok()?;
+            comp.set_memory_budget(ACCELERATOR_BUDGET);
+            *guard = Some(comp);
+        }
+        let comp = guard.as_mut()?;
+        match photocraft_gpu::render_to_vec(comp, &device, &queue, doc, rect) {
+            Ok(px) => Some(px),
+            Err(error) => {
+                log::warn!("GPU composite of {rect:?} failed ({}); using the CPU compositor", error.0);
+                None
+            }
+        }
+    })));
+}
+
 /// Can `adapter` use `Rgba16Float` as a sampled, filtered, render-target and copy texture?
 /// (Core WebGPU guarantees it; WebGL2 needs `EXT_color_buffer_float`, and some drivers lack it.)
 pub fn supports_f16_canvas(adapter: &wgpu::Adapter) -> bool {
@@ -226,6 +258,10 @@ impl GpuCanvas {
                 log::warn!("{error}; using the CPU compositor");
                 res.compositor_failed = Some(error);
             }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if res.compositor_failed.is_none() {
+            register_compose_accelerator(rs);
         }
         rs.renderer.write().callback_resources.insert(res);
         log::info!("gpu canvas: target {:?}, max texture {max}, tile {tile}, 16F canvas {high:?}", rs.target_format);
@@ -619,15 +655,24 @@ impl GpuCanvas {
                     ],
                 );
             }
-            // Wait for the GPU before returning. Without this, edits that arrive faster than the
+            // Bound the GPU work in flight. Without a bound, edits that arrive faster than the
             // GPU finishes them keep their upload staging in flight, and the driver's memory pool
             // keeps that high-water mark for the rest of the session (4 GB of RAM after 100
-            // layers of a 4K document, still held after closing it). It's also faster: the
-            // next edit doesn't queue behind unfinished work. `PHOTOCRAFT_GPU_ASYNC=1` restores
-            // the old behaviour for comparisons.
+            // layers of a 4K document, still held after closing it). Waiting for this composite
+            // itself blocked the UI thread for its whole GPU time (up to 270 ms after a layer
+            // property change on a 479-layer PSB); waiting for the previous one instead keeps at
+            // most one composite in flight while this one runs alongside the next frame.
+            // `PHOTOCRAFT_GPU_WAIT=current` waits for this one, `PHOTOCRAFT_GPU_ASYNC=1` for none.
             if std::env::var_os("PHOTOCRAFT_GPU_ASYNC").is_none() {
                 let _wait = photocraft_trace::span("gpu_wait");
-                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                if std::env::var("PHOTOCRAFT_GPU_WAIT").as_deref() == Ok("current") {
+                    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                } else {
+                    if let Some(previous) = res.last_composite.take() {
+                        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None });
+                    }
+                    res.last_composite = Some(queue.submit(std::iter::empty::<wgpu::CommandBuffer>()));
+                }
             }
         } else if fresh {
             res.docs.remove(&key);
@@ -1367,6 +1412,8 @@ struct Resources {
     compositor: Option<photocraft_gpu::Compositor>,
     /// Why the wgpu compositor couldn't be created (then the CPU compositor is used).
     compositor_failed: Option<photocraft_gpu::Unsupported>,
+    /// The previous composite's last submission (see `composite_output`).
+    last_composite: Option<wgpu::SubmissionIndex>,
     /// GPU memory the compositor may hold (`None`: its default), and the document area the
     /// view shows; applied before every composite.
     compositor_budget: Option<u64>,
@@ -1666,6 +1713,7 @@ impl Resources {
             out_linear: target.is_srgb(),
             compositor: None,
             compositor_failed: None,
+            last_composite: None,
             compositor_budget: None,
             compositor_focus: None,
             compositor_pixels_only: false,

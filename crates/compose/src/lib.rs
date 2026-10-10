@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod accel;
 pub mod adjust;
 pub mod bounds;
 pub mod effects;
@@ -87,6 +88,12 @@ pub fn render(doc: &Document, rect: Rect) -> Buffer {
 
 /// [`render`] with an explicit tile size (tests check tile independence).
 pub fn render_tiled(doc: &Document, rect: Rect, tile: i32) -> Buffer {
+    // Inside the canvas only: beyond it the CPU compositor extends edge pixels for neighbourhoods.
+    if rect.intersect(&doc.bounds()) == rect
+        && let Some(buffer) = accel::render(doc, rect)
+    {
+        return buffer;
+    }
     let patterns = pattern::PreparedPatterns::new(&doc.patterns, pattern::PREPARED_PATTERN_BYTES);
     let cx = Ctx::for_doc(doc, &patterns);
     render_tiled_with(doc, rect, tile, &cx)
@@ -204,7 +211,9 @@ pub fn render_bands<E>(doc: &Document, rect: Rect, band_rows: i32, mut sink: imp
     let mut y = rect.y0;
     while y < rect.y1 {
         let y1 = y.saturating_add(rows).min(rect.y1);
-        sink(render_tiled_with(doc, Rect::new(rect.x0, y, rect.x1, y1), RENDER_TILE, &cx))?;
+        let band = Rect::new(rect.x0, y, rect.x1, y1);
+        let fast = if band.intersect(&doc.bounds()) == band { accel::render(doc, band) } else { None };
+        sink(fast.unwrap_or_else(|| render_tiled_with(doc, band, RENDER_TILE, &cx)))?;
         y = y1;
     }
     Ok(())

@@ -180,8 +180,9 @@ impl TexKind {
 type ResidentRef = (usize, [i32; 4]);
 /// A page cell: the square `[x·page, (x+1)·page) × [y·page, (y+1)·page)` of document pixels.
 type Cell = (i32, i32);
-/// A resident layer page.
-type ResKey = (LayerId, Role, Cell);
+/// A resident layer page, for one canvas size (`Compositor::fx_view`): a display mip level of
+/// the same document keeps its own pages, so returning to a zoom re-uploads nothing.
+type ResKey = (LayerId, Role, Cell, (u32, u32));
 /// Effect maps of a layer: over its whole effect region (`None`), or one page cell of a region
 /// larger than the texture limit, for one canvas size (a display mip level of the same document
 /// keeps its own maps, so returning to a zoom reuses them).
@@ -1283,7 +1284,7 @@ impl Compositor {
         let frame = self.frame;
         if !self.nested {
             let live: std::collections::HashSet<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
-            self.residents.retain(|(id, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
+            self.residents.retain(|(id, _, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
             self.fx.retain(|(id, _, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
             stats.evicted += self.evict().0;
         }
@@ -1409,17 +1410,18 @@ impl Compositor {
                 continue;
             }
             let (ta, ma) = fr.areas.get(i).copied().unwrap_or((Rect::EMPTY, Rect::EMPTY));
-            let tex =
-                p.tex.as_ref().and_then(|t| self.sync(device, queue, encoder, doc, (t.layer, t.role, cell), t.surface.get(), ta.intersect(&cr), stats)).map(
-                    |(k, r)| {
-                        keys.push(k);
-                        (keys.len() - 1, r)
-                    },
-                );
+            let tex = p
+                .tex
+                .as_ref()
+                .and_then(|t| self.sync(device, queue, encoder, doc, (t.layer, t.role, cell, self.fx_view), t.surface.get(), ta.intersect(&cr), stats))
+                .map(|(k, r)| {
+                    keys.push(k);
+                    (keys.len() - 1, r)
+                });
             let mask = p
                 .mask
                 .as_ref()
-                .and_then(|m| self.sync(device, queue, encoder, doc, (m.layer, Role::Mask, cell), m.surface.get(), ma.intersect(&cr), stats))
+                .and_then(|m| self.sync(device, queue, encoder, doc, (m.layer, Role::Mask, cell, self.fx_view), m.surface.get(), ma.intersect(&cr), stats))
                 .map(|(k, r)| {
                     keys.push(k);
                     (keys.len() - 1, r)
@@ -1763,8 +1765,8 @@ impl Compositor {
     /// (0 for what isn't resident). Looked up whether or not this refresh culled the pass.
     fn input_gen(&self, p: &plan::Pass<'_>, plan: &Plan<'_>, paged: &[bool], cell: Cell) -> u64 {
         let page = |key: ResKey| self.residents.get(&key).map_or(0, |r| r.version);
-        let tex = p.tex.as_ref().map_or(0, |t| page((t.layer, t.role, cell)));
-        let mask = p.mask.as_ref().map_or(0, |m| page((m.layer, Role::Mask, cell)));
+        let tex = p.tex.as_ref().map_or(0, |t| page((t.layer, t.role, cell, self.fx_view)));
+        let mask = p.mask.as_ref().map_or(0, |m| page((m.layer, Role::Mask, cell, self.fx_view)));
         let map = p
             .map
             .and_then(|m| {

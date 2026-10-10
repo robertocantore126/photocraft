@@ -196,3 +196,24 @@ fn bug_03_zoom_roundtrip_rebuilds_effects() {
     eprintln!("cold fx pixels={cold}, warm={warm}, return-to-zoom={repeated}");
     assert_eq!(repeated, 0, "BUG-03: no document edit occurred");
 }
+
+/// Like BUG-03 for layer pages: each display mip level keeps its own resident pages, so going
+/// back to a zoom already shown uploads nothing (it re-uploaded every page before, a 1.3 s
+/// first frame on a 479-layer PSB).
+#[test]
+fn zoom_roundtrip_reuses_layer_pages() {
+    let (device, queue, mut comp) = gpu();
+    let mut s = scene(8);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.stroke", json!({"points":[[90,20],[10,380]],"size":31,"color":"#3366cc"})).unwrap();
+    let doc = &s.active().unwrap().doc;
+    let half = photocraft_compose::mip_view::document(doc, 1).unwrap();
+    let quarter = photocraft_compose::mip_view::document(doc, 2).unwrap();
+    let uploads = |comp: &mut Compositor, d: &photocraft_doc::Document| render_to_vec_stats(comp, &device, &queue, d, d.bounds()).unwrap().1.tiles_uploaded;
+    let cold = uploads(&mut comp, &half);
+    uploads(&mut comp, &quarter);
+    let back = uploads(&mut comp, &half);
+    eprintln!("tiles uploaded: first visit {cold}, back to the same zoom {back}");
+    assert!(cold > 0);
+    assert_eq!(back, 0);
+}
