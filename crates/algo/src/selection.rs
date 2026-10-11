@@ -286,6 +286,24 @@ pub fn wand_region(img: &[[u8; 4]], area: Rect, seed: (i32, i32), tolerance: f32
     Some(Region { bbox, mask })
 }
 
+/// Grows a region by `r` pixels inside `area` (the SAI-style Paint Bucket "Expand", which lets the
+/// fill slip under anti-aliased line art instead of leaving a light fringe).
+pub fn expand_region(region: &Region, area: Rect, r: f32) -> Region {
+    if r <= 0.0 || region.bbox.is_empty() {
+        return region.clone();
+    }
+    let bbox = region.bbox.inflate(r.ceil() as i32 + 1).intersect(&area);
+    let (w, h) = (bbox.width() as usize, bbox.height() as usize);
+    let mut m = vec![0.0f32; w * h];
+    for y in bbox.y0..bbox.y1 {
+        for x in bbox.x0..bbox.x1 {
+            m[(y - bbox.y0) as usize * w + (x - bbox.x0) as usize] = region.at(x, y);
+        }
+    }
+    let grown = expand(&m, w, h, r);
+    Region { bbox, mask: grown.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect() }
+}
+
 /// Combines a [`Region`] with the current selection, touching only the region's box (outside it
 /// the new mask is zero). Returns `None` when nothing remains selected.
 pub fn combine_region(old: Option<&Surface>, new: Option<&Region>, mode: SelectionMode) -> Option<Surface> {

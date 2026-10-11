@@ -1,0 +1,29 @@
+# Fotox brush plugins (D-096): a workspace of its own, built for
+# wasm32-unknown-unknown, never part of the app's workspace.
+#
+#   cargo xtask plugins            # build all, copy the .wasm where Fotox looks
+#   cargo xtask plugins --watch    # rebuild + copy on every save (hot reload)
+#
+# A new plugin: copy `plain-eraser/` (the smallest one), rename it, add it to
+# `members`. HOWTO: docs/PLUGINS.md.
+[workspace]
+resolver = "2"
+members = ["sdk", "plain-eraser", "blend-eraser", "feather-eraser"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+# `cargo build` without --release still makes usable pixel code.
+[profile.dev]
+opt-level = 2
+panic = "abort"

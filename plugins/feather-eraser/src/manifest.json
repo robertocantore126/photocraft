@@ -1,0 +1,65 @@
+{
+  "id": "feather-eraser",
+  "name": "Feather Eraser Tool",
+  "slot": "eraser",
+  "icon": "i-eraser",
+  "color": "background",
+  "brush": {
+    "profile": "feather",
+    "accumulate": "max",
+    "spacing": 0.2,
+    "feather_from": "Feather"
+  },
+  "options": [
+    {
+      "type": "num",
+      "text": "Size:",
+      "value": "150",
+      "unit": "px",
+      "width": 40
+    },
+    {
+      "type": "num",
+      "text": "Feather:",
+      "value": "300",
+      "unit": "px",
+      "width": 40
+    },
+    {
+      "type": "range",
+      "text": "Opacity:",
+      "value": 100
+    },
+    {
+      "type": "range",
+      "text": "Flow:",
+      "value": 60
+    },
+    {
+      "type": "range",
+      "text": "Breakup:",
+      "value": 0
+    },
+    {
+      "type": "num",
+      "text": "Smoothing:",
+      "value": "25",
+      "unit": "%",
+      "width": 36
+    },
+    {
+      "type": "toggle",
+      "text": "Pressure for opacity",
+      "on": false
+    },
+    {
+      "type": "toggle",
+      "text": "Pressure for size",
+      "on": false
+    }
+  ],
+  "params": [
+    "Breakup",
+    "Feather"
+  ]
+}

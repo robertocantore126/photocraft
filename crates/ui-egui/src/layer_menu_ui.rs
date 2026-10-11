@@ -55,6 +55,7 @@ pub fn entries(l: &Layer, multi: bool, has_selection: bool) -> Vec<Entry> {
         if l.clipped { "Release Clipping Mask" } else { "Create Clipping Mask" },
         if l.clipped { "layer.releaseClippingMask" } else { "layer.createClippingMask" },
     )));
+    v.push(Some((if l.reference { "Unset Reference Layer" } else { "Set as Reference Layer" }, "layer.reference")));
     v.push(None);
     v.push(Some(("Link Layers", "layer.linkLayers")));
     v.push(Some(("Select Linked Layers", "layer.selectLinkedLayers")));

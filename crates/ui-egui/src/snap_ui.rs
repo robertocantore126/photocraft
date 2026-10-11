@@ -348,6 +348,7 @@ mod tests {
     fn ctrl_or_snap_off_disables_snapping() {
         let mut app = app_with_box();
         app.ui.tool = Tool::Move;
+        app.ui.tool_options.move_auto_select = false;
         app.ui.view.show.smart_guides = false;
         app.ui.extras.snap = false;
         let m = egui::Modifiers::NONE;

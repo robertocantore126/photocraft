@@ -265,6 +265,10 @@ fn common_shortcuts_work_after_clicking_panels() {
             h.run_steps(2);
         }
         if !text {
+            // Enter the brush group from another tool; B while already on Brush cycles
+            // to Pixel Brush now that the group has multiple tools.
+            h.state_mut().ui.tool = Tool::Move;
+            h.run_steps(2);
             press(&mut h, "B");
             assert_eq!(h.state().ui.tool, Tool::Brush, "{place:?}: B picks the Brush");
             press(&mut h, "V");

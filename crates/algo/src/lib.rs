@@ -37,6 +37,7 @@ mod image;
 pub mod inpaint;
 pub mod lens;
 pub mod liquify;
+pub mod livewire;
 pub mod matting;
 mod noise;
 mod oil;

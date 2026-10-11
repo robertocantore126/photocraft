@@ -114,12 +114,58 @@ fn rect_param(p: &Value) -> Option<Rect> {
 }
 
 fn object_selection(s: &mut Session, p: &Value) -> Result<Value> {
+    if b(p, "ai", true) && crate::ai_select::available() {
+        return object_selection_ai(s, p);
+    }
     let rect = rect_param(p).ok_or_else(|| bad("select.object", "needs \"rect\": [x, y, w, h]"))?;
     let region = with_sampler(s, b(p, "sampleAllLayers", false), |smp, doc| grabcut::object_select(smp, doc.bounds(), rect, 160_000))?;
     apply(s, "Object Selection", region, mode(p, "replace"))
 }
 
+/// What the AI reads: the active layer's own content (covered parts included) unless Sample All
+/// Layers is on, or the active layer has none (an adjustment layer); else the document.
+fn ai_source(s: &Session, all_layers: bool) -> Result<Document> {
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let alone = (!all_layers).then_some(d.active_layer).flatten().and_then(|id| crate::ai_select::layer_alone(&d.doc, id));
+    Ok(alone.unwrap_or_else(|| (*d.doc).clone()))
+}
+
+/// Object Selection with BiRefNet / EfficientSAM (`ai_select`): a `rect` (box), a `point` (click)
+/// or a `lasso` outline.
+fn object_selection_ai(s: &mut Session, p: &Value) -> Result<Value> {
+    let lasso: Vec<(f64, f64)> = p
+        .get("lasso")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|q| Some((q.get(0)?.as_f64()?, q.get(1)?.as_f64()?))).collect())
+        .unwrap_or_default();
+    let boxed = if lasso.len() >= 3 {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in &lasso {
+            (x0, y0, x1, y1) = (x0.min(*x), y0.min(*y), x1.max(*x), y1.max(*y));
+        }
+        Some([x0, y0, x1, y1])
+    } else {
+        rect_param(p).filter(|r| r.width() >= 2 && r.height() >= 2).map(|r| [f64::from(r.x0), f64::from(r.y0), f64::from(r.x1), f64::from(r.y1)])
+    };
+    let point = p.get("point").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+    if boxed.is_none() && point.is_none() {
+        return Err(bad("select.object", "needs \"rect\": [x, y, w, h], \"point\": [x, y] or \"lasso\": [[x, y], …]"));
+    }
+    let point = point.or(boxed.filter(|_| lasso.len() >= 3).map(|b| ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)));
+    let source = ai_source(s, b(p, "sampleAllLayers", false))?;
+    let prompt = crate::ai_select::Prompt { boxed, point, lasso, sam: p.get("model").and_then(Value::as_str) == Some("sam") };
+    let mask = crate::ai_select::object_mask(&source, &prompt).map_err(EngineError::Other)?;
+    let region = crate::ai_select::to_region(&source, &mask);
+    apply(s, "Object Selection", region, mode(p, "replace"))
+}
+
 fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
+    if b(p, "ai", true) && crate::ai_select::available() && photocraft_ml::models::BIREFNET.installed() {
+        let source = ai_source(s, b(p, "sampleAllLayers", true))?;
+        let mask = crate::ai_select::subject(&source).map_err(EngineError::Other)?;
+        let region = crate::ai_select::to_region(&source, &mask);
+        return apply(s, "Select Subject", region, mode(p, "replace"));
+    }
     let region = with_sampler(s, b(p, "sampleAllLayers", true), |smp, doc| subject::select_subject(smp, doc.bounds()))?;
     apply(s, "Select Subject", region, mode(p, "replace"))
 }
@@ -234,7 +280,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.object",
             "Object Selection",
             [],
-            r##"{"rect":[x,y,w,h],"mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=false}"##,
+            r##"{"rect":[x,y,w,h]?,"point":[x,y]?,"lasso":[[x,y],…]?,"mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=false,"ai":bool=true,"model":"birefnet|sam"="birefnet"}"##,
             has_doc,
             object_selection
         ),
@@ -242,7 +288,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.subject",
             "Subject",
             ["Select"],
-            r##"{"sampleAllLayers":bool=true,"mode":"replace|add|subtract|intersect"="replace"}"##,
+            r##"{"sampleAllLayers":bool=true,"mode":"replace|add|subtract|intersect"="replace","ai":bool=true}"##,
             has_doc,
             select_subject
         ),

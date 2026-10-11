@@ -31,6 +31,22 @@ use crate::{Dab, StrokePoint, dab_coverage};
 
 /// Edge of a stroke-buffer tile.
 pub const COV_TILE: i32 = 64;
+
+/// What a brush plug-in does to a stroke: called once per dirty rectangle (part of one
+/// [`COV_TILE`] tile) with the **pre-stroke** pixels of `rect` (`channels` = 4: premultiplied
+/// RGBA `0..=1`; 1: a mask's grey) and `k`, the stroke's opacity × coverage per pixel. It
+/// overwrites the values with the result; an error keeps those pixels as they were.
+pub type PixelOpFn = dyn Fn(Rect, &mut [f32], usize, &[f32]) -> Result<(), String> + Send + Sync;
+
+/// A shared [`PixelOpFn`].
+#[derive(Clone)]
+pub struct PixelOp(pub Arc<PixelOpFn>);
+
+impl std::fmt::Debug for PixelOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PixelOp")
+    }
+}
 const NOISE_SALT: u64 = 0x006E_6F69_7365;
 
 #[inline]
@@ -398,6 +414,10 @@ pub struct StrokeRenderer {
     dab_buf: Vec<Dab>,
     dual_buf: Vec<Dab>,
     all_dabs: Option<Vec<Dab>>,
+    /// A brush plug-in deciding the pixels instead of the brush's colour / erase.
+    pixel_op: Option<PixelOp>,
+    /// Each pixel keeps its strongest dab coverage instead of building up (Fotox's `max`).
+    max_accumulate: bool,
 }
 
 impl StrokeRenderer {
@@ -418,7 +438,21 @@ impl StrokeRenderer {
             dab_buf: Vec::new(),
             dual_buf: Vec::new(),
             all_dabs: None,
+            pixel_op: None,
+            max_accumulate: false,
         }
+    }
+
+    /// Paint through a brush plug-in (see [`PixelOp`]).
+    pub fn with_pixel_op(mut self, op: Option<PixelOp>) -> Self {
+        self.pixel_op = op;
+        self
+    }
+
+    /// Keep each pixel's strongest coverage (scrubbing over a stroke adds nothing).
+    pub fn with_max_accumulate(mut self, max: bool) -> Self {
+        self.max_accumulate = max;
+        self
     }
 
     /// Keep a copy of every primary dab (for tests and sequential tools).
@@ -487,7 +521,7 @@ impl StrokeRenderer {
                 }
                 _ => None,
             };
-            self.cov.accumulate(rect, &self.scratch, d.opacity, wet, col);
+            self.cov.accumulate(rect, &self.scratch, d.opacity, wet || self.max_accumulate, col);
             // Bounds track the full dab rectangle (even fully transparent parts), like the damage.
             self.cov.bounds = self.cov.bounds.union(&rect);
         }
@@ -561,6 +595,8 @@ impl StrokeRenderer {
             dab_buf: dabs,
             dual_buf: duals,
             all_dabs: None,
+            pixel_op: self.pixel_op.clone(),
+            max_accumulate: self.max_accumulate,
         };
         t.raster_pending();
         // Tiles whose coverage the tail doesn't change still composite the same: redraw them all.
@@ -649,6 +685,9 @@ impl StrokeRenderer {
             pre.read_region_into(tr, &mut region);
             let sel = selection.map(|s| (s.channels(), s.read_region(tr)));
             let w = tr.width() as usize;
+            if let Some(op) = &self.pixel_op {
+                return self.composite_op(op, tile, tx, ty, tr, region, sel.as_ref(), opacity, lock_transparency, &fmt);
+            }
             for y in tr.y0..tr.y1 {
                 for x in tr.x0..tr.x1 {
                     let ti = ((y - ty * COV_TILE) * COV_TILE + (x - tx * COV_TILE)) as usize;
@@ -719,6 +758,79 @@ impl StrokeRenderer {
             }
         }
         if all { bounds } else { dmg }
+    }
+}
+
+impl StrokeRenderer {
+    /// One coverage tile through the brush plug-in: `k` per pixel, the pre-stroke pixels in, the
+    /// plug-in's result out (non-finite values keep the pixel; alpha and grey stay in `0..=1`).
+    #[allow(clippy::too_many_arguments)]
+    fn composite_op(
+        &self,
+        op: &PixelOp,
+        tile: &CovTile,
+        tx: i32,
+        ty: i32,
+        tr: Rect,
+        mut region: Vec<f32>,
+        sel: Option<&(usize, Vec<f32>)>,
+        opacity: f32,
+        lock_transparency: bool,
+        fmt: &PixelFormat,
+    ) -> Option<(Rect, Vec<f32>)> {
+        let n = fmt.channels();
+        let w = tr.width() as usize;
+        let count = w * tr.height() as usize;
+        let mut ks = vec![0.0f32; count];
+        let mut any = false;
+        for y in tr.y0..tr.y1 {
+            for x in tr.x0..tr.x1 {
+                let c = tile.cov[((y - ty * COV_TILE) * COV_TILE + (x - tx * COV_TILE)) as usize];
+                if c <= 0.0 {
+                    continue;
+                }
+                let i = (y - tr.y0) as usize * w + (x - tr.x0) as usize;
+                let m = self.ctx.stroke_mask(c, self.dual.as_ref().map(|d| d.get(x, y)), x, y);
+                let s = sel.map_or(1.0, |(sc, v)| v[i * sc]);
+                ks[i] = (m * opacity * s).clamp(0.0, 1.0);
+                any |= ks[i] > 0.0;
+            }
+        }
+        if !any {
+            return None;
+        }
+        let gray = alpha_index(fmt).is_none() && fmt.mode.color_channels() == 1;
+        let channels = if gray { 1 } else { 4 };
+        let mut vals = Vec::with_capacity(count * channels);
+        for px in region.chunks_exact(n) {
+            if gray {
+                vals.push(px[0]);
+            } else {
+                let c = to_rgba(fmt, px);
+                vals.extend([c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]);
+            }
+        }
+        (op.0)(tr, &mut vals, channels, &ks).ok()?;
+        let mut enc = [0.0f32; 8];
+        for (i, px) in region.chunks_exact_mut(n).enumerate() {
+            if ks[i] <= 0.0 {
+                continue;
+            }
+            let v = &vals[i * channels..(i + 1) * channels];
+            if v.iter().any(|x| !x.is_finite()) {
+                continue;
+            }
+            if gray {
+                px[0] = v[0].clamp(0.0, 1.0);
+                continue;
+            }
+            let old = to_rgba(fmt, px);
+            let a = if lock_transparency { old[3] } else { v[3].clamp(0.0, 1.0) };
+            let rgb = if v[3] > 1e-6 { [v[0] / v[3], v[1] / v[3], v[2] / v[3]] } else { [old[0], old[1], old[2]] };
+            from_rgba_into(fmt, [rgb[0], rgb[1], rgb[2], a], &mut enc);
+            px.copy_from_slice(&enc[..n]);
+        }
+        Some((tr, region))
     }
 }
 

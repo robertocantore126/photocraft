@@ -18,13 +18,29 @@ pub(crate) fn hash01(x: i32, y: i32, c: u32, seed: u32) -> f32 {
     (h >> 8) as f32 / (1u32 << 24) as f32
 }
 
-/// Amount 100 % spans ±50 % of the range (uniform); Gaussian uses the same
-/// amount as ~2σ.
+/// Fotox's per-pixel hash (`fx-ops` Add Noise), kept bit for bit so the grain matches it.
+#[inline]
+fn fotox_hash(x: i32, y: i32, seed: u32) -> u32 {
+    let mut h = (x as u32).wrapping_mul(0x8da6_b343) ^ (y as u32).wrapping_mul(0xd816_3841) ^ seed.wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^ (h >> 15)
+}
+
+#[inline]
+fn unit(h: u32) -> f32 {
+    h as f32 / u32::MAX as f32
+}
+
+/// Add Noise as Fotox does it: amount 100 % spans ±100 % of the range (uniform), Gaussian has
+/// σ = half the amount (Box–Muller from two hashes). Monochromatic adds the same value to every
+/// colour channel. Hashed per document pixel, so results do not depend on tiling. Values stay in
+/// 0..1 (HDR values above 1 are not pulled down).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add(src: &Image, out: Rect, ctx: &Ctx, amount: f32, dist: Distribution, mono: bool, seed: u32) -> Vec<f32> {
     let n = src.ch;
     let cc = if ctx.alpha { n - 1 } else { n };
-    let a = amount.max(0.0) / 100.0 * 0.5;
+    let k = amount.max(0.0) / 100.0;
     let mut res = src.crop(out);
     let w = out.width() as usize;
     for (i, px) in res.chunks_exact_mut(n).enumerate() {
@@ -32,18 +48,20 @@ pub(crate) fn add(src: &Image, out: Rect, ctx: &Ctx, amount: f32, dist: Distribu
             continue;
         }
         let (x, y) = (out.x0 + (i % w) as i32, out.y0 + (i / w) as i32);
-        for (c, pv) in px.iter_mut().enumerate().take(cc) {
-            let ch = if mono { 0 } else { c as u32 };
-            let v = match dist {
-                Distribution::Uniform => (hash01(x, y, ch, seed) - 0.5) * 2.0 * a,
+        let noise = |ch: u32| -> f32 {
+            let h = fotox_hash(x, y, seed.wrapping_add(ch.wrapping_mul(7919)));
+            match dist {
+                Distribution::Uniform => unit(h) * 2.0 - 1.0,
                 Distribution::Gaussian => {
-                    let u1 = hash01(x, y, ch * 2 + 101, seed).max(1e-7);
-                    let u2 = hash01(x, y, ch * 2 + 102, seed);
-                    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * a * 0.5
+                    let (u1, u2) = (unit(h).max(1e-7), unit(fotox_hash(y, x, seed.wrapping_add(ch.wrapping_mul(104_729)))));
+                    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.5
                 }
-            };
-            // Integer storage clamps on write; float surfaces keep the value.
-            *pv += v;
+            }
+        };
+        let m = noise(0);
+        for (c, pv) in px.iter_mut().enumerate().take(cc) {
+            let v = if mono { m } else { noise(c as u32) };
+            *pv = (*pv + v * k).clamp(0.0, pv.max(1.0));
         }
     }
     res

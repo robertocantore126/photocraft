@@ -13,6 +13,8 @@ pub mod analysis;
 pub mod blend_if;
 pub mod comps;
 pub mod effects;
+pub mod linework;
+pub mod roles;
 pub mod mode;
 pub mod pattern;
 pub mod slices;
@@ -28,6 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use adjust::Adjustment;
 pub use analysis::{CountGroup, Measurement, MeasurementScale, Note, Ruler};
 pub use blend_if::{BlendIf, BlendRange};
+pub use linework::{LineKind, LineStroke, Linework};
+pub use roles::LayerRole;
 pub use comps::{Artboard, ArtboardBackground, CompAppearance, CompLayerState, LayerComp};
 pub use effects::{
     Bevel, BevelContour, BevelStyle, BevelTechnique, BevelTexture, Contour, Effect, FxCommon, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient,
@@ -436,6 +440,14 @@ pub struct Layer {
     pub blend_if: BlendIf,
     /// Layer › Video Layers frame stack (None for a normal layer).
     pub video: Option<VideoData>,
+    /// SAI "Selection Source": the Paint Bucket, Magic Wand and Edit › Fill Foreground (Ctrl+F)
+    /// can sample only the layers marked as reference (e.g. line art on its own layer).
+    pub reference: bool,
+    /// SAI-style Linework layer: the editable strokes this pixel layer renders (`None` = an
+    /// ordinary layer). Pixel tools rasterize it first (the strokes are dropped).
+    pub linework: Option<std::sync::Arc<Linework>>,
+    /// Special layer role (Sugimori watercolour set): its own icon and regenerated content.
+    pub role: Option<LayerRole>,
 }
 
 impl Layer {
@@ -461,6 +473,9 @@ impl Layer {
             excluded_channels: 0,
             blend_if: BlendIf::default(),
             video: None,
+            reference: false,
+            linework: None,
+            role: None,
         }
     }
     pub fn raster(name: impl Into<String>, format: PixelFormat) -> Self {

@@ -1,0 +1,21 @@
+{
+  "id": "blend-eraser",
+  "name": "Blend Eraser Tool",
+  "slot": "eraser",
+  "icon": "i-eraser",
+  "color": "background",
+  "options": [
+    { "type": "brushpreset" },
+    { "type": "num", "text": "Size:", "value": "300", "unit": "px", "width": 40 },
+    { "type": "num", "text": "Hardness:", "value": "0", "unit": "%", "width": 40 },
+    { "type": "range", "text": "Opacity:", "value": 100 },
+    { "type": "range", "text": "Flow:", "value": 25 },
+    { "type": "select", "text": "Tone:", "options": ["Shadows First", "Highlights First", "Off"], "value": "Shadows First" },
+    { "type": "range", "text": "Softness:", "value": 40 },
+    { "type": "range", "text": "Grain:", "value": 0 },
+    { "type": "num", "text": "Smoothing:", "value": "10", "unit": "%", "width": 36 },
+    { "type": "toggle", "text": "Pressure for opacity", "on": false },
+    { "type": "toggle", "text": "Pressure for size", "on": false }
+  ],
+  "params": ["Tone", "Softness", "Grain"]
+}

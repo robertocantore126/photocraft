@@ -465,7 +465,7 @@ fn build() -> Vec<CommandSpec> {
             "Layer Properties",
             [],
             None,
-            r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"locked":bool?,"locks":{"transparency","pixels","position","artboard","all":bool}?,"channels":[bool,…]? (Advanced Blending: which colour channels blend, R G B / C M Y K / L a b)}"##,
+            r##"{"layer":id?,"name":str?,"visible":bool?,"opacity":0..1?,"fill":0..1?,"blend":"Multiply|…"?,"clipped":bool?,"reference":bool? (SAI selection source),"locked":bool?,"locks":{"transparency","pixels","position","artboard","all":bool}?,"channels":[bool,…]? (Advanced Blending: which colour channels blend, R G B / C M Y K / L a b)}"##,
             has_layer,
             |s, p| {
                 let id = layer_param(s, p)?;
@@ -489,6 +489,9 @@ fn build() -> Vec<CommandSpec> {
                     }
                     if let Some(v) = p.get("clipped").and_then(Value::as_bool) {
                         l.clipped = v;
+                    }
+                    if let Some(v) = p.get("reference").and_then(Value::as_bool) {
+                        l.reference = v;
                     }
                     if let Some(v) = p.get("locked").and_then(Value::as_bool) {
                         l.locks.all = v;
@@ -535,6 +538,23 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(Value::Null)
         }),
+        cmd!(
+            "layer.reference",
+            "Reference Layer",
+            ["Layer"],
+            None,
+            r##"{"layer":id?,"on":bool? (default: toggle)} (SAI "Selection Source": sampled by Paint Bucket / Magic Wand / Fill Foreground with sample=reference)"##,
+            has_layer,
+            |s, p| {
+                let id = layer_param(s, p)?;
+                let on = s.edit("Reference Layer", |doc, _| {
+                    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                    l.reference = p.get("on").and_then(Value::as_bool).unwrap_or(!l.reference);
+                    Ok(l.reference)
+                })?;
+                Ok(json!({ "reference": on }))
+            }
+        ),
         cmd!("layer.releaseClippingMask", "Release Clipping Mask", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
             s.edit("Release Clipping Mask", |doc, _| {
@@ -957,6 +977,8 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::selection_cmds::specs());
     v.extend(crate::select_extra_cmds::specs());
     v.extend(crate::paint_cmds::specs());
+    v.extend(crate::linework_cmds::specs());
+    v.extend(crate::sugimori_cmds::specs());
     v.extend(crate::extra_cmds::specs());
     v.extend(crate::file_cmds::specs());
     v.extend(crate::type_extra_cmds::specs());

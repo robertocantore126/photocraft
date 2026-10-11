@@ -1,0 +1,12 @@
+[package]
+name = "blend-eraser"
+description = "Fotox brush plugin: an eraser that dissolves an image by its tones, for blending several images"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fotox-plugin = { path = "../sdk" }

@@ -67,26 +67,6 @@ pub fn finish_stroke(app: &mut PhotocraftApp, tool: Tool, points: &[[f64; 3]], m
     true
 }
 
-/// Object Selection: the dragged rectangle.
-pub fn finish_object_selection(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2], mods: egui::Modifiers) {
-    let (x, y) = (start[0].min(end[0]), start[1].min(end[1]));
-    let (w, h) = ((end[0] - start[0]).abs(), (end[1] - start[1]).abs());
-    if w < 2.0 || h < 2.0 {
-        return;
-    }
-    let mode = if mods.alt {
-        "subtract"
-    } else if mods.shift {
-        "add"
-    } else {
-        "replace"
-    };
-    let _ = app.run(
-        "select.object",
-        json!({"rect": [x.round(), y.round(), w.round(), h.round()], "mode": mode, "sampleAllLayers": app.ui.tool_options.sample_all_layers}),
-    );
-}
-
 /// ⌥-click with Clone Stamp / Healing Brush sets the source.
 pub fn set_source(app: &mut PhotocraftApp, x: f64, y: f64) {
     app.ui.clone_source = Some([x.round(), y.round()]);
@@ -127,7 +107,7 @@ fn pct(ui: &mut egui::Ui, label: &str, v: &mut f32) {
 
 /// Options bar for the retouching and smart-selection tools. Returns false for other tools.
 pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bool {
-    if !tool.is_brushlike() && !matches!(tool, Tool::QuickSelection | Tool::ObjectSelection) || matches!(tool, Tool::Brush | Tool::Eraser) {
+    if !tool.is_brushlike() && !matches!(tool, Tool::QuickSelection | Tool::ObjectSelection) || matches!(tool, Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser | Tool::Plugin) {
         return false;
     }
     let o = &mut app.ui.tool_options;

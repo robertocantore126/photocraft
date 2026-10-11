@@ -228,6 +228,24 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // Single-key tools and colours (no modifiers).
     let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
     // Enter / Escape commit or cancel in-progress tool state (polygonal lasso, crop).
+    if crate::magnetic_ui::active(app) {
+        if pressed(Key::Enter) {
+            crate::magnetic_ui::close(app);
+            return;
+        }
+        if pressed(Key::Escape) {
+            crate::magnetic_ui::cancel(app);
+            return;
+        }
+        if pressed(Key::Backspace) || pressed(Key::Delete) {
+            crate::magnetic_ui::remove_last(app);
+            return;
+        }
+    }
+    if !app.ui.polygon.is_empty() && (pressed(Key::Backspace) || pressed(Key::Delete)) {
+        app.ui.polygon.pop();
+        return;
+    }
     if !app.ui.polygon.is_empty() || app.ui.crop_rect.is_some() {
         if pressed(Key::Enter) {
             if !app.ui.polygon.is_empty() {

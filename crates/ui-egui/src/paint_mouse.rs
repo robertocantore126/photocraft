@@ -10,33 +10,60 @@ use photocraft_engine::prefs::RightClickPaint;
 use crate::PhotocraftApp;
 use crate::state::Tool;
 
-/// Smoothing is a tool option, kept per tool like Photoshop's options bar: switching between the
-/// Brush and the Eraser saves the session brush's smoothing for the old tool and loads the new
-/// tool's (Photoshop's 10 % the first time). Other tools leave it alone.
+/// The brush is kept per tool: switching between tools with a brush chip (Brush, Eraser, Clone
+/// Stamp, Dodge…) saves the session brush (preset tip, size, hardness, smoothing…) for the old
+/// tool and loads the one the new tool last used, so the Eraser comes back as the soft 400 px tip
+/// it had. A tool used for the first time starts from the current brush; the Brush and Eraser
+/// start with Photoshop's 10 % smoothing. Colours and the erase flag stay the session's. Other
+/// tools leave the brush alone.
 pub fn sync_tool_smoothing(app: &mut PhotocraftApp) {
     let tool = app.ui.tool;
-    if !matches!(tool, Tool::Brush | Tool::Eraser) || app.ui.smoothing_tool == Some(tool) {
+    let key = (tool, app.ui.plugin_tool.clone().filter(|_| tool == Tool::Plugin));
+    if !has_brush_picker(tool) || app.ui.brush_tool.as_ref() == Some(&key) {
         return;
     }
-    let current = app.session.tools.brush.smoothing.clone();
-    let next = match app.ui.smoothing_tool {
-        // The first smoothing tool takes what the brush has.
-        None => current,
-        Some(prev) => {
-            let saved = &mut app.ui.tool_smoothing;
-            match saved.iter_mut().find(|(t, _)| *t == prev) {
-                Some(e) => e.1 = current,
-                None => saved.push((prev, current)),
-            }
-            saved
-                .iter()
-                .find(|(t, _)| *t == tool)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_else(|| photocraft_engine::paint::brush::Smoothing { amount: 0.1, ..Default::default() })
+    let current = app.session.tools.brush.clone();
+    let prev = app.ui.brush_tool.take();
+    if let Some(prev) = &prev {
+        let saved = &mut app.ui.tool_brushes;
+        match saved.iter_mut().find(|(t, _)| t == prev) {
+            Some(e) => e.1 = current.clone(),
+            None => saved.push((prev.clone(), current.clone())),
         }
-    };
-    app.session.tools.brush.smoothing = next;
-    app.ui.smoothing_tool = Some(tool);
+    }
+    match app.ui.tool_brushes.iter().find(|(t, _)| *t == key).map(|(_, b)| b.clone()) {
+        Some(mut next) => {
+            next.color = current.color;
+            next.background = current.background;
+            next.erase = current.erase;
+            app.session.tools.brush = next;
+        }
+        // A brush plug-in used for the first time: its manifest's defaults.
+        None if tool == Tool::Plugin => {
+            if let Some(id) = key.1.clone() {
+                let mut b = current;
+                crate::brush_plugin_ui::apply_defaults(&mut app.ui, &id, &mut b);
+                app.session.tools.brush = b;
+            }
+        }
+        // The Pixel Brush starts as a 1 px pen with full opacity and no smoothing.
+        // The SAI Brush starts as a 20 px round, pressure on size, a little smoothing.
+        None if tool == Tool::SaiBrush => {
+            let b = &mut app.session.tools.brush;
+            (b.size, b.opacity, b.flow, b.hardness) = (20.0, 1.0, 1.0, 0.8);
+            b.smoothing = photocraft_engine::paint::brush::Smoothing { amount: 0.1, ..Default::default() };
+        }
+        None if tool == Tool::PixelBrush => {
+            let b = &mut app.session.tools.brush;
+            (b.size, b.opacity, b.flow) = (1.0, 1.0, 1.0);
+            b.smoothing = photocraft_engine::paint::brush::Smoothing { amount: 0.0, ..Default::default() };
+        }
+        None if matches!(tool, Tool::Brush | Tool::Eraser) && prev.as_ref().is_some_and(|p| matches!(p.0, Tool::Brush | Tool::Eraser)) => {
+            app.session.tools.brush.smoothing = photocraft_engine::paint::brush::Smoothing { amount: 0.1, ..Default::default() };
+        }
+        None => {}
+    }
+    app.ui.brush_tool = Some(key);
 }
 
 /// Which tool events this frame's canvas response produces.
@@ -55,7 +82,7 @@ pub fn has_brush_picker(tool: Tool) -> bool {
 
 /// Does a right-button drag with `tool` erase (rather than open the picker)?
 pub fn right_erases(app: &PhotocraftApp, tool: Tool) -> bool {
-    matches!(tool, Tool::Brush | Tool::Eraser) && app.session.prefs().tools.right_click_with_painting_tools == RightClickPaint::Erase
+    matches!(tool, Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser) && app.session.prefs().tools.right_click_with_painting_tools == RightClickPaint::Erase
 }
 
 /// Route the canvas response's buttons: the left one drives the tool; the right one erases (Erase

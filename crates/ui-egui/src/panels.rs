@@ -18,14 +18,15 @@ const TOOL_SECTIONS: &[&[&[Tool]]] = &[
     &[&[Tool::Move]],
     &[
         &[Tool::RectMarquee, Tool::EllipseMarquee],
-        &[Tool::Lasso, Tool::PolygonLasso],
+        &[Tool::Lasso, Tool::PolygonLasso, Tool::MagneticLasso],
         &[Tool::ObjectSelection, Tool::QuickSelection, Tool::MagicWand],
         &[Tool::Crop, Tool::Slice, Tool::SliceSelect],
         &[Tool::Eyedropper, Tool::Ruler, Tool::Note, Tool::Count],
     ],
     &[
         &[Tool::SpotHealing, Tool::Healing],
-        &[Tool::Brush],
+        &[Tool::Brush, Tool::PixelBrush, Tool::SaiBrush],
+        &[Tool::Linework],
         &[Tool::CloneStamp],
         &[Tool::HistoryBrush],
         &[Tool::Eraser, Tool::BackgroundEraser, Tool::MagicEraser],
@@ -102,24 +103,31 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             let key = egui::Id::new(("tool-slot", slot_index));
                             slot_index += 1;
                             let tool = slot_tool(ui, app.ui.tool, slot, key);
-                            let sel = slot.contains(&app.ui.tool);
-                            let tip = if tool.key() == '\0' { tool.label().to_string() } else { format!("{}  ({})", tool.label(), tool.key()) };
+                            let plugins = crate::brush_plugin_ui::tools_for_slot(slot);
+                            let plugin_sel = app.ui.tool == Tool::Plugin && plugins.iter().any(|(id, _)| Some(id) == app.ui.plugin_tool.as_ref());
+                            let sel = slot.contains(&app.ui.tool) || plugin_sel;
+                            let many = slot.len() + plugins.len() > 1;
+                            let tip = match crate::brush_plugin_ui::current_name(&app.ui).filter(|_| plugin_sel) {
+                                Some(name) => name,
+                                None if tool.key() == '\0' => tool.label().to_string(),
+                                None => format!("{}  ({})", tool.label(), tool.key()),
+                            };
                             let resp = icons::button(ui, icons::tool_icon(tool), bx, sel, &tip);
-                            if slot.len() > 1 {
+                            if many {
                                 let r = resp.rect;
                                 let tri = vec![r.right_bottom() + vec2(-2.0, -2.0), r.right_bottom() + vec2(-6.0, -2.0), r.right_bottom() + vec2(-2.0, -6.0)];
                                 ui.painter().add(egui::Shape::convex_polygon(tri, t.text_faint, Stroke::NONE));
                             }
-                            if resp.clicked() {
+                            if resp.clicked() && !plugin_sel {
                                 app.ui.tool = tool;
                             }
                             // Right-click or long-press opens the flyout (Photoshop).
                             let long_press =
                                 resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.press_start_time().is_some_and(|t0| i.time - t0 > 0.35));
-                            if slot.len() > 1 && (resp.secondary_clicked() || long_press) {
+                            if many && (resp.secondary_clicked() || long_press) {
                                 ui.data_mut(|d| d.insert_temp(flyout_id, (key, resp.rect)));
                             }
-                            if slot.len() > 1 && long_press {
+                            if many && long_press {
                                 ui.ctx().request_repaint();
                             }
                             if let Some((open_key, anchor)) = ui.data(|d| d.get_temp::<(egui::Id, Rect)>(flyout_id))
@@ -174,6 +182,22 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                                                 }
                                                 if ir.clicked() {
                                                     app.ui.tool = item;
+                                                    ui.data_mut(|d| d.remove::<(egui::Id, Rect)>(flyout_id));
+                                                }
+                                            }
+                                            // Brush plug-ins whose manifest puts them in this slot.
+                                            for (id, name) in &plugins {
+                                                let (r, ir) = ui.allocate_exact_size(vec2(fw, 26.0), Sense::click());
+                                                if ir.hovered() {
+                                                    ui.painter().rect_filled(r, 3.0, t.hover);
+                                                }
+                                                if app.ui.tool == Tool::Plugin && app.ui.plugin_tool.as_ref() == Some(id) {
+                                                    ui.painter().rect_filled(Rect::from_center_size(pos2(r.left() + 8.0, r.center().y), vec2(4.0, 4.0)), 0.0, t.text);
+                                                }
+                                                icons::paint(ui, Rect::from_center_size(pos2(r.left() + 26.0, r.center().y), vec2(18.0, 18.0)), icons::tool_icon(slot[0]), 14.0, t.icon);
+                                                ui.painter().text(pos2(r.left() + 42.0, r.center().y), Align2::LEFT_CENTER, name, egui::FontId::proportional(12.5), t.text);
+                                                if ir.clicked() {
+                                                    crate::brush_plugin_ui::select(app, id);
                                                     ui.data_mut(|d| d.remove::<(egui::Id, Rect)>(flyout_id));
                                                 }
                                             }
@@ -366,9 +390,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if crate::distort_ui::options_bar(app, ui) {
                     return;
                 }
+                crate::paint_mouse::sync_tool_smoothing(app);
                 let tool = app.ui.tool;
                 // Brush edits here go through `tools.setBrush`, one journal entry per gesture (Rule 1).
-                if (tool.is_brushlike() && !matches!(tool, Tool::Brush | Tool::Eraser)) || tool == Tool::QuickSelection {
+                if (tool.is_brushlike() && !matches!(tool, Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser | Tool::Plugin)) || tool == Tool::QuickSelection {
                     let before = app.session.tools.brush.clone();
                     let mut b = before.clone();
                     brush_preset_chip(ui, &mut b);
@@ -419,6 +444,41 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             b.pressure_size = !b.pressure_size;
                         }
                         let _ = icons::button(ui, "arrow-left-right", 24.0, false, "Set painting symmetry options");
+                    }
+                    Tool::Linework => crate::linework_ui::options_bar(app, ui),
+                    Tool::SaiBrush => {
+                        brush_preset_chip(ui, b);
+                        opt_label(ui, "Size");
+                        widgets::value_field(ui, &mut b.size, 1.0..=2500.0, "px", 66.0);
+                        opt_label(ui, "Density");
+                        let mut o = b.opacity * 100.0;
+                        if widgets::value_field(ui, &mut o, 0.0..=100.0, "", 46.0).changed() {
+                            b.opacity = o / 100.0;
+                        }
+                        widgets::vline(ui, 22.0);
+                        crate::sai_ui::options_bar(app, ui);
+                    }
+                    Tool::PixelBrush => {
+                        opt_label(ui, "Size");
+                        if widgets::value_field(ui, &mut b.size, 1.0..=256.0, "px", 66.0).changed() {
+                            b.size = b.size.round().max(1.0);
+                        }
+                        opt_label(ui, "Opacity");
+                        let mut o = b.opacity * 100.0;
+                        if widgets::value_field(ui, &mut o, 0.0..=100.0, "%", 62.0).changed() {
+                            b.opacity = o / 100.0;
+                        }
+                        widgets::vline(ui, 22.0);
+                        widgets::checkbox(ui, &mut app.ui.tool_options.pixel_perfect, "Pixel Perfect");
+                        opt_label(ui, "Smoothing");
+                        smoothing_field(ui, b, 58.0);
+                    }
+                    Tool::Plugin => {
+                        if crate::brush_plugin_ui::has_preset_chip(&app.ui) {
+                            brush_preset_chip(ui, b);
+                            widgets::vline(ui, 22.0);
+                        }
+                        crate::brush_plugin_ui::options_bar(&mut app.ui, ui, b);
                     }
                     Tool::Brush | Tool::Eraser => {
                         opt_label(ui, "Size");
@@ -489,6 +549,24 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
                         }
                     }
+                    Tool::MagneticLasso => {
+                        selection_mode_buttons(app, ui);
+                        widgets::vline(ui, 22.0);
+                        widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
+                        opt_label(ui, "Width");
+                        widgets::value_field(ui, &mut app.ui.tool_options.magnetic_width, 1.0..=256.0, "px", 58.0);
+                        opt_label(ui, "Contrast");
+                        widgets::value_field(ui, &mut app.ui.tool_options.magnetic_contrast, 1.0..=100.0, "%", 58.0);
+                        opt_label(ui, "Frequency");
+                        widgets::value_field(ui, &mut app.ui.tool_options.magnetic_frequency, 0.0..=100.0, "", 52.0);
+                        widgets::vline(ui, 22.0);
+                        if widgets::secondary_button(ui, "Select and Mask…", 0.0).clicked() {
+                            let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
+                        }
+                        if crate::magnetic_ui::active(app) {
+                            hint(ui, "Click adds an anchor · ↵, double-click or the first anchor closes · ⌫ removes · Esc cancels");
+                        }
+                    }
                     Tool::Lasso | Tool::PolygonLasso if t.pro => {
                         selection_mode_buttons(app, ui);
                         widgets::vline(ui, 22.0);
@@ -500,7 +578,34 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
                         }
                         if app.ui.tool == Tool::PolygonLasso && !app.ui.polygon.is_empty() {
-                            hint(ui, "Click the first point or press ↵ to close · Esc cancels");
+                            hint(ui, "Click the first point, double-click or press ↵ to close · ⌫ removes the last point · Esc cancels");
+                        } else if app.ui.tool == Tool::Lasso {
+                            hint(ui, "Hold ⌥ while dragging for straight segments");
+                        }
+                    }
+                    Tool::ObjectSelection => {
+                        photocraft_engine::ai_select::warm();
+                        selection_mode_buttons(app, ui);
+                        widgets::vline(ui, 22.0);
+                        opt_label(ui, "Mode");
+                        let mut lasso = u8::from(app.ui.tool_options.object_lasso);
+                        if widgets::dropdown(ui, "object-shape", &mut lasso, &[(0u8, "Rectangle"), (1, "Lasso")], 96.0) {
+                            app.ui.tool_options.object_lasso = lasso == 1;
+                        }
+                        if photocraft_engine::ai_select::available() {
+                            opt_label(ui, "Model");
+                            let models = [("birefnet".to_string(), "BiRefNet"), ("sam".to_string(), "EfficientSAM")];
+                            widgets::dropdown(ui, "object-model", &mut app.ui.tool_options.object_model, &models, 110.0);
+                        } else {
+                            hint(ui, "AI models not found: box only (GrabCut)");
+                        }
+                        widgets::checkbox(ui, &mut app.ui.tool_options.sample_all_layers, "Sample All Layers");
+                        widgets::vline(ui, 22.0);
+                        if widgets::secondary_button(ui, "Select Subject", 0.0).clicked() {
+                            let _ = app.run("select.subject", json!({}));
+                        }
+                        if widgets::secondary_button(ui, "Select and Mask…", 0.0).clicked() {
+                            let _ = crate::menus::invoke(app, ui.ctx(), "select.selectAndMask", json!({}));
                         }
                     }
                     Tool::MagicWand => {
@@ -510,7 +615,8 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         widgets::value_field(ui, &mut app.ui.tool_options.tolerance, 0.0..=255.0, "", 58.0);
                         widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
                         widgets::checkbox(ui, &mut app.ui.tool_options.contiguous, "Contiguous");
-                        widgets::checkbox(ui, &mut app.ui.tool_options.sample_all_layers, "Sample All Layers");
+                        opt_label(ui, "Sample");
+                        fill_sample_dropdown(ui, "wand-sample", &mut app.ui.tool_options.fill_sample);
                         widgets::vline(ui, 22.0);
                         if widgets::secondary_button(ui, "Select Subject", 0.0).clicked() {
                             let _ = app.run("select.subject", json!({}));
@@ -531,7 +637,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         widgets::value_field(ui, &mut app.ui.tool_options.tolerance, 0.0..=255.0, "", 58.0);
                         widgets::checkbox(ui, &mut app.ui.tool_options.anti_alias, "Anti-alias");
                         widgets::checkbox(ui, &mut app.ui.tool_options.contiguous, "Contiguous");
-                        widgets::checkbox(ui, &mut app.ui.tool_options.sample_all_layers, "All Layers");
+                        opt_label(ui, "Sample");
+                        fill_sample_dropdown(ui, "bucket-sample", &mut app.ui.tool_options.fill_sample);
+                        opt_label(ui, "Expand");
+                        widgets::value_field(ui, &mut app.ui.tool_options.bucket_expand, 0.0..=20.0, "px", 54.0);
                     }
                     Tool::Gradient if t.pro => {
                         gradient_swatch(ui, app.session.tools.foreground, app.session.tools.background);
@@ -666,6 +775,12 @@ fn opt_label(ui: &mut egui::Ui, s: &str) {
     let t = Tokens::get(ui.ctx());
     let text = if t.pro && !s.ends_with(':') { format!("{s}:") } else { s.to_string() };
     ui.label(RichText::new(text).color(t.text_dim));
+}
+
+/// Magic Wand / Paint Bucket sample source (SAI: Reference = the layers marked as reference).
+fn fill_sample_dropdown(ui: &mut egui::Ui, id: &str, v: &mut String) {
+    let opts = [("layer".to_string(), "Current Layer"), ("reference".to_string(), "Reference Layers"), ("all".to_string(), "All Layers")];
+    widgets::dropdown(ui, id, v, &opts, 120.0);
 }
 
 fn hint(ui: &mut egui::Ui, s: &str) {
@@ -1206,6 +1321,7 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 }
                 crate::smart_ui::filter_rows(app, ui, l, depth, &mut actions);
             }
+            layer_drag_autoscroll(ui);
         });
     // End any layer drag after every row has had a chance to accept the drop.
     if ctx.input(|i| i.pointer.any_released()) {
@@ -1496,7 +1612,8 @@ fn draw_layer_thumb(app: &mut PhotocraftApp, ctx: &egui::Context, ui: &egui::Ui,
     match &l.content {
         LayerContent::Adjustment(_) | LayerContent::Group(_) => {
             p.rect_filled(rect, 6.0, t.field);
-            let icon = if l.is_group() { "folder" } else { "contrast" };
+            let sugimori = l.children().is_some_and(|c| c.iter().any(|c| c.role.is_some()));
+            let icon = if sugimori { "palette" } else if l.is_group() { "folder" } else { "contrast" };
             icons::paint(ui, rect, icon, 18.0, t.icon);
         }
         LayerContent::Text(_) => {
@@ -2070,7 +2187,8 @@ fn layer_drag_and_drop(ctx: &egui::Context, ui: &egui::Ui, l: &Layer, rect: Rect
         return;
     }
     let Some(p) = pointer else { return };
-    if !rect.contains(p) {
+    // Rows scrolled out of the list are still laid out: only the visible part takes the drop.
+    if !rect.contains(p) || !ui.clip_rect().contains(p) {
         return;
     }
     let f = (p.y - rect.top()) / rect.height();
@@ -2096,6 +2214,34 @@ fn layer_drag_and_drop(ctx: &egui::Context, ui: &egui::Ui, l: &Layer, rect: Rect
     if released {
         actions.push(("layer.moveTo".into(), json!({"layer": dragged, "target": l.id.0, "position": position})));
     }
+}
+
+/// While a layer is dragged, holding the pointer near the top or bottom edge of the list, or past
+/// it, scrolls the list until the drop: slowly at the edge, faster the further out the pointer is,
+/// so a long stack can be crossed quickly. Keeps repainting while the pointer rests there.
+fn layer_drag_autoscroll(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    if ctx.data(|d| d.get_temp::<u64>(egui::Id::new("layer-drag"))).is_none() {
+        return;
+    }
+    let Some(p) = ctx.input(|i| i.pointer.interact_pos()) else { return };
+    let clip = ui.clip_rect();
+    if p.x < clip.left() - 60.0 || p.x > clip.right() + 60.0 {
+        return;
+    }
+    const ZONE: f32 = 32.0;
+    // Positive = towards the top of the stack.
+    let depth = if p.y < clip.top() + ZONE {
+        clip.top() + ZONE - p.y
+    } else if p.y > clip.bottom() - ZONE {
+        -(p.y - (clip.bottom() - ZONE))
+    } else {
+        return;
+    };
+    let speed = (150.0 + depth.abs() * 40.0).min(8000.0) * depth.signum();
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
+    ui.scroll_with_delta(vec2(0.0, speed * dt));
+    ctx.request_repaint();
 }
 
 /// Photoshop shows a layer's effects as indented sub-rows ("Effects", then each effect).

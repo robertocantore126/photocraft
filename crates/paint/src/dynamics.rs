@@ -588,6 +588,75 @@ pub struct DabGenerator {
     builder: DabBuilder,
     dual: Option<DualBuilder>,
     scratch: Vec<StrokePoint>,
+    grid: PixelGrid,
+}
+
+/// Pixel brush post-pass over the primary dabs: snaps them to the pixel grid, drops repeats of
+/// the same pixel and, with Pixel Perfect at 1 px, removes the middle pixel of L-shaped corners
+/// (one pixel is held back until the next shows where the line turns; `flush` releases it).
+#[derive(Clone, Debug, Default)]
+struct PixelGrid {
+    snap: bool,
+    perfect: bool,
+    pending: Vec<Dab>,
+    last: Option<(i32, i32)>,
+}
+
+impl PixelGrid {
+    fn new(brush: &BrushSettings) -> Self {
+        Self { snap: brush.pixel_snap, perfect: brush.pixel_snap && brush.pixel_perfect, ..Default::default() }
+    }
+
+    fn pixel(d: &Dab) -> (i32, i32) {
+        (d.center.x.floor() as i32, d.center.y.floor() as i32)
+    }
+
+    fn snap_dab(d: &mut Dab) {
+        let size = (d.radius * 2.0).round().max(1.0);
+        let odd = (size as i64) % 2 == 1;
+        let f = |v: f64| if odd { v.floor() + 0.5 } else { v.round() };
+        d.center = Point::new(f(d.center.x), f(d.center.y));
+        d.radius = size / 2.0;
+    }
+
+    /// Rewrites the dabs appended to `dabs` since `from`.
+    fn process(&mut self, dabs: &mut Vec<Dab>, from: usize) {
+        if !self.snap || from >= dabs.len() {
+            return;
+        }
+        let new: Vec<Dab> = dabs.drain(from..).collect();
+        for mut d in new {
+            Self::snap_dab(&mut d);
+            let px = Self::pixel(&d);
+            if self.pending.last().map(Self::pixel).or(self.last) == Some(px) {
+                continue;
+            }
+            if !self.perfect || d.radius > 0.5 {
+                self.last = Some(px);
+                dabs.push(d);
+                continue;
+            }
+            self.pending.push(d);
+            if self.pending.len() == 3 {
+                let (a, b, c) = (Self::pixel(&self.pending[0]), Self::pixel(&self.pending[1]), Self::pixel(&self.pending[2]));
+                let diagonal = (a.0 - c.0).abs() == 1 && (a.1 - c.1).abs() == 1;
+                let elbow = (b.0 == a.0 || b.1 == a.1) && (b.0 == c.0 || b.1 == c.1);
+                if diagonal && elbow {
+                    self.pending.remove(1);
+                }
+                let first = self.pending.remove(0);
+                self.last = Some(Self::pixel(&first));
+                dabs.push(first);
+            }
+        }
+    }
+
+    fn flush(&mut self, dabs: &mut Vec<Dab>) {
+        for d in self.pending.drain(..) {
+            self.last = Some(Self::pixel(&d));
+            dabs.push(d);
+        }
+    }
 }
 
 impl DabGenerator {
@@ -601,6 +670,7 @@ impl DabGenerator {
             builder: DabBuilder::new(brush),
             dual: dual_on.then(|| DualBuilder::new(brush)),
             scratch: Vec::new(),
+            grid: PixelGrid::new(brush),
         }
     }
 
@@ -627,6 +697,12 @@ impl DabGenerator {
 
     /// Feed input points; appends the new primary and dual dabs.
     pub fn push(&mut self, pts: &[StrokePoint], dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
+        let from = dabs.len();
+        self.push_raw(pts, dabs, dual);
+        self.grid.process(dabs, from);
+    }
+
+    fn push_raw(&mut self, pts: &[StrokePoint], dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
         let mut sm = std::mem::take(&mut self.scratch);
         sm.clear();
         for p in pts {
@@ -638,6 +714,13 @@ impl DabGenerator {
 
     /// End of stroke.
     pub fn finish(&mut self, dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
+        let from = dabs.len();
+        self.finish_raw(dabs, dual);
+        self.grid.process(dabs, from);
+        self.grid.flush(dabs);
+    }
+
+    fn finish_raw(&mut self, dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
         let mut sm = Vec::new();
         self.smoother.finish(&mut sm);
         self.walk(&sm, dabs, dual);

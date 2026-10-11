@@ -1,9 +1,11 @@
 //! Paint helpers: Paint Bucket and Gradient tool.
 
-use photocraft_algo::paint::{GradientShape, bucket_fill, bucket_fill_src, paint_gradient};
+use photocraft_algo::paint::{GradientShape, bucket_fill, bucket_fill_src, fill_region, paint_gradient};
+use photocraft_algo::selection as sel;
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, blend_from_str};
+use crate::selection_cmds::{Sample, sample_param, sample_source_rgba8};
 use crate::{EngineError, Result, Session};
 
 fn f(p: &Value, k: &str, d: f32) -> f32 {
@@ -50,6 +52,13 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         None
     };
+    // SAI-style: sample other layers (reference / all) and/or grow the fill under the line art.
+    let sample = sample_param(p);
+    let expand = f(p, "expand", 0.0).max(0.0);
+    if pattern.is_none() && (sample != Sample::Layer || expand > 0.0) {
+        let filled = sampled_fill(s, "Paint Bucket", p, (x, y), (tol, contiguous, aa), c, opacity, sample, expand)?;
+        return Ok(json!({ "filled": filled }));
+    }
     let filled = s.edit("Paint Bucket", |doc, active| {
         let area = doc.bounds();
         let sel = doc.selection.clone();
@@ -68,6 +77,61 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
         surf.prune();
         Ok(ok)
     })?;
+    Ok(json!({ "filled": filled }))
+}
+
+/// Flood-fills the region found at `seed` in the pixels `sample` names (magic-wand rules:
+/// `(tolerance, contiguous, anti_alias)`), grown by `expand` px, onto the target layer with
+/// `color`. The target keeps its transparency when it is locked.
+#[allow(clippy::too_many_arguments)]
+fn sampled_fill(
+    s: &mut Session,
+    label: &str,
+    p: &Value,
+    seed: (i32, i32),
+    (tol, contiguous, aa): (f32, bool, bool),
+    color: [f32; 4],
+    opacity: f32,
+    sample: Sample,
+    expand: f32,
+) -> Result<bool> {
+    let (area, img) = sample_source_rgba8(s, sample)?;
+    let region = sel::wand_region(&img, area, seed, tol, contiguous, aa);
+    drop(img);
+    let Some(region) = region else { return Ok(false) };
+    let region = sel::expand_region(&region, area, expand);
+    s.edit(label, |doc, active| {
+        let selection = doc.selection.clone();
+        let (surf, lock) = crate::channel_cmds::target_surface(doc, *active, p)?;
+        let ok = fill_region(surf, &region, color, opacity, selection.as_ref(), lock);
+        surf.prune();
+        Ok(ok)
+    })
+}
+
+/// Edit › Fill Foreground (Ctrl+F, SAI-style): fills the selection with the foreground colour;
+/// with no selection, fills the closed area at `x, y`, sampling the reference layers by default
+/// and growing the fill by `expand` px so it slips under the line art.
+fn fill_foreground(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = color(p.get("color"), s.tools.foreground);
+    let opacity = f(p, "opacity", 100.0) / 100.0;
+    if s.active().is_some_and(|d| d.doc.selection.is_some()) {
+        let c = [c[0], c[1], c[2], c[3] * opacity];
+        s.edit("Fill Foreground", |doc, active| {
+            let selection = doc.selection.clone();
+            let area = selection.as_ref().map(|m| m.content_bounds()).unwrap_or(doc.bounds());
+            let (surf, lock) = crate::channel_cmds::target_surface(doc, *active, p)?;
+            crate::pixels::fill_surface(surf, area, c, selection.as_ref(), lock);
+            Ok(())
+        })?;
+        return Ok(json!({ "filled": true }));
+    }
+    let (Some(x), Some(y)) = (p.get("x").and_then(Value::as_f64), p.get("y").and_then(Value::as_f64)) else {
+        return Err(EngineError::BadParams { cmd: "edit.fillForeground".into(), msg: "no selection: pass the point to fill (x, y)".into() });
+    };
+    let sample = if p.get("sample").is_some() || p.get("sampleAllLayers").is_some() { sample_param(p) } else { Sample::Reference };
+    let rules = (f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true));
+    let filled = sampled_fill(s, "Fill Foreground", p, (x.floor() as i32, y.floor() as i32), rules, c, opacity, sample, f(p, "expand", 1.0).max(0.0))?;
     Ok(json!({ "filled": filled }))
 }
 
@@ -115,7 +179,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Paint Bucket",
             menu: &[],
             shortcut: None,
-            params: r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"contents":"foreground|pattern"="foreground","color":"#rrggbb"=foreground,"pattern":id|name (contents=pattern),"scale":%=100,"angle":deg,"opacity":1..100=100,"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
+            params: r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"contents":"foreground|pattern"="foreground","color":"#rrggbb"=foreground,"pattern":id|name (contents=pattern),"scale":%=100,"angle":deg,"opacity":1..100=100,"sample":"layer|reference|all"="layer" (reference = layers marked as reference; sampleAllLayers:true = all),"expand":px=0 (grow the fill under line art),"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             enabled: crate::commands::has_paintable,
             run: bucket,
             journal: true,
@@ -129,6 +193,17 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"from":[x,y],"to":[x,y],"style":"linear|radial|angle|reflected|diamond"="linear","colors":["#rrggbb",…]? (evenly spaced),"gradient":preset name?,"stops":[[t,"#rrggbb"|"foreground"|"background"],…]?,"transparency":[[t,0..100],…]? (default: the current gradient, see gradient.presets.select),"reverse":bool=false,"dither":bool=true,"opacity":1..100=100,"mode":"normal|multiply|…"="normal","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             enabled: crate::commands::has_paintable,
             run: gradient,
+            journal: true,
+            job: None,
+        },
+        CommandSpec {
+            id: "edit.fillForeground",
+            label: "Fill Foreground",
+            menu: &["Edit"],
+            shortcut: Some("Cmd+F"),
+            params: r##"{"color":"#rrggbb"=foreground,"opacity":1..100=100,"x":px?,"y":px? (no selection: the closed area at this point),"sample":"layer|reference|all"="reference","tolerance":0..255=32,"expand":px=1,"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
+            enabled: crate::commands::has_paintable,
+            run: fill_foreground,
             journal: true,
             job: None,
         },

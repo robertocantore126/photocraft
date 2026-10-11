@@ -96,6 +96,8 @@ pub fn open(app: &mut PhotocraftApp) -> u64 {
     f.insert("midtonesLow".into(), json!(105.0));
     f.insert("midtonesHigh".into(), json!(150.0));
     f.insert("invert".into(), json!(false));
+    // Sample: the active layer alone (remembered between openings) or the whole image.
+    f.insert("sampleAllLayers".into(), json!(app.ui.tool_options.color_range_all_layers));
     f.insert("points".into(), json!([]));
     f.insert("subtractPoints".into(), json!([]));
     f.insert("__tool".into(), json!("sample"));
@@ -115,6 +117,10 @@ pub fn params(f: &Map<String, Value>) -> Value {
     let mut p = Map::new();
     p.insert("select".into(), json!(select));
     p.insert("invert".into(), json!(flag(f, "invert")));
+    // Out Of Gamut and the tones look at the image; colours can come from one layer.
+    if !c.tonal && select != "outOfGamut" {
+        p.insert("sampleAllLayers".into(), json!(flag(f, "sampleAllLayers")));
+    }
     if c.sampling {
         p.insert("fuzziness".into(), json!(num(f, "fuzziness", 40.0)));
         let (add, sub) = (points(f, "points"), points(f, "subtractPoints"));
@@ -148,6 +154,7 @@ pub fn params(f: &Map<String, Value>) -> Value {
 /// OK: run the command on the document (one history step).
 pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
     app.color_range = None;
+    app.ui.tool_options.color_range_all_layers = flag(f, "sampleAllLayers");
     app.run(COMMAND, params(f))
 }
 
@@ -327,6 +334,15 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
         let mut cur: &str = &select;
         if widgets::dropdown(ui, "color-range-select", &mut cur, SELECTS, 170.0) {
             f.insert("select".into(), json!(cur));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Sample:").color(t.text_dim));
+        let mut all = flag(f, "sampleAllLayers");
+        let layer = app.session.active().and_then(|d| d.active_layer.and_then(|id| d.doc.layer(id)).map(|l| l.name.clone())).unwrap_or_default();
+        let current = format!("Current Layer ({layer})");
+        if widgets::dropdown(ui, "color-range-sample", &mut all, &[(false, current.as_str()), (true, "All Layers")], 170.0) {
+            f.insert("sampleAllLayers".into(), json!(all));
         }
     });
     ui.add_space(4.0);
@@ -718,7 +734,7 @@ mod tests {
         let mut app = app_with_doc();
         let id = open(&mut app);
         let mut f = app.ui.dialog_mut(id).unwrap().fields.clone();
-        assert_eq!(params(&f), json!({"select": "sampledColors", "invert": false, "fuzziness": 40.0}));
+        assert_eq!(params(&f), json!({"select": "sampledColors", "invert": false, "sampleAllLayers": false, "fuzziness": 40.0}));
         // Localized needs a picked point.
         f.insert("localized".into(), json!(true));
         assert!(params(&f).get("localized").is_none());
@@ -727,7 +743,7 @@ mod tests {
         pick(&app, &mut f, [1.0, 1.0], egui::Modifiers::ALT);
         assert_eq!(
             params(&f),
-            json!({"select": "sampledColors", "invert": false, "fuzziness": 40.0, "points": [[3.0, 4.0], [39.0, 0.0]], "subtractPoints": [[1.0, 1.0]], "localized": true, "range": 100.0})
+            json!({"select": "sampledColors", "invert": false, "sampleAllLayers": false, "fuzziness": 40.0, "points": [[3.0, 4.0], [39.0, 0.0]], "subtractPoints": [[1.0, 1.0]], "localized": true, "range": 100.0})
         );
         f.insert("select".into(), json!("midtones"));
         f.insert("midtonesLow".into(), json!(160.0));
@@ -735,7 +751,7 @@ mod tests {
         f.insert("select".into(), json!("highlights"));
         assert_eq!(params(&f)["tonalRange"], json!(190.0));
         f.insert("select".into(), json!("cyans"));
-        assert_eq!(params(&f), json!({"select": "cyans", "invert": false}));
+        assert_eq!(params(&f), json!({"select": "cyans", "invert": false, "sampleAllLayers": false}));
         // Every Select entry is accepted by the engine.
         for (v, _) in SELECTS {
             f.insert("select".into(), json!(v));

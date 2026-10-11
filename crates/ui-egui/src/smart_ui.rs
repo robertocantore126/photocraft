@@ -10,6 +10,36 @@ use crate::{PhotocraftApp, icons};
 
 /// Smart-object badge in the bottom-right corner of a layer thumbnail.
 pub fn thumb_badge(ui: &egui::Ui, l: &Layer, thumb: Rect) {
+    if let Some(role) = &l.role {
+        // Sugimori set layers: a warm badge with the role's icon on the top-left corner.
+        use photocraft_doc::LayerRole as R;
+        let icon = match role {
+            R::SugiSketch => "pen-tool",
+            R::SugiLine => "spline",
+            R::SugiBase => "circle",
+            R::SugiColour => "droplet",
+            R::SugiPaper => "grid-3x3",
+            R::SugiSoftLine { .. } => "blend",
+        };
+        let r = Rect::from_min_size(pos2(thumb.left() - 3.0, thumb.top() - 3.0), vec2(13.0, 13.0));
+        ui.painter().circle_filled(r.center(), 6.5, Color32::from_rgb(214, 120, 60));
+        icons::paint(ui, r, icon, 9.0, Color32::WHITE);
+    }
+    if l.reference {
+        // SAI-style reference layer (sampled by Paint Bucket / Magic Wand "Reference Layers").
+        let t = Tokens::get(ui.ctx());
+        let r = Rect::from_min_size(pos2(thumb.left() - 2.0, thumb.bottom() - 9.0), vec2(11.0, 11.0));
+        ui.painter().rect_filled(r, 2.0, t.accent);
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "R", egui::FontId::proportional(8.5), egui::Color32::WHITE);
+    }
+    if l.linework.is_some() {
+        // SAI-style Linework layer.
+        let t = Tokens::get(ui.ctx());
+        let r = Rect::from_min_size(pos2(thumb.right() - 9.0, thumb.bottom() - 9.0), vec2(11.0, 11.0));
+        ui.painter().rect_filled(r, 2.0, t.field);
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
+        icons::paint(ui, r, "spline", 9.0, t.icon);
+    }
     if !matches!(l.content, LayerContent::Smart(_)) {
         return;
     }

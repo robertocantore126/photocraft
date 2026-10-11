@@ -389,6 +389,11 @@ pub struct BrushSettings {
     pub flip_y: bool,
     /// Pencil: no anti-aliasing (coverage is 0 or 1).
     pub aliased: bool,
+    /// Pixel brush: dab centres on the pixel grid and whole-pixel diameters, so an aliased tip
+    /// lands on the same pixels wherever the stroke passes.
+    pub pixel_snap: bool,
+    /// Pixel Perfect (with `pixel_snap`, at 1 px): drop the middle pixel of L-shaped corners.
+    pub pixel_perfect: bool,
     // --- dynamics sections ---
     pub shape_dynamics: ShapeDynamics,
     pub scattering: Scattering,
@@ -437,6 +442,8 @@ impl Default for BrushSettings {
             flip_x: false,
             flip_y: false,
             aliased: false,
+            pixel_snap: false,
+            pixel_perfect: false,
             shape_dynamics: ShapeDynamics::default(),
             scattering: Scattering::default(),
             texture: Texture::default(),

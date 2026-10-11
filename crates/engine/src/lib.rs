@@ -59,12 +59,19 @@ pub mod presets;
 pub mod print_cmds;
 pub mod proof_sim;
 pub mod render_cmds;
+pub mod linework_cmds;
 pub mod retouch_cmds;
+pub mod sugimori_cmds;
+pub mod sai_textures;
 pub mod select_extra_cmds;
 pub mod selection_cmds;
 pub mod slice_cmds;
 pub mod smart_cmds;
 pub mod smartselect_cmds;
+pub mod ai_select;
+pub mod brush_plugins;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod brush_script;
 pub mod snap;
 mod timeline_cmds;
 pub mod transform_cmds;
@@ -255,6 +262,9 @@ pub struct ToolState {
     /// The coalescing key of the running `tools.setBrush` gesture and the brush before it, so the
     /// gesture journals as one call ([`brush_cmds::coalesce_journal`]).
     pub brush_gesture: Option<(String, photocraft_paint::BrushSettings)>,
+    /// SAI brush shape maps and textures by name (`paint.stroke` `"sai": {"shape", "texture"}`),
+    /// loaded by the app from the user's texture folder ([`sai_textures`]).
+    pub sai_textures: std::collections::BTreeMap<String, std::sync::Arc<photocraft_paint::GrayTile>>,
 }
 
 impl Default for ToolState {
@@ -271,6 +281,7 @@ impl Default for ToolState {
             presets_rev: 0,
             mixer: Default::default(),
             brush_gesture: None,
+            sai_textures: Default::default(),
         }
     }
 }

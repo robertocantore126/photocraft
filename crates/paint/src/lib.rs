@@ -28,6 +28,7 @@ pub mod render;
 pub mod replace;
 pub mod retouch;
 pub mod rng;
+pub mod sai;
 pub mod tile;
 
 pub use brush::{
@@ -35,7 +36,7 @@ pub use brush::{
     Smoothing, Texture, TipShape, Transfer,
 };
 pub use mixer::MixerSettings;
-pub use render::{BrushContext, StrokeRenderer, render_stroke};
+pub use render::{BrushContext, PixelOp, PixelOpFn, StrokeRenderer, render_stroke};
 pub use tile::GrayTile;
 
 /// One input sample. Missing stylus data defaults to "mouse": full pressure, no tilt/rotation.

@@ -10,6 +10,7 @@ pub enum Tool {
     EllipseMarquee,
     Lasso,
     PolygonLasso,
+    MagneticLasso,
     MagicWand,
     Crop,
     Eyedropper,
@@ -17,6 +18,13 @@ pub enum Tool {
     Note,
     Count,
     Brush,
+    /// SAI-style Pixel (Binary) brush: aliased, on the pixel grid, Pixel Perfect at 1 px.
+    PixelBrush,
+    /// SAI-style Brush / Watercolor / Marker (`photocraft_paint::sai`).
+    SaiBrush,
+    /// SAI-style linework tools (Pen, Eraser, Curve, Line, Edit, Pressure, Weight, Color) on a
+    /// Linework layer (`linework_ui`).
+    Linework,
     Eraser,
     BackgroundEraser,
     MagicEraser,
@@ -47,15 +55,18 @@ pub enum Tool {
     CustomShape,
     Slice,
     SliceSelect,
+    /// A brush plug-in's tool (`UiState::plugin_tool` says which; `brush_plugin_ui`).
+    Plugin,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 42] = [
+    pub const ALL: [Tool; 47] = [
         Tool::Move,
         Tool::RectMarquee,
         Tool::EllipseMarquee,
         Tool::Lasso,
         Tool::PolygonLasso,
+        Tool::MagneticLasso,
         Tool::MagicWand,
         Tool::Crop,
         Tool::Eyedropper,
@@ -63,6 +74,9 @@ impl Tool {
         Tool::Note,
         Tool::Count,
         Tool::Brush,
+        Tool::PixelBrush,
+        Tool::SaiBrush,
+        Tool::Linework,
         Tool::Eraser,
         Tool::BackgroundEraser,
         Tool::MagicEraser,
@@ -93,6 +107,7 @@ impl Tool {
         Tool::CustomShape,
         Tool::Slice,
         Tool::SliceSelect,
+        Tool::Plugin,
     ];
 
     pub fn label(self) -> &'static str {
@@ -101,6 +116,10 @@ impl Tool {
             Tool::RectMarquee => "Rectangular Marquee Tool",
             Tool::EllipseMarquee => "Elliptical Marquee Tool",
             Tool::Brush => "Brush Tool",
+            Tool::PixelBrush => "Pixel Brush Tool",
+            Tool::SaiBrush => "SAI Brush Tool",
+            Tool::Linework => "Linework Tool",
+            Tool::Plugin => "Plug-in Tool",
             Tool::Eraser => "Eraser Tool",
             Tool::BackgroundEraser => "Background Eraser Tool",
             Tool::MagicEraser => "Magic Eraser Tool",
@@ -110,6 +129,7 @@ impl Tool {
             Tool::Count => "Count Tool",
             Tool::Lasso => "Lasso Tool",
             Tool::PolygonLasso => "Polygonal Lasso Tool",
+            Tool::MagneticLasso => "Magnetic Lasso Tool",
             Tool::MagicWand => "Magic Wand Tool",
             Tool::Crop => "Crop Tool",
             Tool::Slice => "Slice Tool",
@@ -146,7 +166,10 @@ impl Tool {
         matches!(
             self,
             Tool::Brush
+                | Tool::PixelBrush
+                | Tool::SaiBrush
                 | Tool::Eraser
+                | Tool::Plugin
                 | Tool::BackgroundEraser
                 | Tool::SpotHealing
                 | Tool::Healing
@@ -165,10 +188,10 @@ impl Tool {
         match self {
             Tool::Move => 'V',
             Tool::RectMarquee | Tool::EllipseMarquee => 'M',
-            Tool::Brush => 'B',
+            Tool::Brush | Tool::PixelBrush | Tool::SaiBrush => 'B',
             Tool::Eraser | Tool::BackgroundEraser | Tool::MagicEraser => 'E',
             Tool::Eyedropper | Tool::Ruler | Tool::Note | Tool::Count => 'I',
-            Tool::Lasso | Tool::PolygonLasso => 'L',
+            Tool::Lasso | Tool::PolygonLasso | Tool::MagneticLasso => 'L',
             Tool::MagicWand => 'W',
             Tool::Crop | Tool::Slice | Tool::SliceSelect => 'C',
             Tool::Gradient | Tool::PaintBucket => 'G',
@@ -178,7 +201,7 @@ impl Tool {
             Tool::SpotHealing | Tool::Healing => 'J',
             Tool::CloneStamp => 'S',
             Tool::HistoryBrush => 'Y',
-            Tool::Blur | Tool::Sharpen | Tool::Smudge => '\0',
+            Tool::Blur | Tool::Sharpen | Tool::Smudge | Tool::Plugin | Tool::Linework => '\0',
             Tool::Dodge | Tool::Burn | Tool::Sponge => 'O',
             Tool::QuickSelection | Tool::ObjectSelection => 'W',
             Tool::Pen => 'P',
@@ -227,6 +250,9 @@ pub struct Panels {
     /// Window › Brush Settings (F5): floating, like Photoshop's.
     #[serde(default)]
     pub brush_settings: bool,
+    /// Dedicated SAI painting and linework controls.
+    #[serde(default)]
+    pub sai_kit: bool,
     /// Window › Character / Paragraph: the Character | Paragraph dock group (#150).
     #[serde(default)]
     pub character: bool,
@@ -244,6 +270,7 @@ impl Default for Panels {
             options_bar: true,
             status_bar: true,
             brush_settings: false,
+            sai_kit: false,
             character: false,
         }
     }
@@ -306,6 +333,20 @@ pub struct ToolOptions {
     pub contiguous: bool,
     pub anti_alias: bool,
     pub sample_all_layers: bool,
+    /// Pixel Brush: remove L-shaped corners at 1 px.
+    pub pixel_perfect: bool,
+    /// SAI Brush options.
+    pub sai: crate::sai_ui::SaiOptions,
+    /// Linework tool: sub-tool id (`linework_ui::MODES`), width, pen pressure on width, and how
+    /// far (screen px) Pen points may stray before they are kept.
+    pub linework_mode: String,
+    pub linework_width: f32,
+    pub linework_pressure: bool,
+    pub linework_simplify: f32,
+    /// Magic Wand / Paint Bucket sample source: "layer" | "reference" | "all" (SAI-style).
+    pub fill_sample: String,
+    /// Paint Bucket: grow the fill by this many pixels (under anti-aliased line art).
+    pub bucket_expand: f32,
     pub feather: f32,
     /// linear | radial | angle | reflected | diamond
     pub gradient_style: String,
@@ -357,11 +398,11 @@ pub struct ToolOptions {
     #[serde(default = "one")]
     pub marquee_height: f32,
     /// Move tool: Auto-Select (with "layer" or "group" target) and Show Transform Controls.
-    #[serde(default)]
+    #[serde(default = "yes")]
     pub move_auto_select: bool,
     #[serde(default = "default_move_target")]
     pub move_target: String,
-    #[serde(default)]
+    #[serde(default = "yes")]
     pub move_show_transform: bool,
     /// Crop options bar: aspect ratio ("" = Ratio/unconstrained, "w:h", or "original") and
     /// Delete Cropped Pixels.
@@ -381,6 +422,43 @@ pub struct ToolOptions {
     /// Zoom tool › Scrubby Zoom: dragging left/right zooms continuously (else a zoom rectangle).
     #[serde(default = "yes")]
     pub zoom_scrubby: bool,
+    /// Object Selection: draw a lasso around the object instead of a box (a click always picks
+    /// the object under it), and the AI model ("birefnet" | "sam").
+    #[serde(default)]
+    pub object_lasso: bool,
+    /// Free Transform's chain (Photopea's Keep Aspect Ratio): on, corner drags scale
+    /// proportionally and ⇧ frees them; off, the reverse. Edge handles always scale one axis.
+    #[serde(default = "yes")]
+    pub transform_keep_ratio: bool,
+    /// Select › Color Range samples the whole image (else the active layer alone).
+    #[serde(default)]
+    pub color_range_all_layers: bool,
+    /// Magnetic Lasso: Width (px the edge is looked for around the pointer), Contrast (%) and
+    /// Frequency (0–100, how often anchors are set).
+    #[serde(default = "default_magnetic_width")]
+    pub magnetic_width: f32,
+    #[serde(default = "default_magnetic_contrast")]
+    pub magnetic_contrast: f32,
+    #[serde(default = "default_magnetic_frequency")]
+    pub magnetic_frequency: f32,
+    #[serde(default = "default_object_model")]
+    pub object_model: String,
+}
+
+fn default_magnetic_width() -> f32 {
+    10.0
+}
+
+fn default_magnetic_contrast() -> f32 {
+    10.0
+}
+
+fn default_magnetic_frequency() -> f32 {
+    57.0
+}
+
+fn default_object_model() -> String {
+    "birefnet".into()
 }
 
 fn yes() -> bool {
@@ -406,6 +484,14 @@ impl Default for ToolOptions {
             contiguous: true,
             anti_alias: true,
             sample_all_layers: false,
+            pixel_perfect: true,
+            sai: Default::default(),
+            linework_mode: "pen".into(),
+            linework_width: 3.0,
+            linework_pressure: true,
+            linework_simplify: 1.0,
+            fill_sample: "layer".into(),
+            bucket_expand: 0.0,
             feather: 0.0,
             gradient_style: "linear".into(),
             gradient_reverse: false,
@@ -438,9 +524,9 @@ impl Default for ToolOptions {
             marquee_style: default_marquee_style(),
             marquee_width: 1.0,
             marquee_height: 1.0,
-            move_auto_select: false,
+            move_auto_select: true,
             move_target: default_move_target(),
-            move_show_transform: false,
+            move_show_transform: true,
             crop_ratio: String::new(),
             crop_delete: true,
             magic_eraser_opacity: 100.0,
@@ -449,6 +535,13 @@ impl Default for ToolOptions {
             bg_tolerance: 50.0,
             bg_protect_fg: false,
             zoom_scrubby: true,
+            object_lasso: false,
+            transform_keep_ratio: true,
+            color_range_all_layers: false,
+            magnetic_width: default_magnetic_width(),
+            magnetic_contrast: default_magnetic_contrast(),
+            magnetic_frequency: default_magnetic_frequency(),
+            object_model: default_object_model(),
         }
     }
 }
@@ -545,12 +638,17 @@ pub struct UiState {
     /// Brush Preset picker opened by a right-click on the canvas: its screen position (points).
     #[serde(default)]
     pub brush_picker: Option<[f32; 2]>,
-    /// Smoothing is a per-tool option (Brush and Eraser each keep theirs): the tool whose
-    /// smoothing the session brush holds, and the other tools' saved values.
+    /// The brush is per tool (see `paint_mouse::sync_tool_smoothing`): the tool (and brush
+    /// plug-in) whose brush the session brush holds, and the other tools' saved brushes.
+    #[serde(skip)]
+    pub brush_tool: Option<(Tool, Option<String>)>,
+    #[serde(skip)]
+    pub tool_brushes: Vec<((Tool, Option<String>), photocraft_engine::paint::BrushSettings)>,
+    /// The brush plug-in `Tool::Plugin` paints with, and each plug-in's own option values.
     #[serde(default)]
-    pub smoothing_tool: Option<Tool>,
-    #[serde(default)]
-    pub tool_smoothing: Vec<(Tool, photocraft_engine::paint::brush::Smoothing)>,
+    pub plugin_tool: Option<String>,
+    #[serde(skip)]
+    pub plugin_values: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
     /// Pen path under construction.
     #[serde(default)]
     pub pen: Option<crate::vector_ui::PenPath>,
@@ -642,8 +740,10 @@ impl Default for UiState {
             transform: None,
             mask_target: false,
             brush_picker: None,
-            smoothing_tool: None,
-            tool_smoothing: Vec::new(),
+            brush_tool: None,
+            tool_brushes: Vec::new(),
+            plugin_tool: None,
+            plugin_values: Default::default(),
             clone_source: None,
             clone_offset: None,
             extras: Extras::default(),

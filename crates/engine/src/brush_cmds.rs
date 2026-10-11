@@ -9,6 +9,7 @@
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
 use photocraft_paint::mixer::{MixerSettings, apply_mixer_stroke};
+use photocraft_paint::sai::{SaiMaps, SaiPainter, SaiSettings};
 use photocraft_paint::replace::{Limits, ReplaceMode, ReplaceSettings, Sampling, apply_color_replacement};
 use photocraft_paint::{BrushPreset, BrushSettings, GrayTile, Stroke, StrokePoint, StrokeRenderer, TipShape, render_stroke};
 use photocraft_raster::Surface;
@@ -169,6 +170,22 @@ pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings>
     if let Some(v) = num(p, "smoothing") {
         b.smoothing.amount = v.clamp(0.0, 1.0);
     }
+    if flag(p, "pixel", false) {
+        // Pixel brush (SAI Binary): hard aliased tip on the pixel grid, whole-pixel sizes.
+        b.aliased = true;
+        b.hardness = 1.0;
+        b.pixel_snap = true;
+        b.pixel_perfect = flag(p, "pixelPerfect", true);
+        b.size = b.size.round().max(1.0);
+        b.spacing = b.spacing.min(0.25);
+        b.tip = TipShape::Round;
+        b.shape_dynamics.enabled = false;
+        b.scattering.enabled = false;
+        b.texture.enabled = false;
+        b.dual_brush.enabled = false;
+        b.noise = false;
+        b.wet_edges = false;
+    }
     b.color = color(p.get("color"), s.tools.foreground);
     b.background = s.tools.background;
     b.erase = flag(p, "erase", false);
@@ -213,6 +230,19 @@ fn erase_locked(brush: &mut BrushSettings, lock: bool, bg: [f32; 4]) {
 
 /// Stroke with a resolved brush onto the target layer (pixels or mask).
 fn stroke_with(s: &mut Session, p: &Value, label: &str, brush: BrushSettings, pts: Vec<StrokePoint>, auto_erase: bool) -> Result<Value> {
+    stroke_plugin(s, p, label, brush, pts, auto_erase, None)
+}
+
+/// [`stroke_with`], through a brush plug-in when one is given.
+fn stroke_plugin(
+    s: &mut Session,
+    p: &Value,
+    label: &str,
+    brush: BrushSettings,
+    pts: Vec<StrokePoint>,
+    auto_erase: bool,
+    plugin: Option<&crate::brush_plugins::StrokePlugin>,
+) -> Result<Value> {
     let bg = s.tools.background;
     let fg = brush.color;
     let (id, brush, zoom) = stroke_target(s, p, brush)?;
@@ -228,7 +258,16 @@ fn stroke_with(s: &mut Session, p: &Value, label: &str, brush: BrushSettings, pt
                 brush.color = bg;
             }
         }
-        Ok(render_stroke(surf, &brush, &pts, sel.as_ref(), lock, zoom))
+        Ok(match plugin {
+            Some(pl) => {
+                let pre = surf.clone();
+                let mut r = StrokeRenderer::new(&brush, Some(surf.format()), zoom).with_pixel_op(Some(pl.op(lock))).with_max_accumulate(pl.max);
+                r.push(&pts);
+                r.finish();
+                r.composite(&pre, surf, sel.as_ref(), lock, true)
+            }
+            None => render_stroke(surf, &brush, &pts, sel.as_ref(), lock, zoom),
+        })
     })?;
     Ok(damage_json(s, dmg))
 }
@@ -248,8 +287,42 @@ fn with_blend_mode(mut b: BrushSettings, p: &Value) -> BrushSettings {
 pub fn paint_stroke(s: &mut Session, p: &Value) -> Result<Value> {
     let pts = parse_points(p, "paint.stroke")?;
     let brush = with_blend_mode(resolve_brush(s, p, "paint.stroke")?, p);
+    if let Some(pl) = crate::brush_plugins::StrokePlugin::from_params(s, p)? {
+        let brush = pl.shape_brush(brush, p);
+        let label = pl.plugin.manifest().name.trim_end_matches(" Tool").to_string();
+        return stroke_plugin(s, p, &label, brush, pts, false, Some(&pl));
+    }
+    if !brush.erase
+        && let Some((st, maps)) = sai_params(s, p)
+    {
+        return sai_stroke(s, p, brush, pts, st, maps);
+    }
     let label = if brush.erase { "Eraser" } else { "Brush Tool" };
     stroke_with(s, p, label, brush, pts, false)
+}
+
+/// SAI brush options and maps from the `"sai"` param (`None`: a normal brush stroke).
+fn sai_params(s: &Session, p: &Value) -> Option<(SaiSettings, SaiMaps)> {
+    let v = p.get("sai").filter(|v| v.is_object())?;
+    let settings: SaiSettings = serde_json::from_value(v.clone()).unwrap_or_default();
+    let map = |k: &str| v.get(k).and_then(Value::as_str).and_then(|n| s.tools.sai_textures.get(n).cloned());
+    Some((settings, SaiMaps { shape: map("shape"), texture: map("texture") }))
+}
+
+/// A SAI-style stroke (Brush / Watercolor / Marker, `photocraft_paint::sai`).
+fn sai_stroke(s: &mut Session, p: &Value, brush: BrushSettings, pts: Vec<StrokePoint>, st: SaiSettings, maps: SaiMaps) -> Result<Value> {
+    let (id, brush, zoom) = stroke_target(s, p, brush)?;
+    let label = p.get("label").and_then(Value::as_str).unwrap_or("SAI Brush").to_string();
+    let dmg = s.edit(&label, |doc, _| {
+        let sel = doc.selection.clone();
+        let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
+        let mut painter = SaiPainter::new(&brush, &st, maps, zoom);
+        let a = painter.push(&pts, surf, sel.as_ref(), lock);
+        let b = painter.finish(surf, sel.as_ref(), lock);
+        surf.prune();
+        Ok(a.union(&b))
+    })?;
+    Ok(damage_json(s, dmg))
 }
 
 /// A `paint.stroke` rendered while it is drawn, onto a copy of the active document, so the canvas
@@ -268,6 +341,8 @@ pub struct LiveStroke {
     params: Value,
     /// Where the doc shows the stroke's end as finishing it would draw it (see `push`).
     tail: Rect,
+    /// A SAI-style stroke paints through this instead of `renderer`.
+    sai: Option<SaiPainter>,
 }
 
 impl LiveStroke {
@@ -281,22 +356,33 @@ impl LiveStroke {
         has_paintable(s).map_err(EngineError::Other)?;
         let pts = parse_points(p, "paint.stroke")?;
         let brush = with_blend_mode(resolve_brush(s, p, "paint.stroke")?, p);
+        let plugin = crate::brush_plugins::StrokePlugin::from_params(s, p)?;
+        let brush = match &plugin {
+            Some(pl) => pl.shape_brush(brush, p),
+            None => brush,
+        };
         let seed = brush.seed;
         let (layer, mut brush, zoom) = stroke_target(s, p, brush)?;
         let mut doc = (*s.active().ok_or(EngineError::NoDocument)?.doc).clone();
         let sel = doc.selection.clone();
         let (surf, lock) = crate::channel_cmds::target_surface(&mut doc, layer, p)?;
         erase_locked(&mut brush, lock, s.tools.background);
-        let renderer = StrokeRenderer::new(&brush, Some(surf.format()), zoom);
+        let renderer = StrokeRenderer::new(&brush, Some(surf.format()), zoom)
+            .with_pixel_op(plugin.as_ref().map(|pl| pl.op(lock)))
+            .with_max_accumulate(plugin.as_ref().is_some_and(|pl| pl.max));
         let pre = surf.clone();
-        let mut live = Self { doc: std::sync::Arc::new(doc), seed, renderer, pre, sel, lock, layer, params: p.clone(), tail: Rect::EMPTY };
+        let sai = if brush.erase { None } else { sai_params(s, p).map(|(st, maps)| SaiPainter::new(&brush, &st, maps, zoom)) };
+        let mut live = Self { doc: std::sync::Arc::new(doc), seed, renderer, pre, sel, lock, layer, params: p.clone(), tail: Rect::EMPTY, sai };
         live.push(&pts)?;
         Ok(live)
     }
 
     /// Everything the stroke has touched so far.
     pub fn bounds(&self) -> Rect {
-        self.renderer.bounds().union(&self.tail)
+        match &self.sai {
+            Some(sp) => sp.bounds(),
+            None => self.renderer.bounds().union(&self.tail),
+        }
     }
 
     /// Render more points; returns the rectangle that changed. The doc shows the stroke as
@@ -304,6 +390,10 @@ impl LiveStroke {
     /// when the stroke ends, so that catch-up tail is drawn too (and redrawn on every step), and
     /// nothing new appears on release.
     pub fn push(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
+        if let Some(sp) = self.sai.as_mut() {
+            let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
+            return Ok(sp.push(pts, surf, self.sel.as_ref(), self.lock));
+        }
         self.renderer.push(pts);
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
         let mut dmg = Rect::EMPTY;

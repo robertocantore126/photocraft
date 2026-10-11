@@ -201,7 +201,7 @@ fn noise_is_deterministic_monochrome_and_centred() {
     for px in v.as_chunks::<4>().0 {
         assert_eq!(px[0], px[1]);
         assert_eq!(px[1], px[2]);
-        assert!((px[0] - 0.5).abs() <= 0.25 + 1e-6);
+        assert!((px[0] - 0.5).abs() <= 0.5 + 1e-6);
         mean += px[0];
     }
     mean /= (v.len() / 4) as f32;

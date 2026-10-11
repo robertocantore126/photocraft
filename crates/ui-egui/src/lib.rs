@@ -54,6 +54,8 @@ pub mod layer_style;
 pub mod layer_tree_ui;
 pub mod links;
 pub mod liquify_ui;
+pub mod brush_plugin_ui;
+pub mod magnetic_ui;
 pub mod mask_thumbs_ui;
 pub mod menu_catalog;
 pub mod menu_nav;
@@ -76,6 +78,8 @@ pub mod proxy;
 pub mod puppet_ui;
 pub mod retouch_ui;
 pub mod rulers;
+pub mod sai_ui;
+pub mod linework_ui;
 pub mod shortcut_dispatch;
 pub mod shortcuts;
 mod sizing;
@@ -306,6 +310,10 @@ pub struct PhotocraftApp {
     pub(crate) doc_hist: Option<(DocId, u64, f64, std::sync::Arc<tone::Histograms>)>,
     /// Free Transform preview (document without the moving pixels + their texture).
     pub(crate) transform_preview: Option<transform_tool::TransformPreview>,
+    /// Magnetic Lasso path in progress (`magnetic_ui`).
+    pub(crate) magnetic: Option<magnetic_ui::Magnetic>,
+    /// The brush plug-in folder watch (`brush_plugin_ui`).
+    pub(crate) plugin_watch: brush_plugin_ui::Watch,
     /// Move-tool ⇧/⌥ drag state (move_mods).
     pub(crate) move_mods: move_mods::MoveDrag,
     /// Live Layer Style dialog preview: (key over revision + style fields, document with the style applied).
@@ -326,6 +334,12 @@ pub struct PhotocraftApp {
     pub(crate) clip_read_for_paste: bool,
     /// Pointer position over the canvas (document px), for the Info panel and status bar.
     pub(crate) hover_doc: Option<[f64; 2]>,
+    /// The SAI Brush texture folder was read (`sai_ui::ensure_textures`).
+    pub(crate) sai_textures_scanned: bool,
+    /// The layer `sai_ui::follow_role` last looked at.
+    pub(crate) sai_role_layer: Option<u64>,
+    /// Linework tool gesture in progress.
+    pub(crate) linework: crate::linework_ui::LineworkUi,
     /// Info panel sample cache: ((x, y, revision), composite RGBA).
     info_sample: Option<((i32, i32, u64), [f32; 4])>,
     /// Guide being dragged (from a ruler or with the Move tool).
@@ -403,11 +417,16 @@ impl PhotocraftApp {
             guide_drag: None,
             crop: Default::default(),
             hover_doc: None,
+            sai_textures_scanned: false,
+            sai_role_layer: None,
+            linework: Default::default(),
             info_sample: None,
             os_clip_sig: None,
             clip_external: false,
             clip_read_for_paste: false,
             transform_preview: None,
+            magnetic: None,
+            plugin_watch: Default::default(),
             move_mods: Default::default(),
             style_preview: None,
             distort: Default::default(),
@@ -809,6 +828,7 @@ impl eframe::App for PhotocraftApp {
         // The job windows use the theme's named fonts, which exist only from the second frame.
         if self.fonts_ready {
             self.poll_jobs(ctx);
+            brush_plugin_ui::poll(self, ctx);
         }
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame_time) as f32;
@@ -834,6 +854,13 @@ impl eframe::App for PhotocraftApp {
             && self.session.active().and_then(|s| s.doc.layer(photocraft_doc::LayerId(t.layer))).is_none()
         {
             transform_tool::cancel(self);
+        }
+        // Picking another tool, or another layer in the Layers panel, applies the transform.
+        if let Some(pv) = &self.transform_preview
+            && self.ui.transform.is_some()
+            && (pv.tool != self.ui.tool || pv.active_layer != self.session.active().and_then(|s| s.active_layer))
+        {
+            transform_tool::commit(self);
         }
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
@@ -916,6 +943,7 @@ impl eframe::App for PhotocraftApp {
         split(&mut self.perf, "ui:canvas");
         panels::properties_window(self, &ctx);
         brush_panel::window(self, &ctx);
+        sai_ui::window(self, &ctx);
         preset_panels::windows(self, &ctx);
         type_panels_ui::windows(self, &ctx);
         analysis_ui::windows(self, &ctx);

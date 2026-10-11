@@ -226,7 +226,10 @@ fn report_differences(a: &photocraft_doc::Document, b: &photocraft_doc::Document
                 link_group,
                 excluded_channels,
                 blend_if,
-                video
+                video,
+                reference,
+                linework,
+                role
             );
             match (&l.content, &m.content) {
                 (photocraft_doc::LayerContent::Group(g), photocraft_doc::LayerContent::Group(h)) => {

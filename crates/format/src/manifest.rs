@@ -244,6 +244,15 @@ pub struct LayerM {
     pub blend_if: photocraft_doc::BlendIf,
     #[serde(default)]
     pub video: Option<VideoDataM>,
+    /// SAI-style reference layer (sampled by the Paint Bucket / Magic Wand "Reference" source).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reference: bool,
+    /// Linework layer strokes (the raster content is their rendering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linework: Option<photocraft_doc::Linework>,
+    /// Special layer role (Sugimori set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<photocraft_doc::LayerRole>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

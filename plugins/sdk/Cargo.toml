@@ -1,0 +1,8 @@
+[package]
+name = "fotox-plugin"
+description = "The plugin side of Fotox's brush plugins: the exports the host calls"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

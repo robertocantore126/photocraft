@@ -156,6 +156,30 @@ pub fn paint_gradient(
     );
 }
 
+/// Composites `color` over `area` weighted by `coverage(x, y)` (Normal blend). With
+/// `lock_transparency` the surface keeps its alpha (Preserve Opacity / Lock Transparency).
+pub fn fill_coverage(s: &mut Surface, area: Rect, coverage: impl Fn(i32, i32) -> f32 + Sync, color: [f32; 4], lock_transparency: bool) {
+    composite_area(s, area, BlendMode::Normal, coverage, |_, _| color, lock_transparency);
+}
+
+/// Fills an already computed region (e.g. a magic-wand region sampled from other layers) with
+/// `color`, limited by `selection`.
+pub fn fill_region(
+    s: &mut Surface,
+    region: &crate::selection::Region,
+    color: [f32; 4],
+    opacity: f32,
+    selection: Option<&Surface>,
+    lock_transparency: bool,
+) -> bool {
+    if region.bbox.is_empty() {
+        return false;
+    }
+    let cov = |x: i32, y: i32| region.at(x, y) * opacity * selection.map_or(1.0, |m| m.sample_channel(x, y, 0));
+    composite_area(s, region.bbox, BlendMode::Normal, cov, |_, _| color, lock_transparency);
+    true
+}
+
 /// Paint bucket: fills the region similar to the seed pixel (on the layer's
 /// own pixels) within `area`, respecting the selection.
 #[allow(clippy::too_many_arguments)]

@@ -1,0 +1,18 @@
+{
+  "id": "plain-eraser",
+  "name": "Plain Eraser (plugin)",
+  "slot": "eraser",
+  "icon": "i-eraser",
+  "color": "background",
+  "options": [
+    { "type": "brushpreset" },
+    { "type": "num", "text": "Size:", "value": "40", "unit": "px", "width": 40 },
+    { "type": "num", "text": "Hardness:", "value": "50", "unit": "%", "width": 40 },
+    { "type": "range", "text": "Opacity:", "value": 100 },
+    { "type": "toggle", "text": "Pressure for opacity", "on": false },
+    { "type": "range", "text": "Flow:", "value": 100 },
+    { "type": "num", "text": "Smoothing:", "value": "10", "unit": "%", "width": 36 },
+    { "type": "toggle", "text": "Pressure for size", "on": false }
+  ],
+  "params": []
+}

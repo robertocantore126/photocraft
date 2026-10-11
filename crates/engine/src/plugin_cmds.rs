@@ -219,9 +219,107 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(report)
 }
 
+/// Brush plug-ins loaded now (Fotox's ABI, `brush_plugins`).
+fn brush_list() -> Value {
+    let list: Vec<Value> = photocraft_plugins::brush::list()
+        .iter()
+        .map(|p| {
+            let m = p.manifest();
+            json!({"id": m.id, "name": m.name, "slot": m.slot, "params": m.params, "source": p.source(), "stopped": p.stopped()})
+        })
+        .collect();
+    json!({"plugins": list})
+}
+
+/// Edit › Brush Plug-ins › Reload: every `.wasm` and `.rs` in the folder, built and loaded again
+/// (a stopped plug-in starts fresh).
+#[cfg(not(target_arch = "wasm32"))]
+fn brush_reload(_: &mut Session, _: &Value) -> Result<Value> {
+    let dir = crate::brush_script::prepare().ok_or_else(|| EngineError::Other("no plug-in folder (APPDATA is not set)".into()))?;
+    let (mut loaded, mut failed) = crate::brush_plugins::load_folder(&dir);
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut scripts: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rs"))).collect();
+        scripts.sort();
+        for f in scripts {
+            let r = crate::brush_script::build(&f).and_then(|bytes| {
+                photocraft_plugins::brush::BrushPlugin::load(&bytes, photocraft_plugins::brush::BrushPlugin::default_limits()).map_err(|e| e.to_string())
+            });
+            match r {
+                Ok(p) => {
+                    loaded.push(p.manifest().name.clone());
+                    photocraft_plugins::brush::install(p.with_source(f.display().to_string()));
+                }
+                Err(e) => failed.push((f.display().to_string(), e)),
+            }
+        }
+    }
+    Ok(json!({"folder": dir.display().to_string(), "loaded": loaded, "failed": failed}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn brush_reload(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(EngineError::Other("brush plug-in folders are not available on the web".into()))
+}
+
+/// Edit › Brush Plug-ins › Open Plug-ins Folder: where `.wasm` and `.rs` brush plug-ins go (and
+/// `AI-PROMPT.md`, what to paste to an AI that writes one). `"open": false` only returns it.
+#[cfg(not(target_arch = "wasm32"))]
+fn brush_folder(_: &mut Session, p: &Value) -> Result<Value> {
+    let dir = crate::brush_script::prepare().ok_or_else(|| EngineError::Other("no plug-in folder (APPDATA is not set)".into()))?;
+    if p.get("open").and_then(Value::as_bool).unwrap_or(true) {
+        let opener = if cfg!(windows) {
+            "explorer"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let _ = std::process::Command::new(opener).arg(&dir).spawn();
+    }
+    Ok(json!({"folder": dir.display().to_string()}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn brush_folder(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(EngineError::Other("brush plug-in folders are not available on the web".into()))
+}
+
 /// The plug-in command specs.
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        CommandSpec {
+            id: "plugin.brush.list",
+            label: "List Brush Plug-ins",
+            menu: &[],
+            shortcut: None,
+            params: "{}",
+            enabled: always,
+            run: |_, _| Ok(brush_list()),
+            journal: false,
+            job: None,
+        },
+        CommandSpec {
+            id: "plugin.brush.reload",
+            label: "Reload Brush Plug-ins",
+            menu: &["Edit", "Brush Plug-ins"],
+            shortcut: None,
+            params: "{}",
+            enabled: always,
+            run: brush_reload,
+            journal: false,
+            job: None,
+        },
+        CommandSpec {
+            id: "plugin.brush.openFolder",
+            label: "Open Plug-ins Folder",
+            menu: &["Edit", "Brush Plug-ins"],
+            shortcut: None,
+            params: r##"{"open":bool=true}"##,
+            enabled: always,
+            run: brush_folder,
+            journal: false,
+            job: None,
+        },
         CommandSpec {
             id: "plugin.list",
             label: "List Plug-ins",

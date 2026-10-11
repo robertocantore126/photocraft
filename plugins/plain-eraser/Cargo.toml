@@ -1,0 +1,12 @@
+[package]
+name = "plain-eraser"
+description = "The smallest Fotox brush plugin: the Eraser, as a template and as the benchmark against the native one"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fotox-plugin = { path = "../sdk" }

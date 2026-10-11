@@ -100,6 +100,10 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 DialogKind::Command if crate::adjust_dialog::owns(&fields) => crate::adjust_dialog::body(app, ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__filter") => crate::filter_dialog::body(ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__form") => crate::view_cmds::form_body(ui, &mut fields),
+                DialogKind::Command if fields.contains_key("__message") => {
+                    ui.set_max_width(380.0);
+                    ui.label(fields.get("__message").and_then(Value::as_str).unwrap_or_default());
+                }
                 DialogKind::Command => {}
                 DialogKind::LayerStyle => crate::layer_style::body(ui, &mut fields),
                 DialogKind::Error => {

@@ -44,6 +44,9 @@ pub struct Drag {
     pub erase: bool,
     /// ⇧ constraint of a painting stroke (stroke_constraint.rs).
     pub constrain: Option<crate::stroke_constraint::Axis>,
+    /// Lasso with ⌥ held after the press: the point the straight segment starts from
+    /// (Photoshop's freehand ↔ polygon switch).
+    pub straight_from: Option<usize>,
 }
 
 /// A Brush/Eraser stroke shown while it is drawn: the engine renders the real dabs onto a copy of
@@ -81,7 +84,22 @@ fn live_stroke(app: &PhotocraftApp, idx: usize) -> Option<&LiveStroke> {
 /// `paint.stroke` params for a Brush/Eraser drag (shared by the live preview and the commit). The
 /// stroke smoothing is the session brush's (the options bar's Smoothing %).
 fn stroke_params(app: &PhotocraftApp, erase: bool, points: &[Vec<f64>]) -> serde_json::Value {
-    json!({ "points": points, "erase": erase, "zoom": app.current_zoom(), "target": paint_target(app) })
+    let mut p = json!({ "points": points, "erase": erase, "zoom": app.current_zoom(), "target": paint_target(app) });
+    if app.ui.tool == Tool::PixelBrush {
+        p["pixel"] = json!(true);
+        p["pixelPerfect"] = json!(app.ui.tool_options.pixel_perfect);
+    }
+    if app.ui.tool == Tool::SaiBrush {
+        p["sai"] = app.ui.tool_options.sai.params();
+    }
+    // A brush plug-in's tool paints through it (`brush_plugin_ui`).
+    if app.ui.tool == Tool::Plugin
+        && let (Some(o), Some(extra)) = (p.as_object_mut(), crate::brush_plugin_ui::stroke_params(&app.ui))
+        && let Some(e) = extra.as_object()
+    {
+        o.extend(e.clone());
+    }
+    p
 }
 
 fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
@@ -231,12 +249,19 @@ fn display_doc(app: &mut PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>
     if let Some(l) = live_stroke(app, idx) {
         return (l.stroke.doc.clone(), l.display_key());
     }
-    if let (Some(t), Some(pv)) = (&app.ui.transform, &app.transform_preview)
+    if let (Some(t), Some(_)) = (&app.ui.transform, &app.transform_preview)
         && app.session.active_index() == Some(idx)
         && st.doc.layer(photocraft_doc::LayerId(t.layer)).is_some()
     {
-        return (pv.doc.clone(), (1 << 40) + pv.session);
+        if let Some(shown) = crate::transform_tool::in_place_doc(app, idx) {
+            return shown;
+        }
+        let pv = app.transform_preview.as_ref().map(|pv| (pv.doc.clone(), (1 << 40) + pv.session));
+        if let Some(shown) = pv {
+            return shown;
+        }
     }
+    let st = &app.session.documents()[idx];
     // Layer Style dialog: show its effects live (Cancel just drops the preview).
     let style = app.ui.dialogs.iter().find(|d| d.kind == crate::state::DialogKind::LayerStyle);
     if style.is_none() {
@@ -643,6 +668,12 @@ fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), now: (u64, u6
     if seen.0 == now.0
         && let Some(st) = app.session.documents().get(idx)
         && let Some(r) = crate::adjust_preview::switch_region(app, st.doc.id, now.0, seen.1 ^ display_key, now.1)
+    {
+        return Some(r);
+    }
+    // Free Transform's in-place preview: what moved between its updates.
+    if seen.0 == now.0
+        && let Some(r) = crate::transform_tool::in_place_damage(app, seen.1 ^ display_key, now.1)
     {
         return Some(r);
     }
@@ -1568,6 +1599,14 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         if app.ui.transform.is_some() && response.double_clicked() {
             crate::transform_tool::commit(app);
         }
+        // A double-click closes the polygonal lasso (its second press added a point there).
+        if tool == Tool::PolygonLasso && response.double_clicked() && app.ui.polygon.len() >= 4 {
+            app.ui.polygon.pop();
+            commit_polygon(app, ui.input(|i| i.modifiers));
+        }
+        if tool == Tool::Linework && response.double_clicked() {
+            crate::linework_ui::finish_double_click(app);
+        }
         if tool == Tool::Type && response.double_clicked() {
             crate::type_tool::select_word(app);
         }
@@ -1592,6 +1631,9 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         crate::vector_ui::draw_overlay(app, &painter, &xf, &doc);
         crate::analysis_ui::draw_overlay(app, &painter, &xf);
         crate::slice_ui::draw_overlay(app, &painter, &xf);
+        crate::linework_ui::draw_overlay(app, &painter, &xf);
+        crate::linework_ui::keys(app, &ctx);
+        crate::sai_ui::follow_role(app);
         // Tool cursors (Photoshop-style).
         let guide_hover = response.hover_pos().filter(|_| tool == Tool::Move).and_then(|p| {
             let d = xf.to_doc(p);
@@ -1677,6 +1719,12 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     }
     if primary {
         app.hover_doc = response.hover_pos().map(|p| xf.to_doc(p));
+        if app.ui.tool == Tool::MagneticLasso && app.drag.is_none() {
+            let p = app.hover_doc;
+            crate::magnetic_ui::hover_at(app, p);
+        } else {
+            app.magnetic = None;
+        }
     }
     if primary && app.ui.extras.rulers {
         crate::rulers::draw_rulers(app, ui, full, &xf);
@@ -1803,6 +1851,7 @@ fn draw_tool_state(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform,
         let r = Rect::from_two_pos(xf.to_screen(c[0] as f32, c[1] as f32), xf.to_screen(c[2] as f32, c[3] as f32));
         crop_overlay(painter, r);
     }
+    crate::magnetic_ui::draw(app, painter, xf);
 }
 
 /// Move tool › Show Transform Controls: the active layer's transform bounds.
@@ -1866,7 +1915,7 @@ fn draw_drag_preview(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXfor
     }
     match d.tool {
         // The canvas shows the live stroke itself (`LiveStroke`).
-        Tool::Brush | Tool::Eraser => {}
+        Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser | Tool::Plugin => {}
         t if t.is_brushlike() || t == Tool::QuickSelection => {
             // Retouching strokes preview as a translucent trail of the brush footprint.
             let pts: Vec<Pos2> = d.points.iter().map(|p| xf.to_screen(p[0] as f32, p[1] as f32)).collect();
@@ -1879,6 +1928,10 @@ fn draw_drag_preview(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXfor
             }
         }
         t if crate::vector_ui::is_shape_tool(t) => crate::vector_ui::draw_shape_preview(app, painter, xf, t, d.start, last, d.modifiers),
+        Tool::ObjectSelection if app.ui.tool_options.object_lasso => {
+            let pts: Vec<Pos2> = std::iter::once(d.start).chain(d.points.iter().map(|p| [p[0], p[1]])).map(|p| xf.to_screen(p[0] as f32, p[1] as f32)).collect();
+            crate::tool_feedback::draw_ants(painter, &pts, true);
+        }
         Tool::RectMarquee | Tool::EllipseMarquee | Tool::ObjectSelection => {
             // Marching ants, visible on any pixels (#172).
             let r = Rect::from_two_pos(xf.to_screen(d.start[0] as f32, d.start[1] as f32), xf.to_screen(last[0] as f32, last[1] as f32));
@@ -1951,6 +2004,9 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
         return;
     }
     // Slice and Slice Select tools.
+    if crate::linework_ui::pointer(app, ev, mods) {
+        return;
+    }
     if crate::slice_ui::pointer(app, ev, mods) {
         return;
     }
@@ -1959,6 +2015,11 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
         return;
     }
     let tool = app.ui.tool;
+    if tool == Tool::MagneticLasso {
+        let mode = selection_mode(app, mods);
+        crate::magnetic_ui::pointer(app, ev, mode);
+        return;
+    }
     if tool == Tool::Eyedropper {
         match ev {
             ToolEvent::Down { x, y, .. } | ToolEvent::Move { x, y, .. } => {
@@ -2012,7 +2073,7 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 Tool::MagicWand => {
                     let o = app.ui.tool_options.clone();
                     let mode = selection_mode(app, mods);
-                    let _ = app.run("select.magicWand", json!({"x": x.floor(), "y": y.floor(), "tolerance": o.tolerance, "contiguous": o.contiguous, "antiAlias": o.anti_alias, "sampleAllLayers": o.sample_all_layers, "mode": mode}));
+                    let _ = app.run("select.magicWand", json!({"x": x.floor(), "y": y.floor(), "tolerance": o.tolerance, "contiguous": o.contiguous, "antiAlias": o.anti_alias, "sample": o.fill_sample, "mode": mode}));
                     return;
                 }
                 Tool::MagicEraser => {
@@ -2022,7 +2083,7 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 Tool::PaintBucket => {
                     let o = app.ui.tool_options.clone();
                     let contents = if o.bucket_fill_pattern { "pattern" } else { "foreground" };
-                    let _ = app.run("paint.bucket", json!({"x": x.floor(), "y": y.floor(), "tolerance": o.tolerance, "contiguous": o.contiguous, "antiAlias": o.anti_alias, "opacity": o.fill_opacity, "contents": contents, "target": paint_target(app)}));
+                    let _ = app.run("paint.bucket", json!({"x": x.floor(), "y": y.floor(), "tolerance": o.tolerance, "contiguous": o.contiguous, "antiAlias": o.anti_alias, "opacity": o.fill_opacity, "contents": contents, "sample": o.fill_sample, "expand": o.bucket_expand, "target": paint_target(app)}));
                     return;
                 }
                 Tool::PolygonLasso => {
@@ -2040,6 +2101,9 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 Tool::Type if crate::type_tool::pointer_down(app, x, y, mods.shift) => return,
                 _ => {}
             }
+            if ask_rasterize(app, tool) {
+                return;
+            }
             crate::paint_mouse::sync_tool_smoothing(app);
             let erase = tool == Tool::Eraser || std::mem::take(&mut app.secondary_erase);
             // ⇧-click after a stroke: a straight line from where it ended (stroke_constraint.rs).
@@ -2049,12 +2113,12 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
             if let Some(p) = from {
                 points.insert(0, [p[0], p[1], pressure as f64]);
             }
-            app.drag = Some(Drag { tool, start: from.unwrap_or([x, y]), points, modifiers: mods, erase, constrain: None });
+            app.drag = Some(Drag { tool, start: from.unwrap_or([x, y]), points, modifiers: mods, erase, constrain: None, straight_from: None });
             app.stylus.begin_stroke();
             if from.is_some() {
                 app.stylus.record_point();
             }
-            app.live_stroke = if matches!(tool, Tool::Brush | Tool::Eraser) { begin_live_stroke(app) } else { None };
+            app.live_stroke = if matches!(tool, Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser | Tool::Plugin) { begin_live_stroke(app) } else { None };
         }
         ToolEvent::Move { x, y, pressure } => {
             if tool == Tool::Type && app.drag.is_none() {
@@ -2064,6 +2128,20 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 crate::vector_ui::pen_move(app, x, y);
             }
             let zoom = app.current_zoom();
+            // Lasso: ⌥ pressed during the drag draws a straight segment from where it was pressed
+            // (the subtract mode is chosen by ⌥ at the press only).
+            if let Some(d) = app.drag.as_mut().filter(|d| d.tool == Tool::Lasso && !d.modifiers.alt) {
+                if mods.alt {
+                    let from = *d.straight_from.get_or_insert(d.points.len());
+                    d.points.truncate(from);
+                    d.points.push([x, y, pressure as f64]);
+                    return;
+                }
+                if let Some(from) = d.straight_from.take() {
+                    // Keep the segment's end as a vertex and go on freehand from it.
+                    d.points.truncate(from + 1);
+                }
+            }
             if let Some(d) = &mut app.drag {
                 // ⇧: straight 0/45/90° strokes, 45° gradient angles (stroke_constraint.rs).
                 let last = d.points.last().map_or(d.start, |p| [p[0], p[1]]);
@@ -2110,11 +2188,11 @@ fn finish_gesture(app: &mut PhotocraftApp, d: Drag) {
         return;
     }
     match d.tool {
-        Tool::ObjectSelection => crate::retouch_ui::finish_object_selection(app, d.start, [end[0], end[1]], d.modifiers),
+        Tool::ObjectSelection => finish_object_selection(app, &d),
         t if crate::vector_ui::is_shape_tool(t) => crate::vector_ui::finish_shape(app, t, d.start, [end[0], end[1]], d.modifiers),
         Tool::PathSelection => crate::vector_ui::path_selection_finish(app, d.start, [end[0], end[1]]),
         Tool::Type => crate::type_tool::pointer_up(app, d.start, [end[0], end[1]]),
-        Tool::Brush | Tool::Eraser => {
+        Tool::Brush | Tool::PixelBrush | Tool::SaiBrush | Tool::Eraser | Tool::Plugin => {
             let live = app.live_stroke.take();
             let mut p = stroke_params(app, d.erase, &app.stylus.stroke_points(&d.points));
             if let Some(l) = &live {
@@ -2212,10 +2290,77 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     app.ui.windows.retain(|w| w.open);
 }
 
+/// Object Selection: a box (or, in Lasso mode, the outline drawn) around the object, or a click
+/// on it. With the AI models installed (`ai_select`) every prompt works; without them only a box
+/// does (GrabCut).
+fn finish_object_selection(app: &mut PhotocraftApp, d: &Drag) {
+    let end = d.points.last().map_or(d.start, |p| [p[0], p[1]]);
+    let mode = selection_mode(app, d.modifiers);
+    let o = app.ui.tool_options.clone();
+    let zoom = f64::from(app.current_zoom().max(0.01));
+    let (mut x0, mut y0, mut x1, mut y1) = (d.start[0], d.start[1], d.start[0], d.start[1]);
+    for p in &d.points {
+        (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
+    }
+    // A drag shorter than 3 screen pixels is a click.
+    let click = (x1 - x0).max(y1 - y0) * zoom < 3.0;
+    let mut p = json!({"mode": mode, "sampleAllLayers": o.sample_all_layers, "model": o.object_model});
+    if click {
+        p["point"] = json!([d.start[0], d.start[1]]);
+    } else if o.object_lasso && d.points.len() >= 3 {
+        p["lasso"] = json!(std::iter::once(d.start).chain(d.points.iter().map(|q| [q[0], q[1]])).collect::<Vec<_>>());
+    } else {
+        let (x, y) = (d.start[0].min(end[0]), d.start[1].min(end[1]));
+        p["rect"] = json!([x.round(), y.round(), (end[0] - d.start[0]).abs().round(), (end[1] - d.start[1]).abs().round()]);
+    }
+    if !click || photocraft_engine::ai_select::available() {
+        app.ui.status = "Object Selection…".into();
+        let _ = app.run("select.object", p);
+    }
+}
+
 /// Selection mode from the options bar, overridden by modifier keys (⇧ add, ⌥ subtract, ⇧⌥ intersect).
 /// The cursor badge announces the same mode (`tool_feedback`).
 fn selection_mode(app: &PhotocraftApp, m: egui::Modifiers) -> &'static str {
     crate::tool_feedback::selection_mode(Tool::Lasso, app.ui.selection_mode, m)
+}
+
+/// Painting, filling or a gradient on the pixels of a layer that has none of its own (a Smart
+/// Object, type, shape or fill layer) asks to rasterize it first, as Photoshop does, instead of
+/// silently doing nothing. OK rasterizes the layer; the next stroke then paints.
+fn ask_rasterize(app: &mut PhotocraftApp, tool: Tool) -> bool {
+    if !(tool.is_brushlike() || matches!(tool, Tool::Gradient | Tool::PaintBucket | Tool::MagicEraser)) || paint_target(app) != json!("pixels") {
+        return false;
+    }
+    let Some(l) = app.session.active().and_then(|st| st.active_layer.and_then(|id| st.doc.layer(id))) else { return false };
+    if l.linework.is_some() {
+        let message = format!("This Linework layer must be rasterized before painting on it. Its strokes will no longer be editable.\n\nRasterize \"{}\"?", l.name);
+        let mut fields = serde_json::Map::new();
+        fields.insert("__command".into(), json!("layer.rasterize.linework"));
+        fields.insert("__label".into(), json!("Rasterize Linework"));
+        fields.insert("__message".into(), json!(message));
+        fields.insert("layer".into(), json!(l.id.0));
+        app.ui.open_dialog(crate::state::DialogKind::Command, fields);
+        return true;
+    }
+    let what = match &l.content {
+        LayerContent::Smart(_) => "This Smart Object",
+        LayerContent::Text(_) => "This type layer",
+        LayerContent::Shape(_) => "This shape layer",
+        LayerContent::Fill(_) => "This fill layer",
+        _ => return false,
+    };
+    let message = format!(
+        "{what} must be rasterized before proceeding. Its contents will no longer be editable.\n\nRasterize \"{}\"?",
+        l.name
+    );
+    let mut fields = serde_json::Map::new();
+    fields.insert("__command".into(), json!("layer.rasterize.layer"));
+    fields.insert("__label".into(), json!("Rasterize Layer"));
+    fields.insert("__message".into(), json!(message));
+    fields.insert("layer".into(), json!(l.id.0));
+    app.ui.open_dialog(crate::state::DialogKind::Command, fields);
+    true
 }
 
 /// Close the polygonal lasso and make the selection.

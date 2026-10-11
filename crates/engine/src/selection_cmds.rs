@@ -29,17 +29,27 @@ fn mode(p: &Value) -> SelectionMode {
 
 /// RGBA pixels the tools sample: the composite, or the active layer.
 fn sample_pixels(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[f32; 4]>)> {
+    sample_layer_pixels(s, all_layers, None)
+}
+
+/// The pixels a colour selection reads: one layer's own content (`layer`, else the active one;
+/// its pixels, or for a Smart Object, type, shape or group its rendering alone), or the composite
+/// with `all_layers` (or when the layer has no content of its own, e.g. an adjustment layer).
+fn sample_layer_pixels(s: &Session, all_layers: bool, layer: Option<photocraft_doc::LayerId>) -> Result<(Rect, Vec<[f32; 4]>)> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let area = d.doc.bounds();
-    let layer = d.active_layer.and_then(|id| d.doc.layer(id)).and_then(|l| l.surface());
-    match (all_layers, layer) {
-        (false, Some(surf)) => {
+    let id = layer.or(d.active_layer).filter(|_| !all_layers);
+    if let Some(l) = id.and_then(|id| d.doc.layer(id)) {
+        if let Some(surf) = l.surface().filter(|_| matches!(l.content, photocraft_doc::LayerContent::Raster(_))) {
             let mut px = vec![[0.0f32; 4]; area.width() as usize * area.height() as usize];
             surf.read_rgba_into(area, &mut px);
-            Ok((area, px))
+            return Ok((area, px));
         }
-        _ => Ok((area, photocraft_compose::render(&d.doc, area).px)),
+        if let Some(solo) = crate::ai_select::layer_alone(&d.doc, l.id) {
+            return Ok((area, photocraft_compose::render(&solo, area).px));
+        }
     }
+    Ok((area, photocraft_compose::render(&d.doc, area).px))
 }
 
 fn set_selection(s: &mut Session, label: &str, area: Rect, mask: Vec<f32>, m: SelectionMode) -> Result<Value> {
@@ -60,18 +70,80 @@ pub(crate) fn sample_rgba8(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let area = d.doc.bounds();
     let layer = d.active_layer.and_then(|id| d.doc.layer(id)).and_then(|l| l.surface());
+    let raster = d.active_layer.and_then(|id| d.doc.layer(id)).is_some_and(|l| matches!(l.content, photocraft_doc::LayerContent::Raster(_)));
     match (all_layers, layer) {
-        (false, Some(surf)) => Ok((area, sel::rgba8_image(surf, area))),
+        (false, Some(surf)) if raster => Ok((area, sel::rgba8_image(surf, area))),
         _ => {
+            // Another kind of layer alone (Smart Object, type…), or the composite.
+            let (area, px) = sample_layer_pixels(s, all_layers, None)?;
             let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            Ok((area, photocraft_compose::render(&d.doc, area).px.iter().map(|p| p.map(q)).collect()))
+            Ok((area, px.iter().map(|p| p.map(q)).collect()))
+        }
+    }
+}
+
+/// What the Magic Wand and Paint Bucket sample: the active layer, the reference layers (SAI's
+/// "Selection Source"), or the whole image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sample {
+    Layer,
+    Reference,
+    All,
+}
+
+/// The `"sample"` param (`"layer" | "reference" | "all"`); without it the older
+/// `sampleAllLayers` flag picks between the layer and the whole image.
+pub(crate) fn sample_param(p: &Value) -> Sample {
+    match p.get("sample").and_then(Value::as_str) {
+        Some("reference") => Sample::Reference,
+        Some("all" | "allLayers") => Sample::All,
+        Some("layer") => Sample::Layer,
+        _ if b(p, "sampleAllLayers", false) => Sample::All,
+        _ => Sample::Layer,
+    }
+}
+
+/// `doc` showing only its reference layers (a reference group shows all of its children), or
+/// `None` when no layer is marked as reference.
+pub(crate) fn reference_doc(doc: &Document) -> Option<Document> {
+    fn keep(layers: &mut [photocraft_doc::Layer]) -> bool {
+        let mut any = false;
+        for l in layers.iter_mut() {
+            let hit = l.reference || l.children_mut().is_some_and(|ch| keep(ch));
+            if !hit {
+                l.visible = false;
+            }
+            any |= hit;
+        }
+        any
+    }
+    let mut r = doc.clone();
+    keep(&mut r.layers).then_some(r)
+}
+
+/// 8-bit RGBA of what `sample` names over the canvas. With no reference layer, the Reference
+/// source falls back to the active layer.
+pub(crate) fn sample_source_rgba8(s: &Session, sample: Sample) -> Result<(Rect, Vec<[u8; 4]>)> {
+    match sample {
+        Sample::Layer => sample_rgba8(s, false),
+        Sample::All => sample_rgba8(s, true),
+        Sample::Reference => {
+            let d = s.active().ok_or(EngineError::NoDocument)?;
+            match reference_doc(&d.doc) {
+                Some(r) => {
+                    let area = r.bounds();
+                    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    Ok((area, photocraft_compose::render(&r, area).px.iter().map(|p| p.map(q)).collect()))
+                }
+                None => sample_rgba8(s, false),
+            }
         }
     }
 }
 
 fn magic_wand(s: &mut Session, p: &Value) -> Result<Value> {
     let (x, y) = (f(p, "x", 0.0).floor() as i32, f(p, "y", 0.0).floor() as i32);
-    let (area, img) = sample_rgba8(s, b(p, "sampleAllLayers", false))?;
+    let (area, img) = sample_source_rgba8(s, sample_param(p))?;
     let region = sel::wand_region(&img, area, (x, y), f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true));
     drop(img);
     let m = mode(p);
@@ -119,6 +191,11 @@ fn eyedropper_samples(p: &Value, key: &str, area: Rect, px: &[[f32; 4]], bad: &i
     Ok(out)
 }
 
+/// `"layer": id`: sample that layer instead of the active one.
+fn layer_param(p: &Value) -> Option<photocraft_doc::LayerId> {
+    p.get("layer").and_then(Value::as_u64).map(photocraft_doc::LayerId)
+}
+
 fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "select.colorRange";
     let bad = |msg: String| EngineError::BadParams { cmd: CMD.into(), msg };
@@ -127,7 +204,7 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
     let fuzz = |d: f32| f(p, "fuzziness", d).max(0.0);
     let (area, mut mask) = match preset {
         "sampledColors" => {
-            let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", true))?;
+            let (area, px) = sample_layer_pixels(s, b(p, "sampleAllLayers", true), layer_param(p))?;
             let w = area.width() as usize;
             // The dialog's eyedroppers: colours picked on the image, at their positions.
             let mut samples = eyedropper_samples(p, "points", area, &px, &bad)?;
@@ -175,7 +252,7 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
                 "blues" => 240.0,
                 _ => 300.0,
             };
-            let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", true))?;
+            let (area, px) = sample_layer_pixels(s, b(p, "sampleAllLayers", true), layer_param(p))?;
             (area, sel::hue_range(&px, center))
         }
         "highlights" | "midtones" | "shadows" => {
@@ -318,7 +395,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.magicWand",
             "Magic Wand",
             [],
-            r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"sampleAllLayers":bool=false,"mode":"replace|add|subtract|intersect"="replace"}"##,
+            r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"sampleAllLayers":bool=false,"sample":"layer|reference|all"? (overrides sampleAllLayers; reference = layers marked as reference),"mode":"replace|add|subtract|intersect"="replace"}"##,
             has_doc,
             magic_wand
         ),
@@ -326,7 +403,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.colorRange",
             "Color Range…",
             ["Select"],
-            r##"{"select":"sampledColors|reds|yellows|greens|cyans|blues|magentas|highlights|midtones|shadows|outOfGamut"="sampledColors","color":"#rrggbb"=foreground,"colors":["#rrggbb",…]?,"points":[[x,y],…]? (eyedropper samples),"subtractPoints":[[x,y],…]? (minus eyedropper),"fuzziness":0..200=40 (tones: 0..100 %=20),"localized":bool=false,"range":0..100=100 (% of the longer side),"tonalRange":level|[lo,hi] (shadows 65, highlights 190, midtones [105,150]),"invert":bool=false,"sampleAllLayers":bool=true,"mode":"replace|add|subtract|intersect"="replace"}"##,
+            r##"{"select":"sampledColors|reds|yellows|greens|cyans|blues|magentas|highlights|midtones|shadows|outOfGamut"="sampledColors","color":"#rrggbb"=foreground,"colors":["#rrggbb",…]?,"points":[[x,y],…]? (eyedropper samples),"subtractPoints":[[x,y],…]? (minus eyedropper),"fuzziness":0..200=40 (tones: 0..100 %=20),"localized":bool=false,"range":0..100=100 (% of the longer side),"tonalRange":level|[lo,hi] (shadows 65, highlights 190, midtones [105,150]),"invert":bool=false,"sampleAllLayers":bool=true (false: one layer's own content),"layer":id? (that layer; default the active one),"mode":"replace|add|subtract|intersect"="replace"}"##,
             has_doc,
             color_range
         ),

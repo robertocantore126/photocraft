@@ -201,6 +201,34 @@ pub(crate) fn composite_over(dst: &mut Surface, top: &Surface) {
     dst.write_region(b, &d);
 }
 
+/// The homography as an affine map, when it has no perspective part.
+fn affine_of(h: &Homography) -> Option<Affine> {
+    let m = h.0;
+    (m[6].abs() < 1e-12 && m[7].abs() < 1e-12).then(|| Affine { m: [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]] })
+}
+
+/// `doc` as `edit.transform` would leave it after mapping `rect`'s corners to `quad` on layer
+/// `id`, without history and with the selection left alone. Free Transform's live preview shows
+/// this, so the layer is seen at its place in the stack (blend mode, layers above, clipping).
+pub fn transformed_document(doc: &Document, id: LayerId, rect: [f64; 4], quad: [[f64; 2]; 4], interpolation: &str) -> Result<Document> {
+    let h = Homography::rect_to_quad(rect, quad).ok_or_else(|| bad("degenerate quad"))?;
+    if h.inverse().is_none() {
+        return Err(bad("the transform collapses the layer"));
+    }
+    let mut out = doc.clone();
+    let sel = out.selection.clone();
+    let l = out.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+    let is_group = l.is_group();
+    transform_layer(if is_group { None } else { sel.as_ref() }, l, &h, affine_of(&h), Interp::parse(interpolation))?;
+    if out.layer(id).is_some_and(|l| !matches!(l.content, LayerContent::Raster(_))) {
+        let snapshot = out.clone();
+        if let Some(l) = out.layer_mut(id) {
+            refresh_text(&snapshot, l);
+        }
+    }
+    Ok(out)
+}
+
 fn quad_param(p: &Value) -> Option<[[f64; 2]; 4]> {
     let a = p.get("quad")?.as_array()?;
     if a.len() != 4 {
@@ -249,9 +277,7 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     if h.inverse().is_none() {
         return Err(bad("the transform collapses the layer"));
     }
-    let m = h.0;
-    let affine =
-        (m[6].abs() < 1e-12 && m[7].abs() < 1e-12).then(|| Affine { m: [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]] });
+    let affine = affine_of(&h);
     let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
     s.edit("Free Transform", |doc, _| {
         let sel = doc.selection.clone();

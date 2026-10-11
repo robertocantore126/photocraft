@@ -40,6 +40,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("window.toggle.history", "History", &["Window"], None),
     ("window.toggle.properties", "Properties", &["Window"], None),
     ("window.toggle.color", "Color", &["Window"], Some("F6")),
+    ("window.toggle.saiKit", "SAI Kit", &["Window"], None),
     ("window.toggle.brushSettings", "Brush Settings", &["Window"], Some("F5")),
     ("window.toggle.navigator", "Navigator", &["Window"], None),
     ("window.toggle.toolbar", "Tools", &["Window"], None),
@@ -114,6 +115,25 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
     // Help › Discord, website, GitHub, Report an Issue.
     if let Some(url) = crate::links::url_for(id) {
         return Ok(crate::links::open(app, ctx, url));
+    }
+    // The Sugimori set takes its paper from the SAI texture folder.
+    if id == "layer.new.sugimoriSet" {
+        crate::sai_ui::ensure_textures(app, false);
+    }
+    // Ctrl+F with no selection fills the closed area under the pointer (SAI-style).
+    if id == "edit.fillForeground" && params.get("x").is_none() && app.session.active().is_some_and(|d| d.doc.selection.is_none()) {
+        let Some([x, y]) = app.hover_doc else { return Err("Fill Foreground: make a selection, or point at the area to fill".into()) };
+        let mut params = params;
+        if let Value::Object(m) = &mut params {
+            m.insert("x".into(), json!(x.floor()));
+            m.insert("y".into(), json!(y.floor()));
+            m.entry("tolerance").or_insert(json!(app.ui.tool_options.tolerance));
+            m.entry("expand").or_insert(json!(app.ui.tool_options.bucket_expand.max(1.0)));
+            if app.ui.tool_options.fill_sample != "layer" {
+                m.entry("sample").or_insert(json!(app.ui.tool_options.fill_sample));
+            }
+        }
+        return invoke_unguarded(app, ctx, id, params);
     }
     if id == "view.proofSetup.custom" {
         return Ok(json!({"dialog": crate::filter_dialog::open(app, "view.proofSetup")}));
@@ -387,6 +407,7 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
                 "toolbar" => &mut p.toolbar,
                 "options" => &mut p.options_bar,
                 "brushSettings" => &mut p.brush_settings,
+                "saiKit" => &mut p.sai_kit,
                 _ => return Err(format!("unknown panel in {t}")),
             };
             *slot = !*slot;
@@ -501,6 +522,10 @@ fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
     if let Some(alias) = panel_alias(id) {
         return checked(app, alias);
     }
+    if id == "layer.reference" {
+        let d = app.session.active()?;
+        return Some(d.active_layer.and_then(|l| d.doc.layer(l)).is_some_and(|l| l.reference));
+    }
     if id == "select.isolateLayers" {
         return Some(!app.session.active()?.isolated_layers.is_empty());
     }
@@ -549,6 +574,7 @@ fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
         "window.toggle.toolbar" => p.toolbar,
         "window.toggle.options" => p.options_bar,
         "window.toggle.brushSettings" => p.brush_settings,
+        "window.toggle.saiKit" => p.sai_kit,
         _ => return None,
     })
 }

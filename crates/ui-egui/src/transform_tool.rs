@@ -29,6 +29,112 @@ pub struct TransformPreview {
     gesture: Option<Gesture>,
     /// Warp-mode drag: (control point, pointer start, mesh points at the start).
     warp_drag: Option<(usize, [f64; 2], Vec<[f64; 2]>)>,
+    /// The box's transform applied to the layer in the document, so the preview shows it at its
+    /// place in the stack (Photoshop) rather than on top of everything.
+    in_place: Option<InPlace>,
+    /// The in-place preview can't be made (e.g. perspective on a type layer): draw the mesh.
+    in_place_failed: bool,
+    /// Warp mode: where a press away from every control point started (a click there commits).
+    warp_click: Option<[f64; 2]>,
+    /// The tool and layer when the transform began: picking another tool or another layer in the
+    /// Layers panel commits it (Photoshop applies the transform then too).
+    pub(crate) tool: crate::state::Tool,
+    pub(crate) active_layer: Option<LayerId>,
+}
+
+/// The live in-place preview and the canvas damage of each update (like the live stroke's), so the
+/// canvas recomposites only what moved.
+pub(crate) struct InPlace {
+    quad: [[f64; 2]; 4],
+    doc: Arc<Document>,
+    key: u64,
+    damage: Vec<photocraft_geom::Rect>,
+    cost_ms: f64,
+    at_ms: f64,
+}
+
+impl InPlace {
+    fn display_key(&self) -> u64 {
+        self.key + self.damage.len() as u64
+    }
+
+    /// What changed since the canvas showed preview `key` (0 = the document itself).
+    fn since(&self, key: u64) -> Option<photocraft_geom::Rect> {
+        let seen = if key == 0 { 0 } else { usize::try_from(key.checked_sub(self.key)?).ok()? };
+        Some(self.damage.get(seen..)?.iter().fold(photocraft_geom::Rect::EMPTY, |a, r| a.union(r)))
+    }
+}
+
+/// An in-place update slower than this is redone at most every [`IN_PLACE_INTERVAL_MS`] (or its
+/// own cost) while the box is dragged, and always when the drag ends.
+const IN_PLACE_SLOW_MS: f64 = 40.0;
+const IN_PLACE_INTERVAL_MS: f64 = 100.0;
+
+/// The document to show while transforming document `idx`: the transform applied in place, with
+/// its preview key. `None` (warp, Transform Selection, an impossible preview, or
+/// `PHOTOCRAFT_TRANSFORM_ON_TOP=1`): show the document without the layer and the mesh on top.
+pub(crate) fn in_place_doc(app: &mut PhotocraftApp, idx: usize) -> Option<(Arc<Document>, u64)> {
+    if std::env::var("PHOTOCRAFT_TRANSFORM_ON_TOP").as_deref() == Ok("1") {
+        return None;
+    }
+    let t = app.ui.transform.as_ref()?;
+    if t.warp.is_some() || t.selection {
+        return None;
+    }
+    let base = app.session.documents().get(idx)?.doc.clone();
+    let pv = app.transform_preview.as_mut()?;
+    if pv.in_place_failed {
+        return None;
+    }
+    let now = crate::gpu_canvas::now_ms();
+    let stale = pv.in_place.as_ref().is_none_or(|ip| ip.quad != t.quad);
+    let throttled =
+        pv.in_place.as_ref().is_some_and(|ip| pv.gesture.is_some() && ip.cost_ms > IN_PLACE_SLOW_MS && now - ip.at_ms < ip.cost_ms.max(IN_PLACE_INTERVAL_MS));
+    if stale && !throttled {
+        let interpolation = if t.interpolation == "nearest" { "nearest" } else { "bilinear" };
+        match photocraft_engine::transform_cmds::transformed_document(&base, LayerId(t.layer), t.rect, t.quad, interpolation) {
+            Ok(doc) => {
+                let doc = Arc::new(doc);
+                let cost_ms = crate::gpu_canvas::now_ms() - now;
+                match pv.in_place.as_mut() {
+                    Some(ip) => {
+                        let d = photocraft_engine::damage::between(&ip.doc, &doc);
+                        ip.damage.push(d.unwrap_or_else(|| base.bounds()));
+                        (ip.quad, ip.doc, ip.cost_ms, ip.at_ms) = (t.quad, doc, cost_ms, now);
+                    }
+                    None => {
+                        let d = photocraft_engine::damage::between(&base, &doc).unwrap_or_else(|| base.bounds());
+                        let key = (1 << 45) | ((pv.session & 0xff_ffff) << 20);
+                        pv.in_place = Some(InPlace { quad: t.quad, doc, key, damage: vec![d], cost_ms, at_ms: now });
+                    }
+                }
+            }
+            Err(_) => {
+                pv.in_place_failed = true;
+                return None;
+            }
+        }
+    }
+    pv.in_place.as_ref().map(|ip| (ip.doc.clone(), ip.display_key()))
+}
+
+/// Canvas damage between two in-place previews (or the document, key 0) of the current transform.
+pub(crate) fn in_place_damage(app: &PhotocraftApp, seen: u64, now: u64) -> Option<photocraft_geom::Rect> {
+    let ip = app.transform_preview.as_ref()?.in_place.as_ref()?;
+    if ip.display_key() != now {
+        return None;
+    }
+    ip.since(seen)
+}
+
+/// Is the transform shown in place (so the overlay draws only the box)? While a throttled update
+/// is pending, asks for another frame.
+fn shown_in_place(app: &PhotocraftApp, t: &TransformSession, ctx: &egui::Context) -> bool {
+    let Some(ip) = app.transform_preview.as_ref().and_then(|pv| pv.in_place.as_ref()) else { return false };
+    if ip.quad != t.quad {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+    t.warp.is_none() && !t.selection
 }
 
 fn corners(r: [f64; 4]) -> [[f64; 2]; 4] {
@@ -67,8 +173,9 @@ pub fn begin(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String>
     let max_side = ctx.input(|i| i.max_texture_side).max(app.gpu.as_ref().map_or(1, |g| g.max_texture_side()));
     let (image, uv) = preview_image(&doc, id, lifted.as_ref(), b, max_side);
     let texture = crate::transform_tex::PreviewTextures::new(ctx, format!("transform-{session}"), image, uv);
+    let (tool, active_layer) = (app.ui.tool, Some(id));
     app.transform_preview =
-        Some(TransformPreview { session, doc: Arc::new(pd), texture, opacity: layer.opacity * layer.fill_opacity, gesture: None, warp_drag: None });
+        Some(TransformPreview { session, doc: Arc::new(pd), texture, opacity: layer.opacity * layer.fill_opacity, gesture: None, warp_drag: None, in_place: None, in_place_failed: false, warp_click: None, tool, active_layer });
     app.ui.transform = Some(TransformSession {
         session,
         layer: id.0,
@@ -110,7 +217,8 @@ pub fn begin_selection(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(
     let texture = crate::transform_tex::PreviewTextures::new(ctx, format!("transform-{session}"), egui::ColorImage::new([tw, th], px), uv);
     let mut pd = (*doc).clone();
     pd.selection = None;
-    app.transform_preview = Some(TransformPreview { session, doc: Arc::new(pd), texture, opacity: 1.0, gesture: None, warp_drag: None });
+    let (tool, active_layer) = (app.ui.tool, app.session.active().and_then(|s| s.active_layer));
+    app.transform_preview = Some(TransformPreview { session, doc: Arc::new(pd), texture, opacity: 1.0, gesture: None, warp_drag: None, in_place: None, in_place_failed: false, warp_click: None, tool, active_layer });
     app.ui.transform = Some(TransformSession {
         session,
         layer: layer.0,
@@ -298,7 +406,9 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
     let Some(t) = app.ui.transform.clone() else { return false };
     let tol = 8.0 / app.current_zoom().max(0.01) as f64;
     if t.warp.is_some() {
-        warp_pointer(app, ev, tol);
+        if warp_pointer(app, ev, tol) {
+            commit(app);
+        }
         return true;
     }
     let Some(pv) = app.transform_preview.as_mut() else { return false };
@@ -331,15 +441,16 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
                 commit(app);
                 return true;
             }
+            let keep = app.ui.tool_options.transform_keep_ratio;
             if let (Some(g), Some(s)) = (g, app.ui.transform.as_mut()) {
-                apply_drag(s, g, [x, y], mods);
+                apply_drag(s, g, [x, y], mods, keep);
             }
         }
     }
     true
 }
 
-fn apply_drag(s: &mut TransformSession, g: Gesture, p: [f64; 2], mods: egui::Modifiers) {
+fn apply_drag(s: &mut TransformSession, g: Gesture, p: [f64; 2], mods: egui::Modifiers, keep_ratio: bool) {
     let (dx, dy) = (p[0] - g.start[0], p[1] - g.start[1]);
     match g.hit {
         Hit::Inside => {
@@ -463,12 +574,17 @@ fn apply_drag(s: &mut TransformSession, g: Gesture, p: [f64; 2], mods: egui::Mod
                     r[1] = 2.0 * pv - r[3];
                 }
             }
-            // Corners scale proportionally by default (Photoshop CC); ⇧ frees them.
+            // Corners scale proportionally with the chain on (the default, Photopea); ⇧ frees
+            // them. With the chain off it is the reverse. Edges always scale one axis.
             let corner = matches!(g.hit, Hit::Corner(_));
-            if corner && !mods.shift {
+            if corner && keep_ratio != mods.shift {
                 let (sx, sy) = (r[2] - r[0], r[3] - r[1]);
-                let k = if sx.abs() > sy.abs() { sx.abs() } else { sy.abs() };
-                let (nx, ny) = (k * sx.signum(), k * sy.signum());
+                // The pointer projected on the box's diagonal: dragging a corner down or inwards
+                // shrinks the box as much as its distance along the diagonal says, whichever axis
+                // the pointer moved on (the larger axis alone could only grow it).
+                let k = (sx + sy) / 2.0;
+                let k = if k.abs() < 1e-6 { 1e-6 } else { k };
+                let (nx, ny) = (k, k);
                 let (ax, ay) = if mods.alt { (pu, pv) } else { (if mu.0 { r[2] } else { r[0] }, if mv.0 { r[3] } else { r[1] }) };
                 let fx = if mods.alt {
                     0.5
@@ -513,12 +629,14 @@ fn warp_hit(w: &Warp, p: [f64; 2], tol: f64) -> Option<usize> {
 }
 
 /// Drags a warp control point. Anchors (patch corners) carry their handles along, as in
-/// Photoshop. Preset warps turn into a custom mesh on the first drag.
-fn warp_pointer(app: &mut PhotocraftApp, ev: ToolEvent, tol: f64) {
-    let (Some(t), Some(pv)) = (app.ui.transform.as_mut(), app.transform_preview.as_mut()) else { return };
-    let Some(w) = t.warp.as_mut() else { return };
+/// Photoshop. Preset warps turn into a custom mesh on the first drag. Returns true for a click (no
+/// drag) outside the warped mesh, which commits the warp like a click outside the box.
+fn warp_pointer(app: &mut PhotocraftApp, ev: ToolEvent, tol: f64) -> bool {
+    let (Some(t), Some(pv)) = (app.ui.transform.as_mut(), app.transform_preview.as_mut()) else { return false };
+    let Some(w) = t.warp.as_mut() else { return false };
     match ev {
         ToolEvent::Down { x, y, .. } => {
+            pv.warp_click = (warp_hit(w, [x, y], tol).is_none() && !inside_warp(w, [x, y], tol)).then_some([x, y]);
             if w.mesh.is_none() || w.style != WarpStyle::Custom {
                 let mesh = w.to_mesh(1, 1);
                 *w = Warp::custom(mesh, w.bounds);
@@ -546,9 +664,24 @@ fn warp_pointer(app: &mut PhotocraftApp, ev: ToolEvent, tol: f64) {
             }
             if matches!(ev, ToolEvent::Up { .. }) {
                 pv.warp_drag = None;
+                return pv.warp_click.take().is_some_and(|s| (x - s[0]).hypot(y - s[1]) <= tol * 0.5);
             }
         }
     }
+    false
+}
+
+/// Is `p` within the warped mesh's outline (its points' bounding box, grown by `tol`)?
+fn inside_warp(w: &Warp, p: [f64; 2], tol: f64) -> bool {
+    let pts = match &w.mesh {
+        Some(m) => m.points.clone(),
+        None => w.to_mesh(1, 1).points,
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for q in &pts {
+        (x0, y0, x1, y1) = (x0.min(q[0]), y0.min(q[1]), x1.max(q[0]), y1.max(q[1]));
+    }
+    p[0] >= x0 - tol && p[0] <= x1 + tol && p[1] >= y0 - tol && p[1] <= y1 + tol
 }
 
 /// Applies a split-warp command to the mesh being edited (at the box centre unless `at`).
@@ -592,7 +725,9 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
         draw_warp(painter, xf, t, w, pv);
         return;
     }
-    if let Some(h) = Homography::rect_to_quad([0.0, 0.0, 1.0, 1.0], t.quad) {
+    if !shown_in_place(app, t, painter.ctx())
+        && let Some(h) = Homography::rect_to_quad([0.0, 0.0, 1.0, 1.0], t.quad)
+    {
         // A 24×24 grid keeps perspective previews straight.
         let n = 24;
         let (tex, uv) = pv.texture.pick(painter.ctx(), xf.zoom * painter.ctx().pixels_per_point(), quad_scale(t), t.interpolation == "nearest");
@@ -762,11 +897,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let (mut w, mut h) = (sx as f32, sy as f32);
     lbl(ui, "W:");
     let rw = crate::widgets::value_field(ui, &mut w, -10000.0..=10000.0, "%", 66.0);
-    let link_id = egui::Id::new("transform-link");
-    let mut link: bool = ui.data(|d| d.get_temp(link_id)).unwrap_or(true);
-    if crate::icons::button(ui, if link { "link" } else { "unlink" }, 22.0, link, "Maintain aspect ratio").clicked() {
+    let mut link = app.ui.tool_options.transform_keep_ratio;
+    if crate::icons::button(ui, if link { "link" } else { "unlink" }, 22.0, link, "Maintain aspect ratio (corner handles; ⇧ inverts)").clicked() {
         link = !link;
-        ui.data_mut(|d| d.insert_temp(link_id, link));
+        app.ui.tool_options.transform_keep_ratio = link;
     }
     lbl(ui, "H:");
     let rh = crate::widgets::value_field(ui, &mut h, -10000.0..=10000.0, "%", 66.0);
@@ -924,7 +1058,7 @@ mod tests {
 
     fn drag(s: &mut TransformSession, from: [f64; 2], to: [f64; 2], mods: egui::Modifiers) {
         let g = Gesture { hit: hit(s, from, 8.0), start: from, quad0: s.quad, pivot0: s.pivot };
-        apply_drag(s, g, to, mods);
+        apply_drag(s, g, to, mods, true);
     }
 
     fn close(a: [[f64; 2]; 4], b: [[f64; 2]; 4]) -> bool {
@@ -934,11 +1068,23 @@ mod tests {
     #[test]
     fn corner_drag_scales_proportionally_about_opposite_corner() {
         let mut s = session();
+        // ×2 wide, ×1.2 tall: the diagonal projection scales both by 1.6.
         drag(&mut s, [100.0, 50.0], [200.0, 60.0], egui::Modifiers::NONE);
-        assert!(close(s.quad, corners([0.0, 0.0, 200.0, 100.0])), "{:?}", s.quad);
+        assert!(close(s.quad, corners([0.0, 0.0, 160.0, 80.0])), "{:?}", s.quad);
         let mut s = session();
         drag(&mut s, [100.0, 50.0], [200.0, 60.0], egui::Modifiers::SHIFT);
         assert!(close(s.quad, corners([0.0, 0.0, 200.0, 60.0])), "shift = free: {:?}", s.quad);
+        // Dragging the bottom-right corner down and inwards shrinks it (Photopea), keeping the shape.
+        let mut s = session();
+        drag(&mut s, [100.0, 50.0], [40.0, 60.0], egui::Modifiers::NONE);
+        assert!(close(s.quad, corners([0.0, 0.0, 80.0, 40.0])), "{:?}", s.quad);
+        // Chain off: corners are free, ⇧ makes them proportional.
+        let mut s = session();
+        let g = Gesture { hit: hit(&s, [100.0, 50.0], 8.0), start: [100.0, 50.0], quad0: s.quad, pivot0: s.pivot };
+        apply_drag(&mut s, g, [200.0, 60.0], egui::Modifiers::NONE, false);
+        assert!(close(s.quad, corners([0.0, 0.0, 200.0, 60.0])), "{:?}", s.quad);
+        apply_drag(&mut s, g, [200.0, 60.0], egui::Modifiers::SHIFT, false);
+        assert!(close(s.quad, corners([0.0, 0.0, 160.0, 80.0])), "{:?}", s.quad);
     }
 
     #[test]
@@ -1037,11 +1183,11 @@ mod tests {
     fn shift_body_drag_locks_to_eight_directions_and_switches() {
         let mut s = session();
         let g = Gesture { hit: Hit::Inside, start: [40.0, 20.0], quad0: s.quad, pivot0: s.pivot };
-        apply_drag(&mut s, g, [60.0, 23.0], egui::Modifiers::SHIFT);
+        apply_drag(&mut s, g, [60.0, 23.0], egui::Modifiers::SHIFT, true);
         assert!(close(s.quad, corners([20.0, 0.0, 120.0, 50.0])), "horizontal: {:?}", s.quad);
-        apply_drag(&mut s, g, [60.0, 39.0], egui::Modifiers::SHIFT);
+        apply_drag(&mut s, g, [60.0, 39.0], egui::Modifiers::SHIFT, true);
         assert!((s.quad[0][0] - s.quad[0][1]).abs() < 1e-9 && s.quad[0][0] > 15.0, "diagonal: {:?}", s.quad[0]);
-        apply_drag(&mut s, g, [41.0, 60.0], egui::Modifiers::SHIFT);
+        apply_drag(&mut s, g, [41.0, 60.0], egui::Modifiers::SHIFT, true);
         assert!(close(s.quad, corners([0.0, 40.0, 100.0, 90.0])), "vertical: {:?}", s.quad);
     }
 

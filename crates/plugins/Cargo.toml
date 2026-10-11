@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # Pure-Rust WebAssembly interpreter (MIT OR Apache-2.0). Without `wat` (text parsing is test-only)
 # and memory64; `validate` keeps full module validation on.
-wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"] }
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "stable", "portable-dispatch", "simd"] }
 
 # Bands run in parallel on native; wasm builds stay single-threaded.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

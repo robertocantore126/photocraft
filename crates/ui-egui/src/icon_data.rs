@@ -57,6 +57,7 @@ pub static ICONS: &[(&str, &[u8])] = &[
     ("lock-open", include_bytes!("../../../assets/icons/lock-open.svg")),
     ("lollipop", include_bytes!("../../../assets/icons/lollipop.svg")),
     ("maximize-2", include_bytes!("../../../assets/icons/maximize-2.svg")),
+    ("magnet", include_bytes!("../../../assets/icons/magnet.svg")),
     ("message-square", include_bytes!("../../../assets/icons/message-square.svg")),
     ("minus", include_bytes!("../../../assets/icons/minus.svg")),
     ("moon", include_bytes!("../../../assets/icons/moon.svg")),

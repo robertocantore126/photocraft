@@ -1,0 +1,12 @@
+[package]
+name = "feather-eraser"
+description = "Fotox brush plugin: an eraser with a very wide, seamless feather"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fotox-plugin = { path = "../sdk" }
